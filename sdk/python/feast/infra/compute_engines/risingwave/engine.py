@@ -14,6 +14,7 @@ inline ``UNVERIFIED`` markers).
 """
 
 import logging
+from datetime import timedelta
 from typing import List, Literal, Optional, Sequence, Union
 
 from feast import (
@@ -36,7 +37,15 @@ from feast.infra.compute_engines.risingwave.feature_builder import (
 from feast.infra.compute_engines.risingwave.job import (
     RisingWaveMaterializationJob,
 )
+from feast.infra.compute_engines.risingwave.names import (
+    offline_sink_name,
+    online_mv_name,
+    source_name,
+    tiles_name,
+)
 from feast.infra.compute_engines.risingwave.nodes import (
+    build_batch_tile_select,
+    build_online_rollup_select,
     build_windowed_agg_select,
 )
 from feast.infra.compute_engines.dag.context import ColumnInfo
@@ -121,6 +130,83 @@ def _registry_free_column_info(view) -> ColumnInfo:
     )
 
 
+def _batch_column_info(view) -> ColumnInfo:
+    # Batch analog of _registry_free_column_info: the timestamp is on the BATCH source
+    # (view.source), not a stream_source. feature_cols are the resolved output names —
+    # carried onto the tile partials by build_batch_tile_select.
+    return ColumnInfo(
+        join_keys=[f.name for f in view.entity_columns],
+        feature_cols=[f.name for f in view.features],
+        ts_col=view.source.timestamp_field,
+        created_ts_col=None,
+        field_mapping=None,
+    )
+
+
+def _aggregation_interval(view) -> timedelta:
+    # Feast's Aggregation carries no aggregation_interval (the tile size) — that is a
+    # ourfs view-level concept — so it rides on a tag the authoring surface sets.
+    secs = view.tags.get("ourfs_aggregation_interval")
+    if secs is None:
+        raise ValueError(
+            f"BatchFeatureView '{view.name}' has no 'ourfs_aggregation_interval' tag: the "
+            "tile model needs a tile size, but Feast's Aggregation carries none. Set it via "
+            "the ourfs BatchFeatureView authoring surface."
+        )
+    try:
+        return timedelta(seconds=int(secs))
+    except (ValueError, TypeError):
+        raise ValueError(
+            f"BatchFeatureView '{view.name}' tag ourfs_aggregation_interval={secs!r} must be an "
+            "integer number of seconds (e.g. '3600' for hourly, '86400' for daily)."
+        )
+
+
+def _sql_str(value: str) -> str:
+    # Escape a value going into a single-quoted SQL string literal / connector option. Mirrors
+    # Feast's snowflake.py _escape_snowflake_sql_string and RW's own option-quoting rules.
+    return str(value).replace("'", "''")
+
+
+def _iceberg_storage_opts(config) -> List[str]:
+    # The catalog + S3 connection options shared by the Iceberg SOURCE (batch read) and SINK
+    # (offline history). One source of truth so online and offline never read different storage —
+    # all values escaped against the single-quoted option literals.
+    #
+    # CREDENTIALS: the S3 keys are appended ONLY when set in the engine config. For PRODUCTION S3,
+    # leave them unset and run the RisingWave compute node under an IAM role / instance profile /
+    # env credentials — the Iceberg connector then uses the ambient AWS credential chain, so no
+    # credential is ever embedded in the (catalog-persisted, log-visible) CREATE SOURCE/SINK DDL.
+    # Explicit keys are for dev/MinIO only; they are escaped but DO appear in the DDL. (RisingWave's
+    # CREATE SECRET store would also hide them, but it is a licensed feature — free tier <=4 cores.)
+    opts = [
+        f"catalog.name='{_sql_str(config.catalog_name)}'",
+        f"catalog.type='{_sql_str(config.catalog_type)}'",
+        f"warehouse.path='{_sql_str(config.warehouse_path)}'",
+        f"database.name='{_sql_str(config.iceberg_database)}'",
+    ]
+    for key, val in (
+        ("s3.endpoint", config.s3_endpoint),
+        ("s3.region", config.s3_region),
+        ("s3.access.key", config.s3_access_key),
+        ("s3.secret.key", config.s3_secret_key),
+    ):
+        if val:
+            opts.append(f"{key}='{_sql_str(val)}'")
+    return opts
+
+
+def _iceberg_source_ddl(name: str, table: str, config) -> str:
+    # A RisingWave Iceberg source infers its schema from the Iceberg metadata, so (unlike
+    # the Kafka _source_ddl) it needs NO column list. Validated live (spike stage 5c).
+    opts = (
+        ["connector='iceberg'"]
+        + _iceberg_storage_opts(config)
+        + [f"table.name='{_sql_str(table)}'"]
+    )
+    return f'CREATE SOURCE IF NOT EXISTS "{name}" WITH ({", ".join(opts)})'
+
+
 def _source_is_retractable(source) -> bool:
     # Append-only (CREATE SOURCE ... FORMAT PLAIN) by default. Retractable upstreams
     # (CREATE TABLE ... FORMAT UPSERT) are spike-gated; when added, return True so the
@@ -153,8 +239,8 @@ def _source_ddl(name: str, source: KafkaSource, view) -> str:
     return (
         f'CREATE SOURCE IF NOT EXISTS "{name}" ({", ".join(cols)}{watermark}) '
         "WITH (connector='kafka', "
-        f"properties.bootstrap.server='{source.kafka_options.kafka_bootstrap_servers}', "
-        f"topic='{source.kafka_options.topic}', scan.startup.mode='earliest') "
+        f"properties.bootstrap.server='{_sql_str(source.kafka_options.kafka_bootstrap_servers)}', "
+        f"topic='{_sql_str(source.kafka_options.topic)}', scan.startup.mode='earliest') "
         "FORMAT PLAIN ENCODE JSON"  # issue_18308.slt:14-15; non-JSON formats spike-gated
     )
 
@@ -174,23 +260,11 @@ def _iceberg_sink_ddl(
     # (time_window.slt:50-61).
     select = f'SELECT {projection}, "window_end" AS event_timestamp FROM "{mv}"'
 
-    opts = [
-        "connector='iceberg'",
-        "create_table_if_not_exists='true'",
-        f"catalog.name='{config.catalog_name}'",
-        f"catalog.type='{config.catalog_type}'",
-        f"warehouse.path='{config.warehouse_path}'",
-        f"database.name='{config.iceberg_database}'",
-        f"table.name='{name}'",
-    ]
-    for key, val in (
-        ("s3.endpoint", config.s3_endpoint),
-        ("s3.region", config.s3_region),
-        ("s3.access.key", config.s3_access_key),
-        ("s3.secret.key", config.s3_secret_key),
-    ):
-        if val:
-            opts.append(f"{key}='{val}'")
+    opts = (
+        ["connector='iceberg'", "create_table_if_not_exists='true'"]
+        + _iceberg_storage_opts(config)
+        + [f"table.name='{_sql_str(name)}'"]
+    )
 
     if upsert:
         # Composite PK so each (entity, window) bucket is a DISTINCT retained row.
@@ -208,11 +282,20 @@ def _iceberg_sink_ddl(
 
 
 def _drop_ddl(project: str, view) -> List[str]:
-    name = f"{project}_{view.name}"
     return [
-        f'DROP SINK IF EXISTS "{name}_offline"',
-        f'DROP MATERIALIZED VIEW IF EXISTS "{name}_online"',
-        f'DROP SOURCE IF EXISTS "{name}_src"',
+        f'DROP SINK IF EXISTS "{offline_sink_name(project, view.name)}"',
+        f'DROP MATERIALIZED VIEW IF EXISTS "{online_mv_name(project, view.name)}"',
+        f'DROP SOURCE IF EXISTS "{source_name(project, view.name)}"',
+    ]
+
+
+def _batch_drop_ddl(project: str, view) -> List[str]:
+    # Mirror of _drop_ddl for a tile BatchFeatureView: drop the online rollup MV, then the tiles
+    # MV it reads, then the source. No Iceberg sink is provisioned (the MVs are read directly).
+    return [
+        f'DROP MATERIALIZED VIEW IF EXISTS "{online_mv_name(project, view.name)}"',
+        f'DROP MATERIALIZED VIEW IF EXISTS "{tiles_name(project, view.name)}"',
+        f'DROP SOURCE IF EXISTS "{source_name(project, view.name)}"',
     ]
 
 
@@ -258,9 +341,18 @@ class RisingWaveComputeEngine(ComputeEngine):
                 if isinstance(view, StreamFeatureView):
                     for stmt in _drop_ddl(project, view):
                         cur.execute(stmt)
+                elif isinstance(view, BatchFeatureView) and view.aggregations:
+                    for stmt in _batch_drop_ddl(project, view):
+                        cur.execute(stmt)
             for view in views_to_keep:
                 if isinstance(view, StreamFeatureView):
                     for stmt in self._provision_ddl(project, view):
+                        cur.execute(stmt)
+                elif isinstance(view, BatchFeatureView) and view.aggregations:
+                    # Only AGGREGATING batch FVs map to the tile model. A non-aggregating
+                    # batch FV (pure transform) is a later increment; skip it here rather
+                    # than mis-provision it.
+                    for stmt in self._provision_batch_ddl(project, view):
                         cur.execute(stmt)
 
     def teardown_infra(
@@ -273,6 +365,9 @@ class RisingWaveComputeEngine(ComputeEngine):
             for view in fvs:
                 if isinstance(view, StreamFeatureView):
                     for stmt in _drop_ddl(project, view):
+                        cur.execute(stmt)
+                elif isinstance(view, BatchFeatureView) and view.aggregations:
+                    for stmt in _batch_drop_ddl(project, view):
                         cur.execute(stmt)
 
     def _provision_ddl(self, project: str, view) -> List[str]:
@@ -301,18 +396,46 @@ class RisingWaveComputeEngine(ComputeEngine):
             )
 
         column_info = _registry_free_column_info(view)
-        name = f"{project}_{view.name}"
+        src = source_name(project, view.name)
+        mv = online_mv_name(project, view.name)
         select = build_windowed_agg_select(
             column_info,
             list(view.aggregations),
-            f"{name}_src",
+            src,
             source_is_retractable=_source_is_retractable(source),
             emit_on_close=emit_on_close,
         )
         return [
-            _source_ddl(f"{name}_src", source, view),
-            _materialized_view_ddl(f"{name}_online", select),
-            _iceberg_sink_ddl(f"{name}_offline", f"{name}_online", column_info, self.config),
+            _source_ddl(src, source, view),
+            _materialized_view_ddl(mv, select),
+            _iceberg_sink_ddl(offline_sink_name(project, view.name), mv, column_info, self.config),
+        ]
+
+    def _provision_batch_ddl(self, project: str, view) -> List[str]:
+        """Registry-free DDL for one tile-aggregating BatchFeatureView: an Iceberg source, a
+        continuous TILES MV (``build_batch_tile_select`` — per-(entity, tile_end) partials), and an
+        ONLINE ROLLUP MV over those tiles (``build_online_rollup_select`` — the request-anchored
+        ``now()`` window rollup, one row per entity). RisingWave maintains both MVs incrementally as
+        the Iceberg table grows (verified live), so there is no scheduler. The point-lookup reads the
+        ROLLUP MV (``online_mv_name``) unchanged — the tiles MV is internal plumbing. NO Iceberg sink
+        yet (the MVs are read directly; durable tile history is a later increment). Offline training
+        rolls the SAME tiles up with ``build_tile_rollup_select`` anchored to each label timestamp."""
+        interval = _aggregation_interval(view)
+        column_info = _batch_column_info(view)
+        aggs = list(view.aggregations)
+        src = source_name(project, view.name)
+        tiles = tiles_name(project, view.name)
+        mv = online_mv_name(project, view.name)
+        tile_select = build_batch_tile_select(
+            column_info, aggs, src, aggregation_interval=interval
+        )
+        rollup_select = build_online_rollup_select(
+            column_info, aggs, tiles, aggregation_interval=interval
+        )
+        return [
+            _iceberg_source_ddl(src, view.source.table, self.config),
+            _materialized_view_ddl(tiles, tile_select),
+            _materialized_view_ddl(mv, rollup_select),
         ]
 
     def _materialize_one(

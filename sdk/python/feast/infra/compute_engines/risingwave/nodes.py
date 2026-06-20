@@ -21,6 +21,10 @@ from typing import List, Optional
 import pandas as pd
 
 from feast.aggregation import Aggregation
+from feast.infra.compute_engines.risingwave.names import (
+    offline_staging_name,
+    source_name,
+)
 from feast.infra.compute_engines.dag.context import ColumnInfo, ExecutionContext
 from feast.infra.compute_engines.dag.model import DAGFormat
 from feast.infra.compute_engines.dag.node import DAGNode
@@ -32,13 +36,48 @@ from feast.infra.compute_engines.utils import (
     infer_entity_timestamp_column,
 )
 
-# Monoid aggregations have no inverse, so RisingWave cannot incrementally *retract*
-# them over an upsert/retractable source without a full per-window recompute.
-# Mirrors Chronon's deletable (Abelian group) vs non-deletable (monoid) split,
-# api.thrift:156-172.
-MONOID_FUNCTIONS = frozenset(
-    {"min", "max", "first", "last", "count_distinct", "approx_unique_count"}
+# Aggregation functions this engine supports, named as the user writes them (the Feast
+# Aggregation.function string). Validated at apply time (build_windowed_agg_select) so an
+# unsupported function fails fast with a clear error instead of reaching RisingWave as raw
+# SQL and only failing at parse time. Grounded in RisingWave's streaming aggregate support:
+#   - sum / count / mean (-> avg) / min / max: core streaming aggregates.
+#   - stddev_pop / stddev_samp / var_pop / var_samp: RisingWave's optimizer rewrites these
+#     into streaming-safe sum(x) / sum(x*x) / count primitives (logical_agg.rs:660-690), so
+#     they run inside an EOWC materialized view.
+#   - count_distinct (count(distinct ...)) + approx_count_distinct (HyperLogLog): streaming,
+#     but monoids without an inverse (see MONOID_FUNCTIONS). NOTE: RisingWave has a known
+#     crash-RECOVERY state bug for updatable approx_count_distinct
+#     (e2e_test/streaming/aggregate/approx_count_distinct.slt.bug) — harmless for our
+#     append-only EOWC model (the source never retracts), but flagged.
+# Deliberately EXCLUDED — rejected at apply with a reason, not silently:
+#   - first(n) / last(n) / first_distinct / last_distinct (sequence features): RisingWave has
+#     no bare first()/last() aggregate; they need ordered-set / Array outputs (a later phase).
+#   - approx_percentile: parameterized (takes the percentile) — needs a parameter field on
+#     feast.Aggregation, which has none today (a later phase).
+#   - aggregation_secondary_key: produces a per-secondary-key breakdown = an Array/Map output
+#     that the scalar engine and the ServingSpec wire do not carry yet (a later phase).
+SUPPORTED_AGG_FUNCTIONS = frozenset(
+    {
+        "sum",
+        "count",
+        "mean",
+        "min",
+        "max",
+        "count_distinct",
+        "approx_count_distinct",
+        "stddev_pop",
+        "stddev_samp",
+        "var_pop",
+        "var_samp",
+    }
 )
+
+# The non-retractable members of SUPPORTED_AGG_FUNCTIONS: monoids with no inverse, so
+# RisingWave cannot incrementally *retract* them over an upsert/retractable source without a
+# full per-window recompute. Mirrors Chronon's deletable (Abelian group) vs non-deletable
+# (monoid) split, api.thrift:156-172. sum/count/mean and stddev/variance are Abelian-group
+# (or decompose into sum/count), so they are retractable-safe and are NOT listed here.
+MONOID_FUNCTIONS = frozenset({"min", "max", "count_distinct", "approx_count_distinct"})
 
 # Feast Aggregation.function -> RisingWave SQL function (only names that differ).
 _SQL_FUNCTION = {"mean": "avg"}
@@ -106,6 +145,17 @@ def build_windowed_agg_select(
     if not aggregations:
         raise ValueError("build_windowed_agg_select requires at least one aggregation")
 
+    # Apply-time allow-list: reject any unsupported function here, with a clear message,
+    # instead of letting it reach RisingWave as raw SQL and fail at parse time.
+    unsupported = sorted({a.function for a in aggregations} - SUPPORTED_AGG_FUNCTIONS)
+    if unsupported:
+        raise ValueError(
+            f"Unsupported aggregation function(s) {unsupported}. The RisingWave engine "
+            f"supports {sorted(SUPPORTED_AGG_FUNCTIONS)}. Sequence aggregations "
+            f"(first/last), approx_percentile (parameterized), and aggregation_secondary_key "
+            f"(Array output) are not yet supported."
+        )
+
     if source_is_retractable:
         monoids = sorted({a.function for a in aggregations} & MONOID_FUNCTIONS)
         if monoids:
@@ -136,6 +186,222 @@ def build_windowed_agg_select(
     if emit_on_close:
         select += " EMIT ON WINDOW CLOSE"
     return select
+
+
+# --- Batch tile aggregation (established feature stores' aggregation engine, tile model) ---------------------
+# A BATCH feature view materializes PARTIAL aggregates at the aggregation_interval (tiles), then
+# rolls them up to the requested window AT RETRIEVAL, anchored to the request/label time. This is
+# distinct from the streaming TUMBLE path above: tiles are a plain batch GROUP BY over a batch
+# relation (e.g. an Iceberg source) and one fixed tile set serves any window size, sliding with the
+# request time. Verified end-to-end live on RW v3.0.0: spike/sql/05c_batch_tiles.sql.
+
+# How each aggregation's per-tile partial is recombined across the tiles in a window. Additive only:
+# sum (sum of sums), count (SUM of counts), min (min of mins), max (max of maxes). mean/stddev
+# (need sum+count / sum+sumsq+count partials) and count_distinct/approx (non-additive) are a later phase.
+_TILE_ROLLUP = {"sum": "sum", "count": "sum", "min": "min", "max": "max"}
+
+# aggregation_interval (the tile size) -> RisingWave date_trunc unit. Standard units only for now
+# (date_trunc is what the spike validated); arbitrary intervals (e.g. 15min) need epoch-bucketing.
+_TILE_INTERVAL_UNIT = {3600: "hour", 86400: "day", 604800: "week"}
+
+
+def _tile_unit(aggregation_interval) -> str:
+    unit = _TILE_INTERVAL_UNIT.get(int(aggregation_interval.total_seconds()))
+    if unit is None:
+        raise ValueError(
+            f"aggregation_interval {aggregation_interval} is not supported yet: the batch tile "
+            f"builder buckets with date_trunc, so it must be 1 "
+            f"{'/'.join(sorted(_TILE_INTERVAL_UNIT.values()))}. Arbitrary intervals need "
+            f"epoch-bucketing (a later phase)."
+        )
+    return unit
+
+
+def _assert_tile_additive(aggregations: List[Aggregation]) -> None:
+    # "Additive" here = has a safe tile COMBINER (a function that merges per-tile partials).
+    # sum/count(->sum)/min/max do; mean/stddev need composite partials (sum+count); count_distinct
+    # and approx are monoids whose sketch state cannot be safely merged across tiles (cf. Chronon's
+    # monoid split, api.thrift). min/max are ALSO monoids but DO have combiners, hence supported.
+    unsupported = sorted({a.function for a in aggregations} - set(_TILE_ROLLUP))
+    if unsupported:
+        raise ValueError(
+            f"Batch tile aggregations {unsupported} have no additive tile combiner: the tile model "
+            f"rolls up per-tile partials, so only {sorted(_TILE_ROLLUP)} are supported today. "
+            f"mean/stddev need composite partials; count_distinct/approx have no safe sketch merge "
+            f"— both are a later phase."
+        )
+
+
+def _single_window_secs(aggregations: List[Aggregation]) -> int:
+    windows = {a.time_window for a in aggregations}
+    if len(windows) != 1 or None in windows:
+        raise ValueError(
+            f"tile rollup needs a single non-null time_window; got {windows} "
+            f"(multiple windows from one tile set is a later phase)."
+        )
+    return int(next(iter(windows)).total_seconds())
+
+
+def _assert_window_multiple_of_interval(window_secs: int, aggregation_interval) -> None:
+    # The window is a COUNT of tiles, so it must be a whole number of aggregation_intervals. This is
+    # also what makes the online now()-anchored rollup equal the offline floor-anchored rollup:
+    # for interval-boundary tiles, (now - W, now] selects the SAME tiles as
+    # (floor(now, interval) - W, floor(now, interval)] only when W is a multiple of the interval.
+    interval_secs = int(aggregation_interval.total_seconds())
+    if window_secs % interval_secs != 0:
+        raise ValueError(
+            f"time_window ({window_secs}s) must be a whole multiple of aggregation_interval "
+            f"({interval_secs}s) for the tile model (the window is a count of tiles)."
+        )
+
+
+def _validate_window_rollup(aggregations: List[Aggregation], aggregation_interval) -> int:
+    """Shared precondition for the three rollup builders (offline floored, online now(), offline PIT):
+    additive aggs only, a single window, and window a whole multiple of the interval. Returns
+    window_secs. Centralized so the online and offline rollups CANNOT validate differently (ADR-0004)."""
+    _assert_tile_additive(aggregations)
+    window_secs = _single_window_secs(aggregations)
+    _assert_window_multiple_of_interval(window_secs, aggregation_interval)
+    return window_secs
+
+
+def _tile_rollup_exprs(aggregations: List[Aggregation], prefix: str = "") -> str:
+    """The per-aggregation rollup-combiner projection, shared by ALL rollup builders so online and
+    offline recombine per-tile partials IDENTICALLY (ADR-0004 no-drift — a single source of truth for
+    `combiner(partial) AS feature`). ``prefix`` qualifies the partial column for a joined relation
+    (e.g. ``"t."`` in the offline PIT range-join)."""
+    return ", ".join(
+        f"{_TILE_ROLLUP[a.function]}({prefix}{a.resolved_name(a.time_window)}) "
+        f"AS {a.resolved_name(a.time_window)}"
+        for a in aggregations
+    )
+
+
+def build_batch_tile_select(
+    column_info: ColumnInfo,
+    aggregations: List[Aggregation],
+    relation: str,
+    *,
+    aggregation_interval,
+) -> str:
+    """Tile materialization for a BATCH feature view: one PARTIAL aggregate per (entity, tile),
+    where a tile spans ``[tile_start, tile_start + aggregation_interval)`` and is stamped by
+    ``tile_end`` (its event-time upper boundary). A plain batch ``GROUP BY date_trunc`` over a batch
+    relation (e.g. a RisingWave Iceberg source) — NOT the streaming TUMBLE path. The additive
+    partial is the aggregate itself, named by the final feature's ``resolved_name`` so tile ->
+    rollup -> serve carry one column name. Rolled up at retrieval by ``build_tile_rollup_select``."""
+    if not aggregations:
+        raise ValueError("build_batch_tile_select requires at least one aggregation")
+    _assert_tile_additive(aggregations)
+    unit = _tile_unit(aggregation_interval)
+    keys = ", ".join(column_info.join_keys_columns)
+    bucket = f"date_trunc('{unit}', {column_info.timestamp_column})"
+    partials = ", ".join(_agg_expr(a) for a in aggregations)  # additive partial == the aggregate
+    return (
+        f"SELECT {keys}, {bucket} + INTERVAL '1 {unit}' AS tile_end, {partials} "
+        f"FROM {relation} GROUP BY {keys}, {bucket}"
+    )
+
+
+def build_tile_rollup_select(
+    column_info: ColumnInfo,
+    aggregations: List[Aggregation],
+    tile_relation: str,
+    *,
+    aggregation_interval,
+    as_of_sql: str,
+) -> str:
+    """Roll up tiles to the requested window, ANCHORED TO THE REQUEST/LABEL time (established feature stores'
+    request-anchored sliding window over a fixed tile set). Recombine each aggregation's per-tile
+    partial with its rollup combiner (sum/min/max). The window is ``(end - time_window, end]`` where
+    ``end = date_trunc(aggregation_interval, as_of)`` = the most-recent aggregation_interval boundary
+    at or before the request/label time. ``as_of_sql`` is a SQL expression: a bind placeholder for
+    online serving, or the entity-row timestamp column for offline PIT. ``tile_end`` carries the
+    event-time PIT boundary, so there is no future leakage."""
+    if not aggregations:
+        raise ValueError("build_tile_rollup_select requires at least one aggregation")
+    window_secs = _validate_window_rollup(aggregations, aggregation_interval)
+    unit = _tile_unit(aggregation_interval)
+    keys = ", ".join(column_info.join_keys_columns)
+    rollups = _tile_rollup_exprs(aggregations)
+    end = f"date_trunc('{unit}', {as_of_sql})"
+    return (
+        f"SELECT {keys}, {rollups} FROM {tile_relation} "
+        f"WHERE tile_end > {end} - INTERVAL '{window_secs}' SECOND AND tile_end <= {end} "
+        f"GROUP BY {keys}"
+    )
+
+
+def build_online_rollup_select(
+    column_info: ColumnInfo,
+    aggregations: List[Aggregation],
+    tile_relation: str,
+    *,
+    aggregation_interval,
+) -> str:
+    """Online rollup MV over the tiles: a CONTINUOUS RisingWave materialized view that maintains the
+    request-anchored window rollup for ``as_of = now()`` (wall-clock), so the ONLINE READ stays an
+    unchanged point-lookup (one row per entity = the current rollup).
+
+    Uses a plain two-sided ``now()`` window ``tile_end > now() - W AND tile_end <= now()`` rather than
+    ``build_tile_rollup_select``'s ``date_trunc(now())`` form. Verified live on RW v3.0.0: a two-sided
+    ``date_trunc(now())`` range in a CREATE MATERIALIZED VIEW is REJECTED ("Failed to run the query"),
+    but the plain two-sided ``now()`` form is accepted AND maintained correctly as the wall-clock
+    advances (tiles evicted past the lower bound and admitted as ``now()`` crosses the upper bound).
+    The two forms are EQUIVALENT here because tiles live only at ``aggregation_interval`` boundaries and the
+    window is a whole number of intervals (``_assert_window_multiple_of_interval``): no tile ever falls
+    in the intra-interval gap between ``now()`` and ``floor(now(), interval)``. So online (now-anchored)
+    == offline (floor-anchored) for the same as_of. ``max(tile_end) AS window_end`` is the PIT stamp the
+    point-lookup orders by (one row per entity, so LIMIT 1 is that row)."""
+    if not aggregations:
+        raise ValueError("build_online_rollup_select requires at least one aggregation")
+    window_secs = _validate_window_rollup(aggregations, aggregation_interval)
+    keys = ", ".join(column_info.join_keys_columns)
+    rollups = _tile_rollup_exprs(aggregations)
+    return (
+        f"SELECT {keys}, {rollups}, max(tile_end) AS window_end FROM {tile_relation} "
+        f"WHERE tile_end > now() - INTERVAL '{window_secs}' SECOND AND tile_end <= now() "
+        f"GROUP BY {keys}"
+    )
+
+
+def build_offline_tile_pit_query(
+    entity_df_sql: str,
+    entity_columns: List[str],
+    label_ts_column: str,
+    *,
+    tiles_relation: str,
+    column_info: ColumnInfo,
+    aggregations: List[Aggregation],
+    aggregation_interval,
+) -> str:
+    """Offline point-in-time training rollup for a tile BatchFeatureView. For EACH entity row, rolls
+    the tiles up in the request-anchored window ``(end - W, end]`` where ``end = floor(label_ts,
+    aggregation_interval)`` — anchored to THAT ROW's label timestamp (NOT a global now()).
+
+    This CANNOT reuse Feast's standard latest-row PIT template: that picks the latest tile <= label,
+    which anchors the window at the latest tile WITH DATA, not at floor(label) — they diverge when the
+    most recent intervals have no events (verified live: 180/280/230 vs a wrong 180/280/280). So we
+    range-JOIN the inlined entity rows to the tiles and GROUP BY the entity row. LEFT JOIN so a row
+    with no tiles in range still appears (NULL feature). Single tile feature view per query for now.
+
+    TTL note: the feature view's ``ttl`` is intentionally NOT applied as a second lower bound. For an
+    aggregation feature view the ``time_window`` IS the lookback bound (Chronon semantics); a
+    ttl shorter than the window would silently shrink the aggregation below what the user requested, and
+    a longer ttl is a no-op. So the window is the single, authoritative bound."""
+    window_secs = _validate_window_rollup(aggregations, aggregation_interval)
+    unit = _tile_unit(aggregation_interval)
+    keys = column_info.join_keys_columns
+    e_cols = ", ".join(f'e."{c}"' for c in entity_columns)
+    join_on = " AND ".join(f't."{k}" = e."{k}"' for k in keys)
+    end = f'date_trunc(\'{unit}\', e."{label_ts_column}")'
+    rollups = _tile_rollup_exprs(aggregations, prefix="t.")
+    return (
+        f"SELECT {e_cols}, {rollups} FROM ({entity_df_sql}) e "
+        f"LEFT JOIN {tiles_relation} t ON {join_on} "
+        f"AND t.tile_end > {end} - INTERVAL '{window_secs}' SECOND AND t.tile_end <= {end} "
+        f"GROUP BY {e_cols}"
+    )
 
 
 def _quote(identifier: str) -> str:
@@ -201,7 +467,7 @@ class RWSourceNode(_RWNode):
     """
 
     def execute(self, context: ExecutionContext) -> DAGValue:
-        relation = _quote(f"{context.project}_{self.view.name}_src")
+        relation = _quote(source_name(context.project, self.view.name))
         columns = list(self.column_info.join_keys_columns)
         ts = self.column_info.timestamp_column
         if ts and ts not in columns:
@@ -641,7 +907,7 @@ class RWOutputNode(_RWNode):
             # Preferred long-term: read the live sink's Iceberg history so backfill ==
             # what was served (risk #8). The bounded [start, end) predicate is applied
             # by the upstream filter node before this INSERT.
-            staging = _quote(f"{context.project}_{self.view.name}_offline_staging")
+            staging = _quote(offline_staging_name(context.project, self.view.name))
             sql = f"INSERT INTO {staging} {select_sql}"
 
         return self._value(

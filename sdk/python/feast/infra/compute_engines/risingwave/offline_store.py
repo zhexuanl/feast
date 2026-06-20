@@ -17,19 +17,38 @@ from typing import List, Literal, Optional, Union
 
 import pandas as pd
 
+from feast.batch_feature_view import BatchFeatureView
 from feast.feature_view import FeatureView
+from feast.infra.compute_engines.dag.context import ColumnInfo
+from feast.infra.compute_engines.risingwave.engine import _aggregation_interval
+from feast.infra.compute_engines.risingwave.names import tiles_name
+from feast.infra.compute_engines.risingwave.nodes import build_offline_tile_pit_query
+from feast.infra.offline_stores import offline_utils
 from feast.infra.offline_stores.contrib.postgres_offline_store.postgres import (
     EntitySelectMode,
     PostgreSQLOfflineStore,
     PostgreSQLOfflineStoreConfig,
+    PostgreSQLRetrievalJob,
 )
 from feast.infra.offline_stores.offline_store import RetrievalJob
 from feast.infra.registry.base_registry import BaseRegistry
+from feast.on_demand_feature_view import OnDemandFeatureView
 from feast.repo_config import RepoConfig
 
 _OFFLINE_STORE_PATH = (
     "feast.infra.compute_engines.risingwave.offline_store.RisingWaveOfflineStore"
 )
+
+
+def _is_tile_fv(fv: FeatureView) -> bool:
+    # A tile BatchFeatureView: the engine provisioned a tiles MV for it, so training must roll the
+    # tiles up per label timestamp (build_offline_tile_pit_query) instead of the standard latest-row
+    # PIT. The aggregation_interval tag is set by the ourfs BatchFeatureView authoring surface.
+    return (
+        isinstance(fv, BatchFeatureView)
+        and bool(getattr(fv, "aggregations", None))
+        and "ourfs_aggregation_interval" in (fv.tags or {})
+    )
 
 
 class RisingWaveOfflineStoreConfig(PostgreSQLOfflineStoreConfig):
@@ -89,6 +108,12 @@ class RisingWaveOfflineStore(PostgreSQLOfflineStore):
         full_feature_names: bool = False,
         **kwargs,
     ) -> RetrievalJob:
+        tile_fvs = [fv for fv in feature_views if _is_tile_fv(fv)]
+        if tile_fvs:
+            return _tile_historical_features(
+                config, feature_views, tile_fvs, feature_refs, entity_df,
+                registry, project, full_feature_names,
+            )
         # Inline a DataFrame entity_df as SQL so the parent uses its embed_query/CTE
         # path (no temp-table upload). RisingWave INSERTs are async, so an uploaded
         # entity table is empty when the PIT query runs -> 0 training rows.
@@ -104,3 +129,61 @@ class RisingWaveOfflineStore(PostgreSQLOfflineStore):
             full_feature_names=full_feature_names,
             **kwargs,
         )
+
+
+def _tile_historical_features(
+    config, feature_views, tile_fvs, feature_refs, entity_df,
+    registry, project, full_feature_names,
+) -> RetrievalJob:
+    # Floor-anchored range-agg PIT for tile feature views (build_offline_tile_pit_query). The
+    # standard latest-row template anchors at the latest tile WITH DATA, not floor(label) — wrong
+    # when recent intervals are empty (verified live). One tile FV per query for now; mixing tile
+    # with stream/other FVs in one retrieval is a later increment.
+    if len(feature_views) != 1:
+        raise NotImplementedError(
+            "RisingWave offline tile rollup currently supports exactly one tile feature view per "
+            f"retrieval; got {len(feature_views)} views ({len(tile_fvs)} tile). Mixing tile feature "
+            "views with stream/other views in one get_historical_features call is a later increment."
+        )
+    if entity_df is None:
+        raise NotImplementedError(
+            "RisingWave offline tile rollup requires an entity dataframe (the per-label PIT anchor); "
+            "entity-less retrieval is not supported."
+        )
+    fv = tile_fvs[0]
+    if isinstance(entity_df, pd.DataFrame):
+        entity_columns = list(entity_df.columns)
+        label_ts_column = offline_utils.infer_event_timestamp_from_entity_df(
+            dict(entity_df.dtypes)
+        )
+        entity_df_sql = _entity_df_to_sql(entity_df)
+    else:
+        raise NotImplementedError(
+            "RisingWave offline tile rollup currently requires a DataFrame entity_df (it is inlined "
+            "as SQL); a SQL-string entity_df is a later increment."
+        )
+
+    column_info = ColumnInfo(
+        join_keys=[f.name for f in fv.entity_columns],
+        feature_cols=[f.name for f in fv.features],
+        ts_col=label_ts_column,
+        created_ts_col=None,
+        field_mapping=None,
+    )
+    query = build_offline_tile_pit_query(
+        entity_df_sql,
+        entity_columns,
+        label_ts_column,
+        tiles_relation=tiles_name(project, fv.name),
+        column_info=column_info,
+        aggregations=list(fv.aggregations),
+        aggregation_interval=_aggregation_interval(fv),
+    )
+    return PostgreSQLRetrievalJob(
+        query=query,
+        config=config,
+        full_feature_names=full_feature_names,
+        on_demand_feature_views=OnDemandFeatureView.get_requested_odfvs(
+            feature_refs, project, registry
+        ),
+    )

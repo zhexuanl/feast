@@ -21,7 +21,11 @@ from feast.data_format import JsonFormat
 from feast.data_source import KafkaSource, PushSource
 from feast.infra.compute_engines.risingwave.engine import (
     RisingWaveComputeEngine,
+    _aggregation_interval,
+    _batch_drop_ddl,
     _iceberg_sink_ddl,
+    _iceberg_source_ddl,
+    _iceberg_storage_opts,
 )
 from feast.infra.compute_engines.risingwave.offline_store import (
     RisingWaveOfflineStore,
@@ -31,6 +35,10 @@ from feast.infra.compute_engines.risingwave.offline_store import (
 from feast.infra.compute_engines.risingwave.nodes import (
     RWFilterNode,
     RWJoinNode,
+    build_batch_tile_select,
+    build_offline_tile_pit_query,
+    build_online_rollup_select,
+    build_tile_rollup_select,
     build_windowed_agg_select,
 )
 from feast.infra.compute_engines.dag.context import ColumnInfo, ExecutionContext
@@ -201,6 +209,234 @@ def test_emit_on_window_close_is_appended_only_when_requested():
     assert eowc.endswith("EMIT ON WINDOW CLOSE")
 
 
+# --- Aggregation breadth: allow-list + streaming-safe stddev/variance + approx_count_distinct ---
+
+
+@pytest.mark.parametrize("function", ["median", "foobar", "approx_percentile", "first", "last"])
+def test_unsupported_aggregation_function_is_rejected_at_apply(function):
+    # Unknown / unsupported functions must fail at apply with a clear message, not reach
+    # RisingWave as raw SQL and fail at parse time.
+    with pytest.raises(ValueError, match="Unsupported aggregation function"):
+        build_windowed_agg_select(
+            _column_info(), [_agg(function)], "src",
+            source_is_retractable=False, emit_on_close=False,
+        )
+
+
+@pytest.mark.parametrize("function", ["stddev_pop", "stddev_samp", "var_pop", "var_samp"])
+def test_stddev_and_variance_emit_native_rw_sql(function):
+    sql = build_windowed_agg_select(
+        _column_info(), [_agg(function)], "src",
+        source_is_retractable=False, emit_on_close=False,
+    )
+    assert f"{function}(amount) AS {function}_amount_3600s" in sql
+
+
+@pytest.mark.parametrize("function", ["stddev_pop", "stddev_samp", "var_pop", "var_samp"])
+def test_stddev_and_variance_are_not_monoids_over_retractable_source(function):
+    # RisingWave decomposes these into streaming sum(x)/sum(x*x)/count (Abelian group), so it
+    # can retract them over an upsert source — they must NOT trip the monoid guard.
+    sql = build_windowed_agg_select(
+        _column_info(), [_agg(function)], "src",
+        source_is_retractable=True, emit_on_close=False,
+    )
+    assert "tumble(" in sql
+
+
+def test_approx_count_distinct_emits_native_sql_and_is_monoid():
+    sql = build_windowed_agg_select(
+        _column_info(), [_agg("approx_count_distinct")], "src",
+        source_is_retractable=False, emit_on_close=False,
+    )
+    assert "approx_count_distinct(amount) AS approx_count_distinct_amount_3600s" in sql
+    # HLL has no inverse -> monoid -> rejected over a retractable source.
+    with pytest.raises(ValueError, match="monoid"):
+        build_windowed_agg_select(
+            _column_info(), [_agg("approx_count_distinct")], "src",
+            source_is_retractable=True, emit_on_close=False,
+        )
+
+
+# --- Batch tile aggregation (established feature stores tile model: partial aggregates + retrieval rollup) ---
+# Validated end-to-end live on RW v3.0.0: spike/sql/05c_batch_tiles.sql.
+
+
+def test_batch_tile_select_buckets_by_interval_and_stamps_tile_end():
+    sql = build_batch_tile_select(
+        _column_info(), [_agg("sum", 2592000)], "src", aggregation_interval=timedelta(days=1)
+    )
+    # 1-day tiles, stamped by tile_end (the event-time upper boundary of the tile).
+    assert "date_trunc('day', event_ts) + INTERVAL '1 day' AS tile_end" in sql
+    # the tile holds the PARTIAL sum under the final feature's resolved name.
+    assert "sum(amount) AS sum_amount_2592000s" in sql
+    assert "GROUP BY user_id, date_trunc('day', event_ts)" in sql
+
+
+def test_batch_tile_count_partial_is_count():
+    sql = build_batch_tile_select(
+        _column_info(), [_agg("count", 2592000)], "src", aggregation_interval=timedelta(days=1)
+    )
+    assert "count(amount) AS count_amount_2592000s" in sql
+
+
+def test_batch_tile_rollup_recombines_partials_in_request_anchored_window():
+    sql = build_tile_rollup_select(
+        _column_info(), [_agg("sum", 2592000)], "tiles",
+        aggregation_interval=timedelta(days=1), as_of_sql="$1",
+    )
+    # sum partials roll up with sum, under the same feature name.
+    assert "sum(sum_amount_2592000s) AS sum_amount_2592000s" in sql
+    # request-anchored sliding window: end = the most-recent aggregation_interval boundary <= as_of.
+    assert "tile_end > date_trunc('day', $1) - INTERVAL '2592000' SECOND" in sql
+    assert "tile_end <= date_trunc('day', $1)" in sql
+    assert "GROUP BY user_id" in sql
+
+
+def test_batch_tile_count_rollup_combiner_is_sum():
+    sql = build_tile_rollup_select(
+        _column_info(), [_agg("count", 2592000)], "tiles",
+        aggregation_interval=timedelta(days=1), as_of_sql="$1",
+    )
+    # COUNT tiles recombine by SUMMING the per-tile counts (not count()).
+    assert "sum(count_amount_2592000s) AS count_amount_2592000s" in sql
+
+
+def test_batch_tile_min_max_roll_up_with_min_max():
+    tile = build_batch_tile_select(
+        _column_info(), [_agg("max", 2592000)], "src", aggregation_interval=timedelta(days=1)
+    )
+    assert "max(amount) AS max_amount_2592000s" in tile
+    roll = build_tile_rollup_select(
+        _column_info(), [_agg("max", 2592000)], "tiles",
+        aggregation_interval=timedelta(days=1), as_of_sql="$1",
+    )
+    assert "max(max_amount_2592000s) AS max_amount_2592000s" in roll
+
+
+@pytest.mark.parametrize("function", ["mean", "stddev_pop", "count_distinct", "approx_count_distinct"])
+def test_batch_tile_rejects_non_additive_aggregation(function):
+    # mean/stddev (need sum+count / sum+sumsq+count partials) and count_distinct/approx (non-additive)
+    # cannot roll up from simple per-tile partials yet — rejected with a clear message.
+    with pytest.raises(ValueError, match="additive"):
+        build_batch_tile_select(
+            _column_info(), [_agg(function, 2592000)], "src", aggregation_interval=timedelta(days=1)
+        )
+
+
+def test_batch_tile_rejects_non_standard_interval():
+    with pytest.raises(ValueError, match="aggregation_interval"):
+        build_batch_tile_select(
+            _column_info(), [_agg("sum", 2592000)], "src", aggregation_interval=timedelta(minutes=15)
+        )
+
+
+# --- online rollup MV: continuous now()-anchored window over the tiles (point-looked-up) ---
+
+
+def test_online_rollup_uses_plain_now_two_sided_window():
+    sql = build_online_rollup_select(
+        _column_info(), [_agg("sum", 2592000)], "tiles",
+        aggregation_interval=timedelta(days=1),
+    )
+    # plain now() (NOT date_trunc(now()), which RW rejects in a two-sided temporal-filter MV)
+    assert "tile_end > now() - INTERVAL '2592000' SECOND" in sql
+    assert "tile_end <= now()" in sql
+    assert "date_trunc" not in sql
+    # combiner rolls per-tile sum partials up under the same feature name
+    assert "sum(sum_amount_2592000s) AS sum_amount_2592000s" in sql
+    # one row per entity; window_end is the PIT stamp the point-lookup ORDER BYs
+    assert "max(tile_end) AS window_end" in sql
+    assert "GROUP BY user_id" in sql
+
+
+def test_online_rollup_count_combiner_is_sum():
+    sql = build_online_rollup_select(
+        _column_info(), [_agg("count", 2592000)], "tiles",
+        aggregation_interval=timedelta(days=1),
+    )
+    assert "sum(count_amount_2592000s) AS count_amount_2592000s" in sql
+
+
+@pytest.mark.parametrize("function", ["mean", "stddev_pop", "count_distinct"])
+def test_online_rollup_rejects_non_additive_aggregation(function):
+    with pytest.raises(ValueError, match="additive"):
+        build_online_rollup_select(
+            _column_info(), [_agg(function, 2592000)], "tiles",
+            aggregation_interval=timedelta(days=1),
+        )
+
+
+def test_online_rollup_rejects_window_not_multiple_of_interval():
+    # a 1-hour window over 1-day tiles is not a whole number of tiles -> online/offline can't agree
+    with pytest.raises(ValueError, match="multiple"):
+        build_online_rollup_select(
+            _column_info(), [_agg("sum", 3600)], "tiles",
+            aggregation_interval=timedelta(days=1),
+        )
+
+
+def test_tile_rollup_offline_also_rejects_window_not_multiple_of_interval():
+    # the same equivalence guard applies to the offline (date_trunc) rollup
+    with pytest.raises(ValueError, match="multiple"):
+        build_tile_rollup_select(
+            _column_info(), [_agg("sum", 3600)], "tiles",
+            aggregation_interval=timedelta(days=1), as_of_sql="$1",
+        )
+
+
+# --- offline tile PIT: floor-anchored range-agg join, per entity-row label ---
+
+
+def test_offline_tile_pit_anchors_window_at_floor_of_each_label():
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="proj_v_tiles",
+        column_info=_column_info(), aggregations=[_agg("sum", 259200)],
+        aggregation_interval=timedelta(days=1),
+    )
+    assert "LEFT JOIN proj_v_tiles t" in sql  # LEFT so no-tile rows still appear (NULL feature)
+    assert 't."user_id" = e."user_id"' in sql  # range-join on the entity key
+    # window anchored at floor(THIS ROW's label), not a global now() and not the latest tile
+    assert "t.tile_end > date_trunc('day', e.\"event_timestamp\") - INTERVAL '259200' SECOND" in sql
+    assert "t.tile_end <= date_trunc('day', e.\"event_timestamp\")" in sql
+    assert "sum(t.sum_amount_259200s) AS sum_amount_259200s" in sql  # combiner rolls partials up
+    assert 'GROUP BY e."user_id", e."event_timestamp"' in sql  # one output row per entity-label
+
+
+def test_offline_tile_pit_count_combiner_is_sum():
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(),
+        aggregations=[_agg("count", 259200)], aggregation_interval=timedelta(days=1),
+    )
+    assert "sum(t.count_amount_259200s) AS count_amount_259200s" in sql
+
+
+@pytest.mark.parametrize("function", ["mean", "stddev_pop"])
+def test_offline_tile_pit_rejects_non_additive(function):
+    with pytest.raises(ValueError, match="additive"):
+        build_offline_tile_pit_query(
+            "SELECT 1", ["user_id", "event_timestamp"], "event_timestamp",
+            tiles_relation="t", column_info=_column_info(),
+            aggregations=[_agg(function, 259200)], aggregation_interval=timedelta(days=1),
+        )
+
+
+def test_offline_tile_pit_does_not_apply_ttl_only_the_window_bounds():
+    # For an aggregation FV the time_window IS the lookback bound (Chronon); ttl is NOT a
+    # second bound. Pin it: exactly one tile_end lower bound (the window), no extra ttl filter.
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(),
+        aggregations=[_agg("sum", 259200)], aggregation_interval=timedelta(days=1),
+    )
+    assert sql.count("t.tile_end >") == 1  # only the window lower bound, no ttl lower bound
+    assert "ttl" not in sql.lower()
+
+
 # --- Provisioning guards ---
 
 
@@ -230,6 +466,121 @@ def test_provision_emits_source_mv_and_iceberg_sink():
     assert sink_sql.startswith("CREATE SINK")
     assert "connector='iceberg'" in sink_sql
     assert '"window_end" AS event_timestamp' in sink_sql
+
+
+# --- Phase 6 Inc 2: BATCH feature view provisioning (Iceberg source -> tiles MV) ---
+
+
+def _iceberg_batch_source(table="txn_ice", ts="event_ts"):
+    # Stands in for the Feast custom Iceberg batch source (the real DataSource is a
+    # follow-up): _provision_batch_ddl only reads .table + .timestamp_field off it.
+    return SimpleNamespace(name=table, table=table, timestamp_field=ts)
+
+
+def _batch_view(aggs, interval_secs=86400, name="user_txn_daily"):
+    return SimpleNamespace(
+        name=name,
+        source=_iceberg_batch_source(),
+        aggregations=list(aggs),
+        entity_columns=[SimpleNamespace(name="user_id", dtype="String")],
+        features=[SimpleNamespace(name=a.resolved_name(a.time_window)) for a in aggs],
+        tags={"ourfs_aggregation_interval": str(interval_secs)},
+        offline=True,
+    )
+
+
+def test_provision_batch_emits_source_tiles_mv_and_online_rollup_mv():
+    # daily (86400s) tiles, 3-day (259200s) window
+    agg = _agg("sum", window_seconds=259200)
+    view = _batch_view([agg])
+    ddl = _engine()._provision_batch_ddl("proj", view)
+    assert len(ddl) == 3  # source + tiles MV + online rollup MV; NO Iceberg sink (MVs read directly)
+    source_sql, tiles_sql, rollup_sql = ddl
+    feat = agg.resolved_name(agg.time_window)
+
+    assert source_sql.startswith("CREATE SOURCE")
+    assert "connector='iceberg'" in source_sql
+    assert "table.name='txn_ice'" in source_sql
+    assert "WATERMARK" not in source_sql  # a batch source has no watermark
+
+    # tiles MV: internal _tiles name, per-(entity, tile_end) partials over the iceberg source
+    assert tiles_sql.startswith("CREATE MATERIALIZED VIEW")
+    assert '"proj_user_txn_daily_tiles"' in tiles_sql
+    assert "date_trunc('day'" in tiles_sql
+    assert "tile_end" in tiles_sql
+    assert feat in tiles_sql  # the partial carries the FINAL feature's resolved_name
+
+    # online rollup MV: the point-looked-up _online name, plain now() window over the tiles MV
+    assert rollup_sql.startswith("CREATE MATERIALIZED VIEW")
+    assert '"proj_user_txn_daily_online"' in rollup_sql
+    assert "FROM proj_user_txn_daily_tiles" in rollup_sql  # reads FROM the tiles MV
+    assert "now() - INTERVAL '259200' SECOND" in rollup_sql
+    assert "tile_end <= now()" in rollup_sql
+    assert "date_trunc" not in rollup_sql  # RW rejects two-sided date_trunc(now()) in an MV
+    assert "max(tile_end) AS window_end" in rollup_sql  # PIT stamp for the point-lookup
+    assert f"sum({feat}) AS {feat}" in rollup_sql  # combiner rolls partials up under one name
+
+
+def test_provision_batch_requires_aggregation_interval_tag():
+    view = _batch_view([_agg("sum")])
+    view.tags = {}  # Feast Aggregation carries no interval; the tile size must come from a tag
+    with pytest.raises(ValueError, match="aggregation_interval"):
+        _engine()._provision_batch_ddl("proj", view)
+
+
+def test_aggregation_interval_rejects_non_integer_tag():
+    view = _batch_view([_agg("sum")])
+    view.tags = {"ourfs_aggregation_interval": "daily"}  # must be integer seconds
+    with pytest.raises(ValueError, match="integer number of seconds"):
+        _aggregation_interval(view)
+
+
+def test_iceberg_source_ddl_escapes_single_quotes_in_table_name():
+    config = _engine().config
+    sql = _iceberg_source_ddl("src", "my'table", config)
+    assert "table.name='my''table'" in sql  # escaped, not a broken/injectable literal
+
+
+def _config_with_s3(access="minio-access", secret="sup3r's3cret"):
+    return SimpleNamespace(
+        emit_on_window_close=True, catalog_name="feast", catalog_type="storage",
+        warehouse_path="s3a://feast/wh", iceberg_database="feast",
+        s3_endpoint="http://minio:9000", s3_region="us-east-1",
+        s3_access_key=access, s3_secret_key=secret,
+    )
+
+
+def test_iceberg_opts_omit_s3_credentials_for_ambient_chain():
+    # PRODUCTION path: no explicit keys in config -> keys omitted from DDL -> RW uses the node's
+    # ambient AWS credential chain (IAM role / env). No credential in the catalog-persisted DDL.
+    opts = " ".join(_iceberg_storage_opts(_engine().config))  # _engine() has s3_* = None
+    assert "s3.access.key" not in opts
+    assert "s3.secret.key" not in opts
+    assert "catalog.name='feast'" in opts  # non-credential storage opts still present
+
+
+def test_iceberg_opts_escape_explicit_dev_credentials():
+    # DEV/MinIO path: explicit keys are escaped against the single-quoted option literal.
+    config = _config_with_s3(secret="sup3r's3cret")
+    opts = " ".join(_iceberg_storage_opts(config))
+    assert "s3.secret.key='sup3r''s3cret'" in opts  # escaped, not broken/injectable
+
+
+@pytest.mark.parametrize("function", ["mean", "stddev_pop"])
+def test_provision_batch_rejects_non_additive_aggregation(function):
+    view = _batch_view([_agg(function)])
+    with pytest.raises(ValueError, match="additive"):
+        _engine()._provision_batch_ddl("proj", view)
+
+
+def test_batch_drop_ddl_drops_both_mvs_and_source_with_no_sink():
+    view = _batch_view([_agg("sum")])
+    stmts = _batch_drop_ddl("proj", view)
+    # drop order: online rollup MV, then the tiles MV it reads, then the source
+    assert stmts[0] == 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_online"'
+    assert stmts[1] == 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_tiles"'
+    assert stmts[2].startswith("DROP SOURCE")
+    assert not any("SINK" in s for s in stmts)  # none provisioned, none to drop
 
 
 # (Removed: engine.get_historical_features tests — retrieval is the offline store's
