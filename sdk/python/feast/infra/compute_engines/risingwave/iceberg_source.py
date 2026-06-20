@@ -1,0 +1,207 @@
+"""IcebergSource — the batch DataSource for a tile feature view, and the single home for tile-view
+detection + spec access.
+
+A tile feature view aggregates over an Iceberg table that RisingWave reads via
+``CREATE SOURCE ... connector='iceberg'`` (engine.py ``_iceberg_source_ddl``). This source carries
+the per-view coordinate — the Iceberg ``table`` and the event ``timestamp_field`` — AND the tile
+aggregation spec (``aggregations`` + ``aggregation_interval``). The catalog / warehouse / S3
+connection lives once in the engine config, so it is not repeated per source.
+
+Why the spec lives on the SOURCE, not on the feature view: Feast's registry has no
+``batch_feature_views`` list, so a ``BatchFeatureView`` round-trips as a plain ``FeatureView`` proto
+that DROPS its aggregations and its type. A ``CUSTOM_SOURCE``'s ``custom_options`` round-trips
+cleanly (the contrib sources rely on this) — the source is the one object that survives intact. So a
+tile feature view is just a plain ``feast.FeatureView`` whose ``batch_source`` is an ``IcebergSource``
+carrying the spec; ``is_tile_fv(view)`` is the ONE discriminator at every altitude (provisioning,
+serving, training), and ``view_aggregations`` / ``tile_interval`` are the ONE way to read the spec.
+"""
+
+import json
+from datetime import timedelta
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
+
+from feast.aggregation import Aggregation
+from feast.data_source import DataSource
+from feast.protos.feast.core.DataSource_pb2 import DataSource as DataSourceProto
+from feast.repo_config import RepoConfig
+from feast.value_type import ValueType
+
+_CLASS_PATH = "feast.infra.compute_engines.risingwave.iceberg_source.IcebergSource"
+
+
+def _encode_aggregations(aggregations: List[Aggregation]) -> List[dict]:
+    # slide_interval is intentionally not carried: the tile model is tumbling-at-interval today.
+    return [
+        {
+            "function": a.function,
+            "column": a.column,
+            "window_secs": int(a.time_window.total_seconds()),
+            "name": a.name or None,
+        }
+        for a in aggregations
+    ]
+
+
+def _decode_aggregations(items: List[dict]) -> List[Aggregation]:
+    return [
+        Aggregation(
+            column=d["column"],
+            function=d["function"],
+            time_window=timedelta(seconds=d["window_secs"]),
+            name=d.get("name"),
+        )
+        for d in items
+    ]
+
+
+class IcebergSource(DataSource):
+    """A batch data source naming the Iceberg ``table`` a tile feature view aggregates over, plus the
+    tile aggregation spec it is aggregated with (round-trips via ``custom_options``)."""
+
+    def source_type(self) -> DataSourceProto.SourceType.ValueType:
+        return DataSourceProto.CUSTOM_SOURCE
+
+    def __init__(
+        self,
+        *,
+        table: str,
+        timestamp_field: str,
+        aggregations: Optional[List[Aggregation]] = None,
+        aggregation_interval: Optional[timedelta] = None,
+        name: Optional[str] = None,
+        description: Optional[str] = "",
+        tags: Optional[Dict[str, str]] = None,
+        owner: Optional[str] = "",
+    ):
+        """Args:
+        table: the Iceberg table name (within the engine config's catalog/database).
+        timestamp_field: the event-time column the tiles are bucketed by.
+        aggregations / aggregation_interval: the tile spec (set by the BatchFeatureView factory).
+        name: source name; defaults to ``table``.
+        """
+        if not table:
+            raise ValueError("IcebergSource requires a non-empty 'table'.")
+        if not timestamp_field:
+            raise ValueError(
+                "IcebergSource requires 'timestamp_field' (the event-time column the tiles bucket by)."
+            )
+        self.table = table
+        self.aggregations = list(aggregations) if aggregations else []
+        self.aggregation_interval = aggregation_interval
+        super().__init__(
+            name=name or table,  # table is validated non-empty above, so the source always has a name
+            timestamp_field=timestamp_field,
+            description=description,
+            tags=tags,
+            owner=owner,
+        )
+
+    def __hash__(self):
+        return super().__hash__()
+
+    def __eq__(self, other):
+        if not isinstance(other, IcebergSource):
+            raise TypeError("Comparisons should only involve IcebergSource class objects.")
+        return (
+            super().__eq__(other)
+            and self.table == other.table
+            and self.timestamp_field == other.timestamp_field
+            and self.aggregations == other.aggregations
+            and self.aggregation_interval == other.aggregation_interval
+        )
+
+    @staticmethod
+    def from_proto(data_source: DataSourceProto) -> "IcebergSource":
+        assert data_source.HasField("custom_options")
+        cfg = json.loads(data_source.custom_options.configuration)
+        interval_secs = cfg.get("aggregation_interval_secs")
+        return IcebergSource(
+            name=cfg["name"],
+            table=cfg["table"],
+            timestamp_field=data_source.timestamp_field,
+            aggregations=_decode_aggregations(cfg.get("aggregations") or []),
+            aggregation_interval=(
+                timedelta(seconds=interval_secs) if interval_secs is not None else None
+            ),
+            description=data_source.description,
+            tags=dict(data_source.tags),
+            owner=data_source.owner,
+        )
+
+    def _to_proto_impl(self) -> DataSourceProto:
+        cfg = {
+            "name": self.name,
+            "table": self.table,
+            "aggregations": _encode_aggregations(self.aggregations),
+            "aggregation_interval_secs": (
+                int(self.aggregation_interval.total_seconds())
+                if self.aggregation_interval is not None
+                else None
+            ),
+        }
+        proto = DataSourceProto(
+            name=self.name,
+            type=DataSourceProto.CUSTOM_SOURCE,
+            data_source_class_type=_CLASS_PATH,
+            custom_options=DataSourceProto.CustomSourceOptions(
+                configuration=json.dumps(cfg).encode()
+            ),
+            description=self.description,
+            tags=self.tags,
+            owner=self.owner,
+        )
+        proto.timestamp_field = self.timestamp_field
+        return proto
+
+    def validate(self, config: RepoConfig):
+        pass
+
+    @staticmethod
+    def source_datatype_to_feast_value_type() -> Callable[[str], ValueType]:
+        # Never called: the feature view declares an explicit schema, so Feast does not infer types
+        # from this source. Present only to satisfy the DataSource abstract interface.
+        def _unsupported(_: str) -> ValueType:
+            raise NotImplementedError(
+                "IcebergSource does not infer column types; declare the feature view schema."
+            )
+
+        return _unsupported
+
+    def get_table_column_names_and_types(
+        self, config: RepoConfig
+    ) -> Iterable[Tuple[str, str]]:
+        raise NotImplementedError(
+            "IcebergSource is metadata-only; the feature view declares its schema and training reads "
+            "the tiles MV via the RisingWave offline store."
+        )
+
+    def get_table_query_string(self) -> str:
+        return self.table
+
+
+# --- tile-view detection + spec access (the ONE discriminator / accessor at every altitude) ---
+
+
+def is_tile_fv(view) -> bool:
+    """A tile feature view: a (plain) feature view whose ``batch_source`` is an ``IcebergSource``
+    carrying a tile aggregation spec. The IcebergSource (a CUSTOM_SOURCE) survives Feast's registry
+    round-trip with its type + custom_options intact, so this one check works at every altitude —
+    provisioning (in-memory), serving, and training (registry-read). A stream view's source is a
+    KafkaSource, so it is naturally excluded."""
+    src = getattr(view, "batch_source", None)
+    return isinstance(src, IcebergSource) and bool(src.aggregations)
+
+
+def view_aggregations(view) -> List[Aggregation]:
+    """The aggregations for an online-servable view, for BOTH a stream view (``view.aggregations``,
+    intact via the StreamFeatureView proto) and a tile view (the spec on its ``IcebergSource``, since
+    a plain FeatureView's own ``aggregations`` are dropped by the registry). One accessor so the
+    resolved feature-column names cannot drift across provisioning / serving / training."""
+    if is_tile_fv(view):
+        return list(view.batch_source.aggregations)
+    return list(getattr(view, "aggregations", None) or [])
+
+
+def tile_interval(view) -> timedelta:
+    """The aggregation_interval (tile size) for a tile view — carried, typed, on its IcebergSource."""
+    return view.batch_source.aggregation_interval

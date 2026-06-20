@@ -14,7 +14,6 @@ inline ``UNVERIFIED`` markers).
 """
 
 import logging
-from datetime import timedelta
 from typing import List, Literal, Optional, Sequence, Union
 
 from feast import (
@@ -42,6 +41,11 @@ from feast.infra.compute_engines.risingwave.names import (
     online_mv_name,
     source_name,
     tiles_name,
+)
+from feast.infra.compute_engines.risingwave.iceberg_source import (
+    is_tile_fv,
+    tile_interval,
+    view_aggregations,
 )
 from feast.infra.compute_engines.risingwave.nodes import (
     build_batch_tile_select,
@@ -131,35 +135,16 @@ def _registry_free_column_info(view) -> ColumnInfo:
 
 
 def _batch_column_info(view) -> ColumnInfo:
-    # Batch analog of _registry_free_column_info: the timestamp is on the BATCH source
-    # (view.source), not a stream_source. feature_cols are the resolved output names —
-    # carried onto the tile partials by build_batch_tile_select.
+    # Batch analog of _registry_free_column_info: the timestamp is on the BATCH source (the
+    # IcebergSource), not a stream_source. feature_cols are the resolved output names — carried
+    # onto the tile partials by build_batch_tile_select.
     return ColumnInfo(
         join_keys=[f.name for f in view.entity_columns],
         feature_cols=[f.name for f in view.features],
-        ts_col=view.source.timestamp_field,
+        ts_col=view.batch_source.timestamp_field,
         created_ts_col=None,
         field_mapping=None,
     )
-
-
-def _aggregation_interval(view) -> timedelta:
-    # Feast's Aggregation carries no aggregation_interval (the tile size) — that is a
-    # ourfs view-level concept — so it rides on a tag the authoring surface sets.
-    secs = view.tags.get("ourfs_aggregation_interval")
-    if secs is None:
-        raise ValueError(
-            f"BatchFeatureView '{view.name}' has no 'ourfs_aggregation_interval' tag: the "
-            "tile model needs a tile size, but Feast's Aggregation carries none. Set it via "
-            "the ourfs BatchFeatureView authoring surface."
-        )
-    try:
-        return timedelta(seconds=int(secs))
-    except (ValueError, TypeError):
-        raise ValueError(
-            f"BatchFeatureView '{view.name}' tag ourfs_aggregation_interval={secs!r} must be an "
-            "integer number of seconds (e.g. '3600' for hourly, '86400' for daily)."
-        )
 
 
 def _sql_str(value: str) -> str:
@@ -341,17 +326,14 @@ class RisingWaveComputeEngine(ComputeEngine):
                 if isinstance(view, StreamFeatureView):
                     for stmt in _drop_ddl(project, view):
                         cur.execute(stmt)
-                elif isinstance(view, BatchFeatureView) and view.aggregations:
+                elif is_tile_fv(view):
                     for stmt in _batch_drop_ddl(project, view):
                         cur.execute(stmt)
             for view in views_to_keep:
                 if isinstance(view, StreamFeatureView):
                     for stmt in self._provision_ddl(project, view):
                         cur.execute(stmt)
-                elif isinstance(view, BatchFeatureView) and view.aggregations:
-                    # Only AGGREGATING batch FVs map to the tile model. A non-aggregating
-                    # batch FV (pure transform) is a later increment; skip it here rather
-                    # than mis-provision it.
+                elif is_tile_fv(view):
                     for stmt in self._provision_batch_ddl(project, view):
                         cur.execute(stmt)
 
@@ -366,7 +348,7 @@ class RisingWaveComputeEngine(ComputeEngine):
                 if isinstance(view, StreamFeatureView):
                     for stmt in _drop_ddl(project, view):
                         cur.execute(stmt)
-                elif isinstance(view, BatchFeatureView) and view.aggregations:
+                elif is_tile_fv(view):
                     for stmt in _batch_drop_ddl(project, view):
                         cur.execute(stmt)
 
@@ -420,9 +402,9 @@ class RisingWaveComputeEngine(ComputeEngine):
         ROLLUP MV (``online_mv_name``) unchanged — the tiles MV is internal plumbing. NO Iceberg sink
         yet (the MVs are read directly; durable tile history is a later increment). Offline training
         rolls the SAME tiles up with ``build_tile_rollup_select`` anchored to each label timestamp."""
-        interval = _aggregation_interval(view)
+        interval = tile_interval(view)
         column_info = _batch_column_info(view)
-        aggs = list(view.aggregations)
+        aggs = view_aggregations(view)
         src = source_name(project, view.name)
         tiles = tiles_name(project, view.name)
         mv = online_mv_name(project, view.name)
@@ -433,7 +415,7 @@ class RisingWaveComputeEngine(ComputeEngine):
             column_info, aggs, tiles, aggregation_interval=interval
         )
         return [
-            _iceberg_source_ddl(src, view.source.table, self.config),
+            _iceberg_source_ddl(src, view.batch_source.table, self.config),
             _materialized_view_ddl(tiles, tile_select),
             _materialized_view_ddl(mv, rollup_select),
         ]

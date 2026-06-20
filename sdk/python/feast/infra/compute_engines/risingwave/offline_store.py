@@ -17,10 +17,13 @@ from typing import List, Literal, Optional, Union
 
 import pandas as pd
 
-from feast.batch_feature_view import BatchFeatureView
 from feast.feature_view import FeatureView
 from feast.infra.compute_engines.dag.context import ColumnInfo
-from feast.infra.compute_engines.risingwave.engine import _aggregation_interval
+from feast.infra.compute_engines.risingwave.iceberg_source import (
+    is_tile_fv,
+    tile_interval,
+    view_aggregations,
+)
 from feast.infra.compute_engines.risingwave.names import tiles_name
 from feast.infra.compute_engines.risingwave.nodes import build_offline_tile_pit_query
 from feast.infra.offline_stores import offline_utils
@@ -38,17 +41,6 @@ from feast.repo_config import RepoConfig
 _OFFLINE_STORE_PATH = (
     "feast.infra.compute_engines.risingwave.offline_store.RisingWaveOfflineStore"
 )
-
-
-def _is_tile_fv(fv: FeatureView) -> bool:
-    # A tile BatchFeatureView: the engine provisioned a tiles MV for it, so training must roll the
-    # tiles up per label timestamp (build_offline_tile_pit_query) instead of the standard latest-row
-    # PIT. The aggregation_interval tag is set by the ourfs BatchFeatureView authoring surface.
-    return (
-        isinstance(fv, BatchFeatureView)
-        and bool(getattr(fv, "aggregations", None))
-        and "ourfs_aggregation_interval" in (fv.tags or {})
-    )
 
 
 class RisingWaveOfflineStoreConfig(PostgreSQLOfflineStoreConfig):
@@ -108,7 +100,7 @@ class RisingWaveOfflineStore(PostgreSQLOfflineStore):
         full_feature_names: bool = False,
         **kwargs,
     ) -> RetrievalJob:
-        tile_fvs = [fv for fv in feature_views if _is_tile_fv(fv)]
+        tile_fvs = [fv for fv in feature_views if is_tile_fv(fv)]
         if tile_fvs:
             return _tile_historical_features(
                 config, feature_views, tile_fvs, feature_refs, entity_df,
@@ -163,9 +155,13 @@ def _tile_historical_features(
             "as SQL); a SQL-string entity_df is a later increment."
         )
 
+    # The aggregations come from the IcebergSource's spec (carried in custom_options, which survives
+    # the registry round-trip) — the SAME spec the engine provisioned the tiles with, so the resolved
+    # column names cannot drift.
+    aggregations = view_aggregations(fv)
     column_info = ColumnInfo(
         join_keys=[f.name for f in fv.entity_columns],
-        feature_cols=[f.name for f in fv.features],
+        feature_cols=[a.resolved_name(a.time_window) for a in aggregations],
         ts_col=label_ts_column,
         created_ts_col=None,
         field_mapping=None,
@@ -176,8 +172,8 @@ def _tile_historical_features(
         label_ts_column,
         tiles_relation=tiles_name(project, fv.name),
         column_info=column_info,
-        aggregations=list(fv.aggregations),
-        aggregation_interval=_aggregation_interval(fv),
+        aggregations=aggregations,
+        aggregation_interval=tile_interval(fv),
     )
     return PostgreSQLRetrievalJob(
         query=query,

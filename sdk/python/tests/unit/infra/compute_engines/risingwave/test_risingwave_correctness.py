@@ -21,12 +21,12 @@ from feast.data_format import JsonFormat
 from feast.data_source import KafkaSource, PushSource
 from feast.infra.compute_engines.risingwave.engine import (
     RisingWaveComputeEngine,
-    _aggregation_interval,
     _batch_drop_ddl,
     _iceberg_sink_ddl,
     _iceberg_source_ddl,
     _iceberg_storage_opts,
 )
+from feast.infra.compute_engines.risingwave.iceberg_source import IcebergSource
 from feast.infra.compute_engines.risingwave.offline_store import (
     RisingWaveOfflineStore,
     RisingWaveOfflineStoreConfig,
@@ -471,20 +471,19 @@ def test_provision_emits_source_mv_and_iceberg_sink():
 # --- Phase 6 Inc 2: BATCH feature view provisioning (Iceberg source -> tiles MV) ---
 
 
-def _iceberg_batch_source(table="txn_ice", ts="event_ts"):
-    # Stands in for the Feast custom Iceberg batch source (the real DataSource is a
-    # follow-up): _provision_batch_ddl only reads .table + .timestamp_field off it.
-    return SimpleNamespace(name=table, table=table, timestamp_field=ts)
-
-
 def _batch_view(aggs, interval_secs=86400, name="user_txn_daily"):
+    # A tile feature view = a plain FeatureView whose batch_source is an IcebergSource carrying the
+    # tile spec (aggregations + interval). The engine reads it all off batch_source.
     return SimpleNamespace(
         name=name,
-        source=_iceberg_batch_source(),
-        aggregations=list(aggs),
+        batch_source=IcebergSource(
+            table="txn_ice",
+            timestamp_field="event_ts",
+            aggregations=list(aggs),
+            aggregation_interval=timedelta(seconds=interval_secs),
+        ),
         entity_columns=[SimpleNamespace(name="user_id", dtype="String")],
         features=[SimpleNamespace(name=a.resolved_name(a.time_window)) for a in aggs],
-        tags={"ourfs_aggregation_interval": str(interval_secs)},
         offline=True,
     )
 
@@ -519,20 +518,6 @@ def test_provision_batch_emits_source_tiles_mv_and_online_rollup_mv():
     assert "date_trunc" not in rollup_sql  # RW rejects two-sided date_trunc(now()) in an MV
     assert "max(tile_end) AS window_end" in rollup_sql  # PIT stamp for the point-lookup
     assert f"sum({feat}) AS {feat}" in rollup_sql  # combiner rolls partials up under one name
-
-
-def test_provision_batch_requires_aggregation_interval_tag():
-    view = _batch_view([_agg("sum")])
-    view.tags = {}  # Feast Aggregation carries no interval; the tile size must come from a tag
-    with pytest.raises(ValueError, match="aggregation_interval"):
-        _engine()._provision_batch_ddl("proj", view)
-
-
-def test_aggregation_interval_rejects_non_integer_tag():
-    view = _batch_view([_agg("sum")])
-    view.tags = {"ourfs_aggregation_interval": "daily"}  # must be integer seconds
-    with pytest.raises(ValueError, match="integer number of seconds"):
-        _aggregation_interval(view)
 
 
 def test_iceberg_source_ddl_escapes_single_quotes_in_table_name():
