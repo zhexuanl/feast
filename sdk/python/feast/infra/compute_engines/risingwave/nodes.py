@@ -16,7 +16,7 @@ Anything not yet verified end-to-end is marked ``UNVERIFIED`` / spike-gated (see
 ``README.md`` → "Spike-gated").
 """
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import pandas as pd
 
@@ -195,10 +195,52 @@ def build_windowed_agg_select(
 # relation (e.g. an Iceberg source) and one fixed tile set serves any window size, sliding with the
 # request time. Verified end-to-end live on RW v3.0.0: spike/sql/05c_batch_tiles.sql.
 
-# How each aggregation's per-tile partial is recombined across the tiles in a window. Additive only:
-# sum (sum of sums), count (SUM of counts), min (min of mins), max (max of maxes). mean/stddev
-# (need sum+count / sum+sumsq+count partials) and count_distinct/approx (non-additive) are a later phase.
-_TILE_ROLLUP = {"sum": "sum", "count": "sum", "min": "min", "max": "max"}
+# The tile model materializes per-(entity, tile) PARTIALS that recombine additively across the tiles
+# in a window. Two families:
+#   ADDITIVE — one partial == the aggregate; recombine: sum/sum/min/max (count rolls up by SUMMING
+#     per-tile counts). Named by the feature's resolved_name so tile/rollup/serve share one column.
+#   COMPOSITE — the aggregate is NOT additive, but decomposes into additive partials that DO merge
+#     and a recombine formula (Chronon's IR: Average = {sum, count}; Variance via {sum, sumsq, count},
+#     var = (Σx² − (Σx)²/n)/n). Partials are named ``<resolved>__sm/__cnt/__sqs``.
+# count_distinct/approx have no safe additive sketch merge — still rejected.
+_ADDITIVE_TILE_FN = frozenset({"sum", "count", "min", "max"})
+_COMPOSITE_TILE_FN = frozenset({"mean", "var_pop", "var_samp", "stddev_pop", "stddev_samp"})
+_TILE_SUPPORTED_FN = _ADDITIVE_TILE_FN | _COMPOSITE_TILE_FN
+
+
+def _tile_partials(agg: Aggregation) -> List[Tuple[str, str]]:
+    """The per-tile partial columns (name, SQL aggregate) for one aggregation. Additive functions
+    have ONE partial (the aggregate itself); composite functions (mean/var/stddev) have the additive
+    sub-partials that merge across tiles."""
+    out = agg.resolved_name(agg.time_window)
+    col = agg.column
+    fn = agg.function
+    if fn in _ADDITIVE_TILE_FN:
+        return [(out, f"{fn}({col})")]
+    partials = [(f"{out}__sm", f"sum({col})"), (f"{out}__cnt", f"count({col})")]
+    if fn in {"var_pop", "var_samp", "stddev_pop", "stddev_samp"}:
+        partials.append((f"{out}__sqs", f"sum({col} * {col})"))
+    return partials
+
+
+def _tile_recombine(agg: Aggregation, prefix: str = "") -> str:
+    """The retrieval-time recombine for one aggregation: an expression over its per-tile partials
+    aliased to the FINAL ``resolved_name``. ``prefix`` qualifies the partial columns for a joined
+    relation (``"t."`` in the offline PIT range-join)."""
+    out = agg.resolved_name(agg.time_window)
+    fn = agg.function
+    if fn in {"sum", "count"}:  # count recombines by SUMMING per-tile counts
+        return f"sum({prefix}{out}) AS {out}"
+    if fn in {"min", "max"}:
+        return f"{fn}({prefix}{out}) AS {out}"
+    sm, cnt = f"sum({prefix}{out}__sm)", f"sum({prefix}{out}__cnt)"
+    if fn == "mean":
+        return f"{sm} / NULLIF({cnt}, 0) AS {out}"
+    # variance/stddev: (Σx² − (Σx)²/n) / n  (population) or / (n−1) (sample); stddev = sqrt(var)
+    centered = f"(sum({prefix}{out}__sqs) - {sm} * {sm} / NULLIF({cnt}, 0))"
+    denom = f"NULLIF({cnt} - 1, 0)" if fn.endswith("_samp") else f"NULLIF({cnt}, 0)"
+    var = f"{centered} / {denom}"
+    return f"sqrt({var}) AS {out}" if fn.startswith("stddev") else f"{var} AS {out}"
 
 # aggregation_interval (the tile size) -> RisingWave date_trunc unit. Standard units only for now
 # (date_trunc is what the spike validated); arbitrary intervals (e.g. 15min) need epoch-bucketing.
@@ -217,18 +259,16 @@ def _tile_unit(aggregation_interval) -> str:
     return unit
 
 
-def _assert_tile_additive(aggregations: List[Aggregation]) -> None:
-    # "Additive" here = has a safe tile COMBINER (a function that merges per-tile partials).
-    # sum/count(->sum)/min/max do; mean/stddev need composite partials (sum+count); count_distinct
-    # and approx are monoids whose sketch state cannot be safely merged across tiles (cf. Chronon's
-    # monoid split, api.thrift). min/max are ALSO monoids but DO have combiners, hence supported.
-    unsupported = sorted({a.function for a in aggregations} - set(_TILE_ROLLUP))
+def _assert_tile_supported(aggregations: List[Aggregation]) -> None:
+    # The tile model supports any aggregation that recombines from additive partials: sum/count/min/max
+    # directly, and mean/var/stddev via composite partials (Chronon's IR). count_distinct/approx have
+    # no safe additive sketch merge across tiles (cf. Chronon's monoid split, api.thrift) — rejected.
+    unsupported = sorted({a.function for a in aggregations} - _TILE_SUPPORTED_FN)
     if unsupported:
         raise ValueError(
-            f"Batch tile aggregations {unsupported} have no additive tile combiner: the tile model "
-            f"rolls up per-tile partials, so only {sorted(_TILE_ROLLUP)} are supported today. "
-            f"mean/stddev need composite partials; count_distinct/approx have no safe sketch merge "
-            f"— both are a later phase."
+            f"Batch tile aggregations {unsupported} are not supported: the tile model rolls up "
+            f"additive per-tile partials, so {sorted(_TILE_SUPPORTED_FN)} work, but "
+            f"count_distinct/approx_count_distinct have no safe sketch merge across tiles."
         )
 
 
@@ -257,24 +297,20 @@ def _assert_window_multiple_of_interval(window_secs: int, aggregation_interval) 
 
 def _validate_window_rollup(aggregations: List[Aggregation], aggregation_interval) -> int:
     """Shared precondition for the three rollup builders (offline floored, online now(), offline PIT):
-    additive aggs only, a single window, and window a whole multiple of the interval. Returns
+    tile-supported aggs only, a single window, and window a whole multiple of the interval. Returns
     window_secs. Centralized so the online and offline rollups CANNOT validate differently (ADR-0004)."""
-    _assert_tile_additive(aggregations)
+    _assert_tile_supported(aggregations)
     window_secs = _single_window_secs(aggregations)
     _assert_window_multiple_of_interval(window_secs, aggregation_interval)
     return window_secs
 
 
 def _tile_rollup_exprs(aggregations: List[Aggregation], prefix: str = "") -> str:
-    """The per-aggregation rollup-combiner projection, shared by ALL rollup builders so online and
-    offline recombine per-tile partials IDENTICALLY (ADR-0004 no-drift — a single source of truth for
-    `combiner(partial) AS feature`). ``prefix`` qualifies the partial column for a joined relation
-    (e.g. ``"t."`` in the offline PIT range-join)."""
-    return ", ".join(
-        f"{_TILE_ROLLUP[a.function]}({prefix}{a.resolved_name(a.time_window)}) "
-        f"AS {a.resolved_name(a.time_window)}"
-        for a in aggregations
-    )
+    """The per-aggregation recombine projection, shared by ALL rollup builders so online and offline
+    recombine per-tile partials IDENTICALLY (ADR-0004 no-drift — a single source of truth, via
+    ``_tile_recombine``). ``prefix`` qualifies the partial columns for a joined relation (``"t."`` in
+    the offline PIT range-join)."""
+    return ", ".join(_tile_recombine(a, prefix) for a in aggregations)
 
 
 def build_batch_tile_select(
@@ -292,11 +328,14 @@ def build_batch_tile_select(
     rollup -> serve carry one column name. Rolled up at retrieval by ``build_tile_rollup_select``."""
     if not aggregations:
         raise ValueError("build_batch_tile_select requires at least one aggregation")
-    _assert_tile_additive(aggregations)
+    _assert_tile_supported(aggregations)
     unit = _tile_unit(aggregation_interval)
     keys = ", ".join(column_info.join_keys_columns)
     bucket = f"date_trunc('{unit}', {column_info.timestamp_column})"
-    partials = ", ".join(_agg_expr(a) for a in aggregations)  # additive partial == the aggregate
+    # additive functions emit one partial (the aggregate); composite (mean/var/stddev) emit several.
+    partials = ", ".join(
+        f"{expr} AS {name}" for a in aggregations for (name, expr) in _tile_partials(a)
+    )
     return (
         f"SELECT {keys}, {bucket} + INTERVAL '1 {unit}' AS tile_end, {partials} "
         f"FROM {relation} GROUP BY {keys}, {bucket}"

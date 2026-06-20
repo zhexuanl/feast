@@ -313,14 +313,57 @@ def test_batch_tile_min_max_roll_up_with_min_max():
     assert "max(max_amount_2592000s) AS max_amount_2592000s" in roll
 
 
-@pytest.mark.parametrize("function", ["mean", "stddev_pop", "count_distinct", "approx_count_distinct"])
-def test_batch_tile_rejects_non_additive_aggregation(function):
-    # mean/stddev (need sum+count / sum+sumsq+count partials) and count_distinct/approx (non-additive)
-    # cannot roll up from simple per-tile partials yet — rejected with a clear message.
-    with pytest.raises(ValueError, match="additive"):
+@pytest.mark.parametrize("function", ["count_distinct", "approx_count_distinct"])
+def test_batch_tile_rejects_unmergeable_aggregation(function):
+    # count_distinct/approx have no safe additive sketch merge across tiles — rejected clearly.
+    with pytest.raises(ValueError, match="not supported"):
         build_batch_tile_select(
             _column_info(), [_agg(function, 2592000)], "src", aggregation_interval=timedelta(days=1)
         )
+
+
+def test_batch_tile_mean_emits_sum_and_count_partials():
+    sql = build_batch_tile_select(
+        _column_info(), [_agg("mean", 2592000)], "src", aggregation_interval=timedelta(days=1)
+    )
+    assert "sum(amount) AS mean_amount_2592000s__sm" in sql
+    assert "count(amount) AS mean_amount_2592000s__cnt" in sql
+
+
+def test_mean_rollup_recombines_sum_over_count():
+    sql = build_tile_rollup_select(
+        _column_info(), [_agg("mean", 2592000)], "tiles",
+        aggregation_interval=timedelta(days=1), as_of_sql="$1",
+    )
+    assert (
+        "sum(mean_amount_2592000s__sm) / NULLIF(sum(mean_amount_2592000s__cnt), 0) "
+        "AS mean_amount_2592000s" in sql
+    )
+
+
+def test_batch_tile_stddev_emits_sumsq_partial():
+    sql = build_batch_tile_select(
+        _column_info(), [_agg("stddev_pop", 2592000)], "src", aggregation_interval=timedelta(days=1)
+    )
+    assert "sum(amount * amount) AS stddev_pop_amount_2592000s__sqs" in sql
+
+
+def test_stddev_pop_rollup_is_sqrt_of_population_variance():
+    sql = build_tile_rollup_select(
+        _column_info(), [_agg("stddev_pop", 2592000)], "tiles",
+        aggregation_interval=timedelta(days=1), as_of_sql="$1",
+    )
+    assert "sqrt(" in sql  # stddev = sqrt(variance)
+    assert "stddev_pop_amount_2592000s__sqs" in sql  # uses sum-of-squares
+    assert "NULLIF(sum(stddev_pop_amount_2592000s__cnt), 0)) AS stddev_pop_amount_2592000s" in sql  # /n
+
+
+def test_var_samp_rollup_divides_by_n_minus_1():
+    sql = build_tile_rollup_select(
+        _column_info(), [_agg("var_samp", 2592000)], "tiles",
+        aggregation_interval=timedelta(days=1), as_of_sql="$1",
+    )
+    assert "NULLIF(sum(var_samp_amount_2592000s__cnt) - 1, 0) AS var_samp_amount_2592000s" in sql
 
 
 def test_batch_tile_rejects_non_standard_interval():
@@ -357,9 +400,9 @@ def test_online_rollup_count_combiner_is_sum():
     assert "sum(count_amount_2592000s) AS count_amount_2592000s" in sql
 
 
-@pytest.mark.parametrize("function", ["mean", "stddev_pop", "count_distinct"])
+@pytest.mark.parametrize("function", ["count_distinct", "approx_count_distinct"])
 def test_online_rollup_rejects_non_additive_aggregation(function):
-    with pytest.raises(ValueError, match="additive"):
+    with pytest.raises(ValueError, match="not supported"):
         build_online_rollup_select(
             _column_info(), [_agg(function, 2592000)], "tiles",
             aggregation_interval=timedelta(days=1),
@@ -414,9 +457,9 @@ def test_offline_tile_pit_count_combiner_is_sum():
     assert "sum(t.count_amount_259200s) AS count_amount_259200s" in sql
 
 
-@pytest.mark.parametrize("function", ["mean", "stddev_pop"])
+@pytest.mark.parametrize("function", ["count_distinct", "approx_count_distinct"])
 def test_offline_tile_pit_rejects_non_additive(function):
-    with pytest.raises(ValueError, match="additive"):
+    with pytest.raises(ValueError, match="not supported"):
         build_offline_tile_pit_query(
             "SELECT 1", ["user_id", "event_timestamp"], "event_timestamp",
             tiles_relation="t", column_info=_column_info(),
@@ -551,10 +594,10 @@ def test_iceberg_opts_escape_explicit_dev_credentials():
     assert "s3.secret.key='sup3r''s3cret'" in opts  # escaped, not broken/injectable
 
 
-@pytest.mark.parametrize("function", ["mean", "stddev_pop"])
+@pytest.mark.parametrize("function", ["count_distinct", "approx_count_distinct"])
 def test_provision_batch_rejects_non_additive_aggregation(function):
     view = _batch_view([_agg(function)])
-    with pytest.raises(ValueError, match="additive"):
+    with pytest.raises(ValueError, match="not supported"):
         _engine()._provision_batch_ddl("proj", view)
 
 
