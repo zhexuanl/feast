@@ -10,22 +10,39 @@ Iceberg sink from one feature definition, so online and offline are computed by 
 KafkaSource ─▶ CREATE SOURCE (+WATERMARK)
                   │
                   ├─▶ CREATE MATERIALIZED VIEW  (windowed agg, EMIT ON WINDOW CLOSE)
-                  │       └─ online serving: point lookup over pgwire (RisingWaveOnlineStore)
+                  │       ├─ online:   serving layer point-looks-up the MV over pgwire (no Feast online store)
+                  │       └─ training: the control plane derives the offline source from THIS MV
+                  │            (window_end AS event_timestamp) — online == offline by construction
                   └─▶ CREATE SINK → Iceberg     (append-only, window_end AS event_timestamp)
-                          └─ training: RisingWaveOfflineStore PIT-joins this history (get_historical_features)
+                          └─ durable offline system-of-record (GC-immune); the migration target if
+                             the MV is ever given a retention TTL.
 ```
+
+**Late-event parity** (train/serve skew): a late event (`event_ts < watermark`) is dropped once at
+the watermarked source, so the EOWC MV and its Iceberg sink agree by construction. Training reads the
+**MV** today (correct only while the MV is non-GC'd — a plain `CREATE MATERIALIZED VIEW` has no
+retention, so it retains every closed window); if `retention_seconds` is ever added, repoint training
+to the Iceberg sink. The offline source must always be this EOWC-gated relation, **never** a raw
+watermark-ungated re-scan (which would resurrect dropped late events). See
+[ADR-0005](../../../../../../platform/docs/adr/ADR-0005-late-event-parity.md); the invariant is
+enforced at apply time by `_assert_gated_offline_source` and pinned by `test_late_event_parity.py`.
 
 ## Status
 
-Three components make up the RisingWave integration:
+Two components make up the RisingWave integration (the online store is intentionally NOT
+one of them — see below):
 
 - **`RisingWaveComputeEngine`** (`engine.py`) — `update()` provisions the source +
   windowed-agg MV + Iceberg sink (registry-free; join keys from `entity_columns`);
   `_materialize_one` is a bounded backfill. It does **not** implement
   `get_historical_features`: Feast routes retrieval to the offline store (never the
   compute engine), so a retrieval method here would be dead code.
-- **`RisingWaveOnlineStore`** (`online_store.py`) — low-latency point lookup over the
-  MV via pgwire.
+- **Online serving is NOT a Feast online store.** The serving layer (the embedded
+  `FeatureClient` and the Go feature server) point-looks-up the MV directly per the
+  `ServingSpec` — Feast is off the serving hot path. A `RisingWaveOnlineStore` plugin
+  existed but was dropped: its `update`/`teardown` were no-ops (the engine provisions the
+  MV) and its `online_read` was bypassed. Strict single-digit-ms p99 uses a Redis tier
+  (RW `CREATE SINK … connector='redis'` + Feast's Redis store), not the MV.
 - **`RisingWaveOfflineStore`** (`offline_store.py`) — training / point-in-time
   retrieval. Feast's provider calls `offline_store.get_historical_features`, so the PIT
   join lives here. It subclasses the Postgres offline store (RisingWave is
@@ -73,8 +90,9 @@ to MinIO. All of it behaved as designed:
 
 - Monoid retraction over an **upsert** source — only append-only was validated; the
   `build_windowed_agg_select` guard stays.
-- The RisingWave-column → `ValueProto` conversion in `online_store.online_read` — the
-  SQL point-lookup works, but the Python proto mapping is untested.
+- Serving-layer MV-read **type fidelity** (RisingWave column → Arrow/ValueProto): the SQL
+  point-lookup works, but types must be pinned from the schema (ADR-0004) — the read now lives
+  in the serving layer (FeatureClient / Go server), not a Feast online store.
 - Bounded `[start, end)` backfill **late-data** parity with the live stream.
 - `CREATE SOURCE` raw-column **types** (placeholders) and non-JSON encodings.
 - Minor: the Iceberg read-back `CREATE SOURCE` should declare an explicit `*` / column
@@ -97,10 +115,7 @@ offline_store:                       # PIT training joins, Postgres-wire to Risi
   host: localhost
   port: 4566
 
-online_store:                        # read-only point lookup over the MV
-  type: feast.infra.compute_engines.risingwave.online_store.RisingWaveOnlineStore
-  host: localhost
-  port: 4566
+online_store: null                   # no Feast online store — serving reads the MV directly
 ```
 
 The only core change is an additive `DAGFormat.RISINGWAVE` enum member
