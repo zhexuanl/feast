@@ -23,8 +23,7 @@ the watermarked source, so the EOWC MV and its Iceberg sink agree by constructio
 **MV** today (correct only while the MV is non-GC'd — a plain `CREATE MATERIALIZED VIEW` has no
 retention, so it retains every closed window); if `retention_seconds` is ever added, repoint training
 to the Iceberg sink. The offline source must always be this EOWC-gated relation, **never** a raw
-watermark-ungated re-scan (which would resurrect dropped late events). See
-[ADR-0005](../../../../../../platform/docs/adr/ADR-0005-late-event-parity.md); the invariant is
+watermark-ungated re-scan (which would resurrect dropped late events). The invariant is
 enforced at apply time by `_assert_gated_offline_source` and pinned by `test_late_event_parity.py`.
 
 ## Status
@@ -61,7 +60,7 @@ correct typed values; `get_historical_features` → point-in-time-correct traini
 |---|---|---|
 | Offline rows timestamped by `window_end`, never `window_start` | `_iceberg_sink_ddl` | a window is only knowable at close; `window_start` + `<=` join leaks open windows |
 | Offline sink append-only, or upsert with composite PK `(entity, window_end)` — never entity-only | `_iceberg_sink_ddl` | entity-only upsert collapses history → every label joins to the latest value |
-| Monoid aggs (min/max/count_distinct/…) rejected over a retractable source | `build_windowed_agg_select` | monoids cannot be incrementally retracted (Chronon api.thrift:156-164) |
+| Monoid aggs (min/max/count_distinct/…) rejected over a retractable source | `build_windowed_agg_select` | monoids have no inverse, so they cannot be incrementally retracted |
 | All aggs in one view share one window | `build_windowed_agg_select` | RisingWave TUMBLE/HOP is one table function over the relation |
 | `EMIT ON WINDOW CLOSE` requires a watermark | `_provision_ddl` | EOWC is only valid with a watermark + append-only source |
 | `PushSource` stream views rejected | `_provision_ddl` | too thin to compile to `CREATE SOURCE` |
@@ -86,12 +85,12 @@ to MinIO. All of it behaved as designed:
 - `CREATE TABLE … APPEND ONLY` + `WATERMARK` + `EMIT ON WINDOW CLOSE` + the
   `catalog.type='storage'` Iceberg sink all behave as emitted.
 
-## ⚠️ Still spike-gated
+## ⚠️ Not yet validated end-to-end
 
 - Monoid retraction over an **upsert** source — only append-only was validated; the
   `build_windowed_agg_select` guard stays.
 - Serving-layer MV-read **type fidelity** (RisingWave column → Arrow/ValueProto): the SQL
-  point-lookup works, but types must be pinned from the schema (ADR-0004) — the read now lives
+  point-lookup works, but types must be pinned from the schema — the read now lives
   in the serving layer (FeatureClient / Go server), not a Feast online store.
 - Bounded `[start, end)` backfill **late-data** parity with the live stream.
 - `CREATE SOURCE` raw-column **types** (placeholders) and non-JSON encodings.

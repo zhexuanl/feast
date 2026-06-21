@@ -9,8 +9,8 @@ same engine — minimal train/serve skew.
 Status: SCAFFOLD. The contract wiring, config, registry-free provisioning, and PIT
 delegation are grounded and verified against the Feast/RisingWave source. The SQL
 generation and the windowed-agg -> Iceberg composition are NOT yet verified
-end-to-end and are gated behind the de-risking spike (see ``README.md`` and the
-inline ``UNVERIFIED`` markers).
+end-to-end; treat them as unproven and validate against live RisingWave before
+relying on them in production (see the inline ``UNVERIFIED`` markers).
 """
 
 import logging
@@ -70,7 +70,7 @@ _ENGINE_PATH = (
     "feast.infra.compute_engines.risingwave.engine.RisingWaveComputeEngine"
 )
 
-# Minimal Feast dtype -> RisingWave SQL type. Spike-gated: extend to the full Feast
+# Minimal Feast dtype -> RisingWave SQL type. Not yet complete: extend to the full Feast
 # type system, and source raw-input column types from the source schema, before
 # production. Raw aggregation-input columns default to DOUBLE PRECISION.
 _RW_TYPE = {
@@ -189,7 +189,7 @@ def _iceberg_storage_opts(config) -> List[str]:
 
 def _iceberg_source_ddl(name: str, table: str, config) -> str:
     # A RisingWave Iceberg source infers its schema from the Iceberg metadata, so (unlike
-    # the Kafka _source_ddl) it needs NO column list. Validated live (spike stage 5c).
+    # the Kafka _source_ddl) it needs NO column list.
     opts = (
         ["connector='iceberg'"]
         + _iceberg_storage_opts(config)
@@ -200,15 +200,15 @@ def _iceberg_source_ddl(name: str, table: str, config) -> str:
 
 def _source_is_retractable(source) -> bool:
     # Append-only (CREATE SOURCE ... FORMAT PLAIN) by default. Retractable upstreams
-    # (CREATE TABLE ... FORMAT UPSERT) are spike-gated; when added, return True so the
+    # (CREATE TABLE ... FORMAT UPSERT) are not yet supported; when added, return True so the
     # monoid guard in build_windowed_agg_select engages.
     return False
 
 
 def _source_ddl(name: str, source: KafkaSource, view) -> str:
-    # Spike-gated typing: raw aggregation-input columns are not in view.features, and
+    # Placeholder typing: raw aggregation-input columns are not in view.features, and
     # their types are not carried on the FeatureView, so we emit placeholder types.
-    # The spike must source real types from the stream/batch source schema.
+    # Real types must instead be sourced from the stream/batch source schema.
     cols: List[str] = []
     seen = set()
     for field in view.entity_columns:
@@ -216,7 +216,7 @@ def _source_ddl(name: str, source: KafkaSource, view) -> str:
         seen.add(field.name)
     for agg in view.aggregations:
         if agg.column and agg.column not in seen:
-            cols.append(f'"{agg.column}" DOUBLE PRECISION')  # spike-gated type
+            cols.append(f'"{agg.column}" DOUBLE PRECISION')  # placeholder type pending real source-schema types
             seen.add(agg.column)
     ts = source.timestamp_field
     cols.append(f'"{ts}" TIMESTAMP')
@@ -224,7 +224,7 @@ def _source_ddl(name: str, source: KafkaSource, view) -> str:
     watermark = ""
     if source.kafka_options.watermark_delay_threshold is not None:
         secs = int(source.kafka_options.watermark_delay_threshold.total_seconds())
-        # watermark.slt:5-9
+        # subtract the watermark delay from the event timestamp to bound out-of-order lateness
         watermark = f', WATERMARK FOR "{ts}" AS "{ts}" - INTERVAL \'{secs}\' SECOND'
 
     return (
@@ -232,7 +232,7 @@ def _source_ddl(name: str, source: KafkaSource, view) -> str:
         "WITH (connector='kafka', "
         f"properties.bootstrap.server='{_sql_str(source.kafka_options.kafka_bootstrap_servers)}', "
         f"topic='{_sql_str(source.kafka_options.topic)}', scan.startup.mode='earliest') "
-        "FORMAT PLAIN ENCODE JSON"  # issue_18308.slt:14-15; non-JSON formats spike-gated
+        "FORMAT PLAIN ENCODE JSON"  # only JSON encoding is supported for now; non-JSON formats not yet implemented
     )
 
 
@@ -247,8 +247,7 @@ def _iceberg_sink_ddl(
     feats = ", ".join(f'"{c}"' for c in column_info.feature_cols)
     projection = ", ".join(p for p in (keys, feats) if p)
     # window_END is the event timestamp (NEVER window_start): a window [t, t+w) is
-    # only complete at t+w, so an as-of (<=) join can't read it early
-    # (time_window.slt:50-61).
+    # only complete at t+w, so an as-of (<=) join can't read it early.
     select = f'SELECT {projection}, "window_end" AS event_timestamp FROM "{mv}"'
 
     opts = (
@@ -260,12 +259,11 @@ def _iceberg_sink_ddl(
     if upsert:
         # Composite PK so each (entity, window) bucket is a DISTINCT retained row.
         # NEVER entity-only: that collapses to one row per entity and leaks the latest
-        # value to every training label (upsert_table.slt:14-28).
+        # value to every training label.
         opts.append("type='upsert'")
         opts.append(f"primary_key='{', '.join(column_info.join_keys)}, window_end'")
     else:
-        # Append-only retains the full timestamped history the PIT join needs
-        # (append_only_table.slt:29-44).
+        # Append-only retains the full timestamped history the PIT join needs.
         opts.append("type='append-only'")
         opts.append("force_append_only='true'")
 
@@ -312,8 +310,8 @@ def _existing_online_window_secs(cur, project: str, view_name: str) -> set:
 
 
 def _deployed_mv_select(cur, name: str) -> Optional[str]:
-    """The SELECT of a deployed materialized view as RisingWave stores it (verbatim — verified on
-    RW v3.0.0: RW persists ``CREATE MATERIALIZED VIEW <name> AS <select>`` with our SELECT unchanged),
+    """The SELECT of a deployed materialized view as RisingWave stores it (verbatim: RisingWave
+    persists ``CREATE MATERIALIZED VIEW <name> AS <select>`` with our SELECT unchanged),
     or None if the MV does not exist. This stored SELECT is an exact definition fingerprint used to
     detect that a kept view's definition changed — the only way to do so, since RW has no CREATE OR
     REPLACE / ALTER ... AS / COMMENT ON, and Feast never tells the engine which kept views changed.
@@ -343,7 +341,7 @@ def _deployed_source_table(cur, name: str) -> Optional[str]:
     definitions cannot reveal). Single quotes in the table are doubled in the DDL; we un-double them.
 
     Note: unlike a materialized view (whose SELECT RisingWave stores VERBATIM), a source's WITH clause is
-    RE-RENDERED in the catalog (spaces around ``=``, expanded types) — verified live — so we EXTRACT the
+    RE-RENDERED in the catalog (spaces around ``=``, expanded types), so we EXTRACT the
     ``table.name`` option with a spacing-tolerant regex rather than comparing the whole definition."""
     cur.execute("SELECT definition FROM rw_catalog.rw_sources WHERE name = %s", (name,))
     row = cur.fetchone()
@@ -427,7 +425,7 @@ class RisingWaveComputeEngine(ComputeEngine):
         # then keeps online features continuously fresh — there is no per-task
         # streaming start in materialize().
         with _connect(self.config) as conn, conn.cursor() as cur:
-            cur.execute("set sink_decouple = false")  # required before Iceberg sinks (upsert_table.slt:2)
+            cur.execute("set sink_decouple = false")  # required before creating Iceberg sinks
             for view in views_to_delete:
                 # is_streaming_tile FIRST: a streaming-tile view IS a StreamFeatureView, but its physical
                 # objects are the tile graph (N online MVs + tiles MV + source, no Iceberg sink), so it
@@ -492,7 +490,7 @@ class RisingWaveComputeEngine(ComputeEngine):
             raise ValueError(
                 "emit_on_window_close=True requires a watermark on the source "
                 f"timestamp, but the KafkaSource for '{view.name}' sets no "
-                "watermark_delay_threshold (eowc_group_agg.slt:8-12). Set one, or "
+                "watermark_delay_threshold. Set one, or "
                 "disable emit_on_window_close (losing online/offline consistency)."
             )
 
@@ -524,14 +522,14 @@ class RisingWaveComputeEngine(ComputeEngine):
         desired one; on a change drop the graph (sink -> MV -> source, dependents first) and re-provision.
 
         Both online serving AND offline training read this EOWC MV (the offline source is a PostgreSQL
-        query over it, ADR-0005-gated), so re-materializing the MV keeps online == offline under the new
+        query over it), so re-materializing the MV keeps online == offline under the new
         definition — no skew.
 
-        Iceberg-sink follow-up (deferred, ADR-0005): the ``{base}_offline`` Iceberg sink is a durable
+        Iceberg-sink follow-up (deferred): the ``{base}_offline`` Iceberg sink is a durable
         copy training does NOT read today — so its table retaining pre-change rows after a re-materialize
         is harmless now. RisingWave has no sink-level table reset (only ``create_table_if_not_exists``;
-        no drop/overwrite/truncate), so when the offline read ever migrates to the Iceberg sink (ADR-0005:
-        "if MV retention is introduced"), the re-materialize must purge that table out-of-band (catalog
+        no drop/overwrite/truncate), so if the offline read ever migrates to the Iceberg sink (i.e. once
+        MV retention is introduced), the re-materialize must purge that table out-of-band (catalog
         drop, or a definition-versioned table name) to keep the durable archive consistent."""
         mv = online_mv_name(project, view.name)
         desired = self._stream_mv_select(project, view)
@@ -548,10 +546,10 @@ class RisingWaveComputeEngine(ComputeEngine):
         request-anchored ``now()`` window rollup, one row per entity). One tile set is reused across all
         windows; each window gets its own now()-anchored MV because RisingWave rejects now()
         inside a CASE in a two-sided temporal-filter MV. RisingWave maintains every MV incrementally as
-        the Iceberg table grows (verified live), so there is no scheduler. The point-lookup reads the
+        the Iceberg table grows (validated end-to-end on RisingWave v3.0.0), so there is no scheduler. The point-lookup reads the
         per-window MV (``online_window_mv_name``) holding the requested feature's window — the tiles MV
-        is internal plumbing. NO Iceberg sink yet (the MVs are read directly; durable tile history is a
-        later increment). Offline training rolls the SAME tiles up per label timestamp."""
+        is internal plumbing. NO Iceberg sink yet: the MVs are read directly, and durable tile history
+        is not provisioned. Offline training rolls the SAME tiles up per label timestamp."""
         interval = tile_interval(view)
         column_info = _batch_column_info(view)
         aggs = view_aggregations(view)
@@ -709,7 +707,7 @@ class RisingWaveComputeEngine(ComputeEngine):
         Kafka-source-change follow-up (deferred — same gap as ``_reconcile_stream_view``): a repointed
         topic/bootstrap does not show in any MV definition (the tiles MV reads the source by its stable
         name), so it is not detected here. The batch path detects an Iceberg-table repoint via the source
-        catalog; the Kafka analogue (reading topic/bootstrap from rw_sources) is a later increment."""
+        catalog; the Kafka analogue (reading topic/bootstrap from rw_sources) is not yet implemented."""
         interval = tile_interval(view)
         column_info = _registry_free_column_info(view)
         aggs = view_aggregations(view)
@@ -771,10 +769,10 @@ class RisingWaveComputeEngine(ComputeEngine):
                 emit_on_close=False,  # bounded batch backfill, not a streaming MV
             )
             sql = builder.build().to_sql(self.get_execution_context(registry, task))
-            # UNVERIFIED end-to-end (spike risk #3): the windowed-agg -> offline-table
-            # backfill is not yet proven in-repo. Preferred long-term: read the live
-            # sink's Iceberg history so backfill == what was served (risk #8). The
-            # bounded [start, end) predicate must be applied here before execution.
+            # UNVERIFIED end-to-end: the windowed-agg -> offline-table backfill is not yet
+            # proven in-repo. Preferred long-term: read the live sink's Iceberg history so
+            # backfill == what was served. The bounded [start, end) predicate must be
+            # applied here before execution.
             with _connect(self.config) as conn, conn.cursor() as cur:
                 cur.execute(sql)
             return RisingWaveMaterializationJob(job_id, MaterializationJobStatus.SUCCEEDED)

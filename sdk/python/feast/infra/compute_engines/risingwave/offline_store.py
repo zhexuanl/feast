@@ -129,13 +129,13 @@ def _tile_historical_features(
 ) -> RetrievalJob:
     # Floor-anchored range-agg PIT for tile feature views (build_offline_tile_pit_query). The
     # standard latest-row template anchors at the latest tile WITH DATA, not floor(label) — wrong
-    # when recent intervals are empty (verified live). One tile FV per query for now; mixing tile
-    # with stream/other FVs in one retrieval is a later increment.
+    # when recent intervals are empty. One tile FV per query for now; mixing tile
+    # with stream/other FVs in one retrieval is not yet supported.
     if len(feature_views) != 1:
         raise NotImplementedError(
             "RisingWave offline tile rollup currently supports exactly one tile feature view per "
             f"retrieval; got {len(feature_views)} views ({len(tile_fvs)} tile). Mixing tile feature "
-            "views with stream/other views in one get_historical_features call is a later increment."
+            "views with stream/other views in one get_historical_features call is not yet supported."
         )
     if entity_df is None:
         raise NotImplementedError(
@@ -152,7 +152,7 @@ def _tile_historical_features(
     else:
         raise NotImplementedError(
             "RisingWave offline tile rollup currently requires a DataFrame entity_df (it is inlined "
-            "as SQL); a SQL-string entity_df is a later increment."
+            "as SQL); a SQL-string entity_df is not yet supported."
         )
 
     # view_aggregations reads the SAME spec the engine provisioned the tiles with — a batch tile view's

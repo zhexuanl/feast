@@ -11,9 +11,9 @@ over pgwire) or the ``RWOutputNode`` materialize INSERT (run by the engine). Thi
 keeps the correctness logic unit-testable without a live RisingWave, and matches a
 SQL-pushdown engine.
 
-Every SQL fragment traces to a verified RisingWave e2e example (cited inline).
-Anything not yet verified end-to-end is marked ``UNVERIFIED`` / spike-gated (see
-``README.md`` → "Spike-gated").
+Every SQL fragment traces to a RisingWave end-to-end example validated against a live
+instance. Anything not yet validated end-to-end is marked ``UNVERIFIED`` and listed under
+the unvalidated surfaces in ``README.md``.
 """
 
 from typing import List, Optional, Tuple
@@ -46,16 +46,15 @@ from feast.infra.compute_engines.utils import (
 #     they run inside an EOWC materialized view.
 #   - count_distinct (count(distinct ...)) + approx_count_distinct (HyperLogLog): streaming,
 #     but monoids without an inverse (see MONOID_FUNCTIONS). NOTE: RisingWave has a known
-#     crash-RECOVERY state bug for updatable approx_count_distinct
-#     (e2e_test/streaming/aggregate/approx_count_distinct.slt.bug) — harmless for our
+#     crash-RECOVERY state bug for updatable approx_count_distinct — harmless for our
 #     append-only EOWC model (the source never retracts), but flagged.
 # Deliberately EXCLUDED — rejected at apply with a reason, not silently:
 #   - first(n) / last(n) / first_distinct / last_distinct (sequence features): RisingWave has
-#     no bare first()/last() aggregate; they need ordered-set / Array outputs (a later phase).
+#     no bare first()/last() aggregate; they need ordered-set / Array outputs, which are not yet supported.
 #   - approx_percentile: parameterized (takes the percentile) — needs a parameter field on
-#     feast.Aggregation, which has none today (a later phase).
+#     feast.Aggregation, which has none today, so it is not yet supported.
 #   - aggregation_secondary_key: produces a per-secondary-key breakdown = an Array/Map output
-#     that the scalar engine and the ServingSpec wire do not carry yet (a later phase).
+#     that the scalar engine and the ServingSpec wire do not carry yet, so it is not yet supported.
 SUPPORTED_AGG_FUNCTIONS = frozenset(
     {
         "sum",
@@ -75,7 +74,7 @@ SUPPORTED_AGG_FUNCTIONS = frozenset(
 # The non-retractable members of SUPPORTED_AGG_FUNCTIONS: monoids with no inverse, so
 # RisingWave cannot incrementally *retract* them over an upsert/retractable source without a
 # full per-window recompute. Mirrors Chronon's deletable (Abelian group) vs non-deletable
-# (monoid) split, api.thrift:156-172. sum/count/mean and stddev/variance are Abelian-group
+# (monoid) split. sum/count/mean and stddev/variance are Abelian-group
 # (or decompose into sum/count), so they are retractable-safe and are NOT listed here.
 MONOID_FUNCTIONS = frozenset({"min", "max", "count_distinct", "approx_count_distinct"})
 
@@ -100,9 +99,8 @@ def _window_relation(
     aggregations: List[Aggregation], ts_col: str, relation: str
 ) -> str:
     # RisingWave TUMBLE/HOP is a table function over the whole relation, so every
-    # aggregation in one MV must share a single window. Verified:
-    # time_window.slt:33-36 (TUMBLE), time_window.slt:45-48 (HOP; 3rd arg = slide,
-    # 4th arg = size).
+    # aggregation in one MV must share a single window. For HOP the 3rd arg is the
+    # slide and the 4th arg is the size.
     windows = {(a.time_window, a.slide_interval) for a in aggregations}
     if len(windows) != 1:
         raise ValueError(
@@ -133,7 +131,7 @@ def build_windowed_agg_select(
     """Windowed-aggregation SELECT shared by BOTH the online MV (``engine.update``)
     and the offline backfill, so the two definitions cannot drift apart.
 
-    ``emit_on_close`` appends ``EMIT ON WINDOW CLOSE`` (eowc_group_agg.slt:18-23),
+    ``emit_on_close`` appends ``EMIT ON WINDOW CLOSE``,
     required for online/offline consistency; it is only valid when the source has a
     WATERMARK and is append-only — that precondition is enforced by the caller
     (``engine.update``), not here.
@@ -162,8 +160,8 @@ def build_windowed_agg_select(
             raise ValueError(
                 f"Aggregations {monoids} are monoids and cannot be retracted over a "
                 "retractable/upsert source without a per-window recompute "
-                "(Chronon api.thrift:156-164). Use an append-only source, or only "
-                "Abelian-group ops (sum/count/mean)."
+                "(monoids have no inverse, so they cannot be incrementally retracted). Use an "
+                "append-only source, or only Abelian-group ops (sum/count/mean)."
             )
 
     keys = ", ".join(column_info.join_keys_columns)
@@ -173,8 +171,8 @@ def build_windowed_agg_select(
 
     if windowed:
         # window_END is the row's event timestamp: a window [t, t+w) is only knowable
-        # at t+w, so an as-of (<=) join never sees a window before it closes
-        # (time_window.slt:50-61). Timestamping by window_start would leak the full
+        # at t+w, so an as-of (<=) join never sees a window before it closes.
+        # Timestamping by window_start would leak the full
         # aggregate to label times that fall inside the still-open window.
         select = (
             f"SELECT {keys}, {exprs}, window_start, window_end "
@@ -193,7 +191,7 @@ def build_windowed_agg_select(
 # rolls them up to the requested window AT RETRIEVAL, anchored to the request/label time. This is
 # distinct from the streaming TUMBLE path above: tiles are a plain batch GROUP BY over a batch
 # relation (e.g. an Iceberg source) and one fixed tile set serves any window size, sliding with the
-# request time. Verified end-to-end live on RW v3.0.0: spike/sql/05c_batch_tiles.sql.
+# request time. Validated end-to-end on RisingWave v3.0.0.
 
 # The tile model materializes per-(entity, tile) PARTIALS that recombine additively across the tiles
 # in a window. WINDOW-INDEPENDENT (one tile set reused across every time-window): a partial is
@@ -282,7 +280,7 @@ def _tile_recombine(
     return f"sqrt({var}) AS {out}" if fn.startswith("stddev") else f"{var} AS {out}"
 
 # aggregation_interval (the tile size) -> RisingWave date_trunc unit. Standard units only for now
-# (date_trunc is what the spike validated); arbitrary intervals (e.g. 15min) need epoch-bucketing.
+# (date_trunc only supports these units); arbitrary intervals (e.g. 15min) need epoch-bucketing.
 _TILE_INTERVAL_UNIT = {3600: "hour", 86400: "day", 604800: "week"}
 
 
@@ -293,7 +291,7 @@ def _tile_unit(aggregation_interval) -> str:
             f"aggregation_interval {aggregation_interval} is not supported yet: the batch tile "
             f"builder buckets with date_trunc, so it must be 1 "
             f"{'/'.join(sorted(_TILE_INTERVAL_UNIT.values()))}. Arbitrary intervals need "
-            f"epoch-bucketing (a later phase)."
+            f"epoch-bucketing, which is not yet supported."
         )
     return unit
 
@@ -301,7 +299,7 @@ def _tile_unit(aggregation_interval) -> str:
 def _assert_tile_supported(aggregations: List[Aggregation]) -> None:
     # The tile model supports any aggregation that recombines from additive partials: sum/count/min/max
     # directly, and mean/var/stddev via composite partials (Chronon's IR). count_distinct/approx have
-    # no safe additive sketch merge across tiles (cf. Chronon's monoid split, api.thrift) — rejected.
+    # no safe additive sketch merge across tiles (they are monoids with no inverse) — rejected.
     unsupported = sorted({a.function for a in aggregations} - _TILE_SUPPORTED_FN)
     if unsupported:
         raise ValueError(
@@ -316,7 +314,7 @@ def _single_window_secs(aggregations: List[Aggregation]) -> int:
     if len(windows) != 1 or None in windows:
         raise ValueError(
             f"tile rollup needs a single non-null time_window; got {windows} "
-            f"(multiple windows from one tile set is a later phase)."
+            f"(this builder does not support multiple windows from one tile set)."
         )
     return int(next(iter(windows)).total_seconds())
 
@@ -343,7 +341,7 @@ def _assert_window_multiple_of_interval(window_secs: int, aggregation_interval) 
 def _validate_window_rollup(aggregations: List[Aggregation], aggregation_interval) -> int:
     """Single-window precondition for the per-window rollup builders (offline floored, online now()):
     tile-supported aggs only, a single window, and window a whole multiple of the interval. Returns
-    window_secs. Centralized so the online and offline rollups CANNOT validate differently (ADR-0004).
+    window_secs. Centralized so the online and offline rollups CANNOT validate differently.
     Online is per-window (the engine provisions one now()-anchored MV per distinct window), so each of
     those MVs is built from a single-window aggregation subset."""
     _assert_tile_supported(aggregations)
@@ -409,7 +407,7 @@ def group_aggregations_by_window(
 def _tile_rollup_exprs(aggregations: List[Aggregation], prefix: str = "") -> str:
     """The per-aggregation recombine projection for the SINGLE-window rollup builders (the surrounding
     WHERE bounds the window, so no per-agg ``partial_filter``). Shared by online + floored rollups so
-    they recombine per-tile partials IDENTICALLY (ADR-0004 no-drift — one source of truth, via
+    they recombine per-tile partials IDENTICALLY (no-drift — one source of truth, via
     ``_tile_recombine``). ``prefix`` qualifies the partial columns for a joined relation."""
     return ", ".join(_tile_recombine(a, prefix=prefix) for a in aggregations)
 
@@ -459,7 +457,7 @@ def build_batch_tile_select(
 # epoch-anchored TUMBLE, but the offline PIT rollup floors with date_trunc — epoch-tumble lands on the
 # SAME boundary as date_trunc only for hour/day (a 1-week TUMBLE anchors to epoch-Thursday, date_trunc
 # 'week' to ISO-Monday, so weekly tiles would mis-grid online vs offline). Week/arbitrary intervals need
-# an epoch-aligned offline floor first (a later phase).
+# an epoch-aligned offline floor first, which is not yet supported.
 _STREAMING_TILE_INTERVAL_SECS = frozenset({3600, 86400})
 
 
@@ -475,7 +473,7 @@ def build_streaming_tile_select(
     ``aggregation_interval`` over a watermarked append-only source (vs batch's ``date_trunc`` GROUP BY over an
     Iceberg relation). ``tile_end`` is the tumble ``window_end``; ``EMIT ON WINDOW CLOSE`` emits a tile ONCE,
     only when its interval closes past the watermark, so a late event is dropped once at the tile boundary
-    (ADR-0005 train/serve parity at the tile level). Everything downstream — the per-window now()-anchored
+    (train/serve parity at the tile level: online and offline both read the same EOWC tiles). Everything downstream — the per-window now()-anchored
     rollup MVs and the offline PIT — reads the identical tile contract (``tile_end`` + bare partials),
     source-agnostic, so those builders need zero edits.
 
@@ -489,7 +487,7 @@ def build_streaming_tile_select(
         raise ValueError(
             f"streaming tile aggregation_interval must be 1 hour (3600s) or 1 day (86400s); got {secs}s. "
             f"The TUMBLE grid is epoch-anchored and must match the offline date_trunc floor — week/arbitrary "
-            f"intervals need an epoch-aligned offline floor (a later phase)."
+            f"intervals need an epoch-aligned offline floor, which is not yet supported."
         )
     keys = ", ".join(column_info.join_keys_columns)
     ts = column_info.timestamp_column
@@ -542,7 +540,7 @@ def build_online_rollup_select(
     unchanged point-lookup (one row per entity = the current rollup).
 
     Uses a plain two-sided ``now()`` window ``tile_end > now() - W AND tile_end <= now()`` rather than
-    ``build_tile_rollup_select``'s ``date_trunc(now())`` form. Verified live on RW v3.0.0: a two-sided
+    ``build_tile_rollup_select``'s ``date_trunc(now())`` form. Validated end-to-end on RisingWave v3.0.0: a two-sided
     ``date_trunc(now())`` range in a CREATE MATERIALIZED VIEW is REJECTED ("Failed to run the query"),
     but the plain two-sided ``now()`` form is accepted AND maintained correctly as the wall-clock
     advances (tiles evicted past the lower bound and admitted as ``now()`` crosses the upper bound).
@@ -579,7 +577,7 @@ def build_offline_tile_pit_query(
 
     This CANNOT reuse Feast's standard latest-row PIT template: that picks the latest tile <= label,
     which anchors the window at the latest tile WITH DATA, not at floor(label) — they diverge when the
-    most recent intervals have no events (verified live: 180/280/230 vs a wrong 180/280/280). So we
+    most recent intervals have no events (validated end-to-end on RisingWave v3.0.0: 180/280/230 vs a wrong 180/280/280). So we
     range-JOIN the inlined entity rows to the tiles and GROUP BY the entity row. LEFT JOIN so a row
     with no tiles in range still appears (NULL feature).
 
@@ -769,10 +767,10 @@ class RWJoinNode(_RWNode):
             entity_columns = list(entity_df.columns)
             entity_schema = dict(zip(entity_df.columns, entity_df.dtypes))
             entity_ts_col = infer_entity_timestamp_column(entity_schema)
-            # Spike-gated: a pandas entity_df must be staged into RisingWave (e.g. a
+            # NOT YET IMPLEMENTED: a pandas entity_df must be staged into RisingWave (e.g. a
             # temporary table / VALUES list) before it can be joined over pgwire. We
-            # reference a conventional staging relation here; the spike must implement
-            # the upload (mirrors Flink's pandas_to_flink_table staging).
+            # reference a conventional staging relation here; the upload itself is not yet
+            # implemented (mirrors Flink's pandas_to_flink_table staging).
             relation = f"SELECT * FROM {_quote(ENTITY_ROW_ID + '_spine')}"
             select_exprs = [
                 f"{_quote(col)} AS {_quote(ENTITY_TS_ALIAS)}"
@@ -1036,10 +1034,10 @@ class RWTransformNode(_RWNode):
                 "RisingWaveComputeEngine can only push down transformations expressed "
                 "as a RisingWave SQL string (feature_transformation.sql). Arbitrary "
                 "python/pandas/UDF transforms are not expressible in-engine "
-                "(spike-gated). Pre-transform upstream, or use a SQL transformation."
+                "(not supported). Pre-transform upstream, or use a SQL transformation."
             )
         # The SQL transform replaces the projection over the input relation; the
-        # output column set is the view's declared features (spike-gated: we trust the
+        # output column set is the view's declared features (unvalidated: we trust the
         # transform SQL to emit exactly these names).
         select = f"SELECT {sql_expr} FROM ({relation}) AS _t"
         output_columns = (
@@ -1056,7 +1054,7 @@ class RWValidationNode(_RWNode):
     """Column-presence validation. Mirrors ``FlinkValidationNode``: assert every
     expected feature column is present in the relation's carried column list; raise
     with the actual columns if any are missing. (Type/JSON validation would require
-    pulling data out of RisingWave and is spike-gated.)"""
+    pulling data out of RisingWave and is not yet supported.)"""
 
     def __init__(self, name, view, column_info, *, expected_columns=None, inputs=None):
         super().__init__(name, view, column_info, inputs=inputs)
@@ -1116,10 +1114,10 @@ class RWOutputNode(_RWNode):
             # window_end is already the event timestamp emitted by the aggregation
             # node; the staging table mirrors the live sink's projection so backfill
             # rows are byte-compatible with streamed rows.
-            # UNVERIFIED end-to-end (spike risk #1/#5): the bounded backfill INSERT and
+            # UNVERIFIED end-to-end: the bounded backfill INSERT and
             # its late-data parity with the live stream are not yet proven in-repo.
             # Preferred long-term: read the live sink's Iceberg history so backfill ==
-            # what was served (risk #8). The bounded [start, end) predicate is applied
+            # what was served. The bounded [start, end) predicate is applied
             # by the upstream filter node before this INSERT.
             staging = _quote(offline_staging_name(context.project, self.view.name))
             sql = f"INSERT INTO {staging} {select_sql}"

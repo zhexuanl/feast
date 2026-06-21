@@ -2,8 +2,8 @@
 
 These tests do NOT cover the happy path. Each one tries to make the engine emit an
 incorrect, leaky, or unsafe artifact and asserts that it refuses or produces the
-safe form. They encode the 5 blockers + correctness invariants found in the design
-review and pin what the de-risking spike must keep green.
+safe form. They encode the correctness invariants of the engine and
+pin the behavior that must stay green.
 
 They run without a live RisingWave: the SQL builders and the provisioning guards are
 pure (no DB connection).
@@ -101,7 +101,7 @@ def _stream_tile_view(source, aggs, interval_secs=86400):
     # A streaming-tile view = a StreamFeatureView carrying Feast's NATIVE enable_tiling + tiling_hop_size
     # (the tile interval) alongside its aggregations. The engine reads tiling_hop_size as the tile size
     # (tile_interval) and is_streaming_tile keys on enable_tiling + aggregations. Windows are > interval
-    # (the ourfs authoring guarantees this).
+    # (the feature-view authoring layer guarantees this).
     view = _stream_view(source, aggs)
     view.enable_tiling = True
     view.tiling_hop_size = timedelta(seconds=interval_secs)
@@ -275,7 +275,8 @@ def test_approx_count_distinct_emits_native_sql_and_is_monoid():
 
 
 # --- Batch tile aggregation (tile model: partial aggregates + retrieval rollup) ---
-# Validated end-to-end live on RW v3.0.0: spike/sql/05c_batch_tiles.sql.
+# The tile model (window-independent partial aggregates materialized once, then recombined per
+# window at retrieval) is validated end-to-end on RisingWave v3.0.0.
 
 
 def test_batch_tile_select_buckets_by_interval_and_stamps_tile_end():
@@ -449,7 +450,7 @@ def test_tile_rollup_offline_also_rejects_window_not_multiple_of_interval():
 
 
 def test_online_rollup_is_single_window_one_mv_per_window():
-    # SLICE BOUNDARY: the now()-anchored online MV is per-window (RW rejects now() inside a CASE in a
+    # Single-window-per-MV boundary: the now()-anchored online MV is per-window (RW rejects now() inside a CASE in a
     # two-sided temporal-filter MV, so multi-window online = N separate per-window MVs the engine loops
     # over). The builder therefore takes a SINGLE window; two windows is rejected, not silently merged.
     # (Multi-window OFFLINE, by contrast, is one query — see the multi-window PIT tests above.)
@@ -755,7 +756,7 @@ def test_reconcile_stream_view_reprovisions_on_definition_change():
     assert [s.split()[1] for s in creates] == ["SOURCE", "MATERIALIZED", "SINK"]  # base first
 
 
-# --- Phase 6 Inc 2: BATCH feature view provisioning (Iceberg source -> tiles MV) ---
+# --- BATCH feature view provisioning (Iceberg source -> tiles MV) ---
 
 
 def _batch_view(aggs, interval_secs=86400, name="user_txn_daily"):
