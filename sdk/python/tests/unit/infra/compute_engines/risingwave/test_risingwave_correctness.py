@@ -42,6 +42,7 @@ from feast.infra.compute_engines.risingwave.nodes import (
     build_batch_tile_select,
     build_offline_tile_pit_query,
     build_online_rollup_select,
+    build_streaming_tile_select,
     build_tile_rollup_select,
     build_windowed_agg_select,
     group_aggregations_by_window,
@@ -503,6 +504,41 @@ def test_offline_tile_pit_does_not_apply_ttl_only_the_window_bounds():
     assert sql.count("t.tile_end >") == 2
     assert sql.count("- INTERVAL '259200' SECOND") == 2
     assert "ttl" not in sql.lower()
+
+
+# --- Streaming tiles (S1): the EOWC-tumble twin of build_batch_tile_select ---
+
+
+def test_streaming_tile_select_mirrors_batch_partials_via_eowc_tumble():
+    # The streaming tiles MV emits the SAME deduped window-independent partials as the batch tiles MV
+    # (shared _tile_partials_projection), materialized by an EOWC TUMBLE at the interval instead of date_trunc.
+    aggs = [_agg("sum", 259200), _agg("mean", 604800)]  # partials dedup -> sum_amount, count_amount
+    proj = "sum(amount) AS sum_amount, count(amount) AS count_amount"
+    sql = build_streaming_tile_select(_column_info(), aggs, "src", aggregation_interval=timedelta(days=1))
+    assert proj in sql
+    assert proj in build_batch_tile_select(_column_info(), aggs, "src", aggregation_interval=timedelta(days=1))
+    assert "tumble(src, event_ts, INTERVAL '86400' SECOND)" in sql  # EOWC tumble AT the interval
+    assert "window_end AS tile_end" in sql  # tile_end = the tumble close boundary
+    assert "GROUP BY window_start, window_end, user_id" in sql
+    assert sql.rstrip().endswith("EMIT ON WINDOW CLOSE")
+
+
+@pytest.mark.parametrize("secs", [604800, 900, 2592000])  # week, 15min, 30d
+def test_streaming_tile_select_rejects_non_hour_day_interval(secs):
+    # epoch-anchored TUMBLE must match the offline date_trunc floor -> only hour/day are grid-aligned.
+    with pytest.raises(ValueError, match="1 hour .* or 1 day"):
+        build_streaming_tile_select(
+            _column_info(), [_agg("sum", 259200)], "src", aggregation_interval=timedelta(seconds=secs)
+        )
+
+
+def test_streaming_tile_select_rejects_unsupported_and_empty():
+    with pytest.raises(ValueError, match="not supported"):  # same tile-supported contract as batch
+        build_streaming_tile_select(
+            _column_info(), [_agg("count_distinct", 259200)], "src", aggregation_interval=timedelta(hours=1)
+        )
+    with pytest.raises(ValueError, match="at least one aggregation"):
+        build_streaming_tile_select(_column_info(), [], "src", aggregation_interval=timedelta(hours=1))
 
 
 # --- Multi-window from ONE tile set (tiles reused across time-windows) ---

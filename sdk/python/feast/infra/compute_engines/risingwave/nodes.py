@@ -414,6 +414,21 @@ def _tile_rollup_exprs(aggregations: List[Aggregation], prefix: str = "") -> str
     return ", ".join(_tile_recombine(a, prefix=prefix) for a in aggregations)
 
 
+def _tile_partials_projection(column_info: ColumnInfo, aggregations: List[Aggregation]) -> str:
+    """The deduped window-independent partial columns as a ``{expr} AS {name}`` projection — the ONE
+    source of the tile partial set, shared by the batch and streaming tile builders so they cannot drift.
+    Includes the partial-name vs join-key clash guard (a bare ``{family}_{col}`` partial that equals an
+    entity column would make the tiles MV have two identically-named columns, which RisingWave rejects)."""
+    view_partials = _view_partials(aggregations)
+    key_clash = sorted(set(column_info.join_keys_columns) & {name for (name, _) in view_partials})
+    if key_clash:
+        raise ValueError(
+            f"entity/join-key column(s) {key_clash} collide with tile partial column name(s); rename "
+            f"the entity column(s) (tile partials are named '<function>_<column>', e.g. sum_amount)."
+        )
+    return ", ".join(f"{expr} AS {name}" for (name, expr) in view_partials)
+
+
 def build_batch_tile_select(
     column_info: ColumnInfo,
     aggregations: List[Aggregation],
@@ -431,26 +446,58 @@ def build_batch_tile_select(
         raise ValueError("build_batch_tile_select requires at least one aggregation")
     _assert_tile_supported(aggregations)
     unit = _tile_unit(aggregation_interval)
-    # Window-independent partials, deduped across aggregations: one ``sum_amount`` serves every window
-    # and every function on ``amount``. Additive functions emit one partial (the aggregate); composite
-    # (mean/var/stddev) emit several (sum/count/sumsq).
-    view_partials = _view_partials(aggregations)
-    # The partials are bare ``{family}_{col}`` names selected next to the GROUP BY join keys. If an
-    # entity column is literally named like a partial (e.g. a key ``sum_amount`` with a sum(amount)
-    # agg), the tiles MV would have two identically-named columns and RisingWave rejects the DDL —
-    # fail fast with a clear message instead of a confusing duplicate-column error downstream.
-    key_clash = sorted(set(column_info.join_keys_columns) & {name for (name, _) in view_partials})
-    if key_clash:
-        raise ValueError(
-            f"entity/join-key column(s) {key_clash} collide with tile partial column name(s); rename "
-            f"the entity column(s) (tile partials are named '<function>_<column>', e.g. sum_amount)."
-        )
     keys = ", ".join(column_info.join_keys_columns)
     bucket = f"date_trunc('{unit}', {column_info.timestamp_column})"
-    partials = ", ".join(f"{expr} AS {name}" for (name, expr) in view_partials)
+    partials = _tile_partials_projection(column_info, aggregations)
     return (
         f"SELECT {keys}, {bucket} + INTERVAL '1 {unit}' AS tile_end, {partials} "
         f"FROM {relation} GROUP BY {keys}, {bucket}"
+    )
+
+
+# Streaming tile intervals are restricted to HOUR/DAY: the streaming tiles MV buckets with RisingWave's
+# epoch-anchored TUMBLE, but the offline PIT rollup floors with date_trunc — epoch-tumble lands on the
+# SAME boundary as date_trunc only for hour/day (a 1-week TUMBLE anchors to epoch-Thursday, date_trunc
+# 'week' to ISO-Monday, so weekly tiles would mis-grid online vs offline). Week/arbitrary intervals need
+# an epoch-aligned offline floor first (a later phase).
+_STREAMING_TILE_INTERVAL_SECS = frozenset({3600, 86400})
+
+
+def build_streaming_tile_select(
+    column_info: ColumnInfo,
+    aggregations: List[Aggregation],
+    relation: str,
+    *,
+    aggregation_interval,
+) -> str:
+    """Tile materialization for a STREAMING feature view — the streaming twin of ``build_batch_tile_select``.
+    Emits the SAME per-(entity, tile_end) window-independent partials, but materialized by an EOWC TUMBLE at
+    ``aggregation_interval`` over a watermarked append-only source (vs batch's ``date_trunc`` GROUP BY over an
+    Iceberg relation). ``tile_end`` is the tumble ``window_end``; ``EMIT ON WINDOW CLOSE`` emits a tile ONCE,
+    only when its interval closes past the watermark, so a late event is dropped once at the tile boundary
+    (ADR-0005 train/serve parity at the tile level). Everything downstream — the per-window now()-anchored
+    rollup MVs and the offline PIT — reads the identical tile contract (``tile_end`` + bare partials),
+    source-agnostic, so those builders need zero edits.
+
+    The watermark + append-only precondition on ``relation`` is the PROVISIONING layer's responsibility (the
+    engine asserts a ``watermark_delay_threshold`` before emitting EOWC), not this pure builder's."""
+    if not aggregations:
+        raise ValueError("build_streaming_tile_select requires at least one aggregation")
+    _assert_tile_supported(aggregations)
+    secs = int(aggregation_interval.total_seconds())
+    if secs not in _STREAMING_TILE_INTERVAL_SECS:
+        raise ValueError(
+            f"streaming tile aggregation_interval must be 1 hour (3600s) or 1 day (86400s); got {secs}s. "
+            f"The TUMBLE grid is epoch-anchored and must match the offline date_trunc floor — week/arbitrary "
+            f"intervals need an epoch-aligned offline floor (a later phase)."
+        )
+    keys = ", ".join(column_info.join_keys_columns)
+    ts = column_info.timestamp_column
+    partials = _tile_partials_projection(column_info, aggregations)
+    return (
+        f"SELECT {keys}, window_end AS tile_end, {partials} "
+        f"FROM tumble({relation}, {ts}, INTERVAL '{secs}' SECOND) "
+        f"GROUP BY window_start, window_end, {keys} EMIT ON WINDOW CLOSE"
     )
 
 
