@@ -508,8 +508,14 @@ class RisingWaveComputeEngine(ComputeEngine):
 
         Both online serving AND offline training read this EOWC MV (the offline source is a PostgreSQL
         query over it, ADR-0005-gated), so re-materializing the MV keeps online == offline under the new
-        definition — no skew. (The Iceberg sink is a separate durable copy training does NOT read; its
-        table may retain pre-change rows after a re-materialize — harmless, but a future tidy-up.)"""
+        definition — no skew.
+
+        Iceberg-sink follow-up (deferred, ADR-0005): the ``{base}_offline`` Iceberg sink is a durable
+        copy training does NOT read today — so its table retaining pre-change rows after a re-materialize
+        is harmless now. RisingWave has no sink-level table reset (only ``create_table_if_not_exists``;
+        no drop/overwrite/truncate), so when the offline read ever migrates to the Iceberg sink (ADR-0005:
+        "if MV retention is introduced"), the re-materialize must purge that table out-of-band (catalog
+        drop, or a definition-versioned table name) to keep the durable archive consistent."""
         mv = online_mv_name(project, view.name)
         desired = self._stream_mv_select(project, view)
         if _norm_sql(_deployed_mv_select(cur, mv)) != _norm_sql(desired):
