@@ -30,7 +30,7 @@ from feast.infra.compute_engines.risingwave.engine import (
     _iceberg_storage_opts,
     _plan_batch_reconcile,
 )
-from feast.infra.compute_engines.risingwave.iceberg_source import IcebergSource
+from feast.infra.compute_engines.risingwave.iceberg_source import IcebergSource, is_tile_view
 from feast.infra.compute_engines.risingwave.offline_store import (
     RisingWaveOfflineStore,
     RisingWaveOfflineStoreConfig,
@@ -1082,6 +1082,16 @@ def test_provision_streaming_tile_requires_a_tiling_hop_size():
     view.tiling_hop_size = None  # an enable_tiling SFV authored without the hop
     with pytest.raises(ValueError, match="tiling_hop_size"):
         _engine()._provision_streaming_tile_ddl("proj", view)
+
+
+def test_is_tile_view_unions_batch_and_streaming_tile():
+    # S5 offline + serving routing keys on is_tile_view: BOTH a batch tile FV and a streaming tile view
+    # take the tile path (per-window rollup MVs online + tile PIT offline); a plain stream view does not.
+    assert is_tile_view(_batch_view([_agg("sum", 259200)]))  # batch tile (IcebergSource)
+    assert is_tile_view(
+        _stream_tile_view(_kafka_source(watermark=True), [_agg("sum", 259200)], interval_secs=86400)
+    )  # streaming tile (enable_tiling)
+    assert not is_tile_view(_stream_view(_kafka_source(watermark=True), [_agg("sum", 259200)]))  # plain stream
 
 
 def test_multi_window_streaming_tile_would_fail_the_plain_stream_path():

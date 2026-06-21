@@ -20,7 +20,7 @@ import pandas as pd
 from feast.feature_view import FeatureView
 from feast.infra.compute_engines.dag.context import ColumnInfo
 from feast.infra.compute_engines.risingwave.iceberg_source import (
-    is_tile_fv,
+    is_tile_view,
     tile_interval,
     view_aggregations,
 )
@@ -100,7 +100,7 @@ class RisingWaveOfflineStore(PostgreSQLOfflineStore):
         full_feature_names: bool = False,
         **kwargs,
     ) -> RetrievalJob:
-        tile_fvs = [fv for fv in feature_views if is_tile_fv(fv)]
+        tile_fvs = [fv for fv in feature_views if is_tile_view(fv)]
         if tile_fvs:
             return _tile_historical_features(
                 config, feature_views, tile_fvs, feature_refs, entity_df,
@@ -155,9 +155,10 @@ def _tile_historical_features(
             "as SQL); a SQL-string entity_df is a later increment."
         )
 
-    # The aggregations come from the IcebergSource's spec (carried in custom_options, which survives
-    # the registry round-trip) — the SAME spec the engine provisioned the tiles with, so the resolved
-    # column names cannot drift.
+    # view_aggregations reads the SAME spec the engine provisioned the tiles with — a batch tile view's
+    # IcebergSource custom_options, or a streaming tile view's native StreamFeatureView.aggregations —
+    # so the resolved column names cannot drift. The PIT below reads the tiles MV by name, identically
+    # for both flavors (only the engine's tiles-MV source differs).
     aggregations = view_aggregations(fv)
     column_info = ColumnInfo(
         join_keys=[f.name for f in fv.entity_columns],

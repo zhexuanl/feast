@@ -12,8 +12,10 @@ Why the spec lives on the SOURCE, not on the feature view: Feast's registry has 
 that DROPS its aggregations and its type. A ``CUSTOM_SOURCE``'s ``custom_options`` round-trips
 cleanly (the contrib sources rely on this) — the source is the one object that survives intact. So a
 tile feature view is just a plain ``feast.FeatureView`` whose ``batch_source`` is an ``IcebergSource``
-carrying the spec; ``is_tile_fv(view)`` is the ONE discriminator at every altitude (provisioning,
-serving, training), and ``view_aggregations`` / ``tile_interval`` are the ONE way to read the spec.
+carrying the spec; ``is_tile_fv(view)`` discriminates this BATCH tile flavor at every altitude
+(provisioning, serving, training), while ``is_streaming_tile(view)`` discriminates the STREAMING flavor
+and ``is_tile_view(view)`` is their union (serving/training key on the union). ``view_aggregations`` /
+``tile_interval`` are the ONE way to read the spec for either flavor.
 """
 
 import json
@@ -210,6 +212,15 @@ def is_streaming_tile(view) -> bool:
     downstream is the shared per-window rollup. Mutually exclusive with ``is_tile_fv`` (a stream view has
     no IcebergSource batch source)."""
     return bool(getattr(view, "enable_tiling", False)) and bool(getattr(view, "aggregations", None))
+
+
+def is_tile_view(view) -> bool:
+    """A tile feature view of EITHER flavor: a BATCH tile view (Iceberg-sourced, ``is_tile_fv``) or a
+    STREAMING tile view (Kafka-sourced, ``is_streaming_tile``). Both serve online from per-window rollup
+    MVs over a shared tiles MV and read offline via the tile PIT over that tiles MV — so the serving and
+    training routing keys on this union (not the flavor), differing only in how the engine provisions the
+    tiles MV (Iceberg ``date_trunc`` vs watermarked-Kafka EOWC tumble)."""
+    return is_tile_fv(view) or is_streaming_tile(view)
 
 
 def tile_interval(view) -> timedelta:
