@@ -48,6 +48,7 @@ from feast.infra.compute_engines.risingwave.names import (
 from feast.infra.compute_engines.risingwave.iceberg_source import (
     is_streaming_tile,
     is_tile_fv,
+    is_tile_view,
     tile_interval,
     view_aggregations,
 )
@@ -832,6 +833,13 @@ class RisingWaveComputeEngine(ComputeEngine):
         job_id = f"{view.name}-{task.start_time}-{task.end_time}"
         if not getattr(view, "offline", False):
             # Online-only: the live MV serves online; nothing to backfill offline.
+            return RisingWaveMaterializationJob(job_id, MaterializationJobStatus.SUCCEEDED)
+        if is_tile_view(view):
+            # A tile view's offline training reads the live tiles MV directly (the tile PIT rollup), and that
+            # MV already holds the full history its source carries — there is no durable offline table to
+            # backfill. The plain windowed-agg backfill below would instead compute non-tile values (skewing
+            # offline from the tile rollup served online) and target a staging table a tile view never
+            # provisions, so a tile view materializes offline to a no-op.
             return RisingWaveMaterializationJob(job_id, MaterializationJobStatus.SUCCEEDED)
         try:
             builder = RisingWaveFeatureBuilder(

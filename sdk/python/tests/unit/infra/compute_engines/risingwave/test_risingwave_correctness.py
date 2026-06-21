@@ -9,7 +9,7 @@ They run without a live RisingWave: the SQL builders and the provisioning guards
 pure (no DB connection).
 """
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -19,6 +19,10 @@ import pytest
 from feast.aggregation import Aggregation
 from feast.data_format import JsonFormat
 from feast.data_source import KafkaSource, PushSource
+from feast.infra.common.materialization_job import (
+    MaterializationJobStatus,
+    MaterializationTask,
+)
 from feast.infra.compute_engines.risingwave.engine import (
     RisingWaveComputeEngine,
     _batch_drop_ddl,
@@ -1336,6 +1340,54 @@ def test_multi_window_streaming_tile_would_fail_the_plain_stream_path():
     ddl = _engine()._provision_streaming_tile_ddl("proj", view)
     assert sum(1 for s in ddl if "tumble(" in s) == 1
     assert len([s for s in ddl if "_online_" in s]) == 2
+
+
+# --- offline materialize routing: tile views no-op (offline reads the live tiles MV directly) ---
+
+
+def test_materialize_one_tile_view_offline_is_noop(monkeypatch):
+    # A tile view (batch OR streaming) trains offline by reading the live tiles MV directly, so there is no
+    # durable offline table to backfill. materialize(offline=True) must be a no-op — NOT run the plain
+    # windowed-agg backfill, which would skew offline from the tile rollup served online (and a batch tile
+    # view has no stream_source, so the backfill path would even raise). Proven by: the backfill builder is
+    # never constructed (we make it explode) yet the job SUCCEEDS.
+    import feast.infra.compute_engines.risingwave.engine as eng_mod
+
+    def _explode(*args, **kwargs):
+        raise RuntimeError("entered the windowed-agg backfill path")
+
+    monkeypatch.setattr(eng_mod, "RisingWaveFeatureBuilder", _explode)
+    eng = _engine()
+    start, end = datetime(2026, 1, 1), datetime(2026, 1, 2)
+    for view in (
+        _batch_view([_agg("sum", 259200)]),  # batch tile (IcebergSource), offline=True
+        _stream_tile_view(  # streaming tile (enable_tiling), offline=True via _stream_view default
+            _kafka_source(watermark=True), [_agg("sum", 259200)], interval_secs=86400
+        ),
+    ):
+        job = eng._materialize_one(MagicMock(), MaterializationTask("proj", view, start, end))
+        assert job.status() == MaterializationJobStatus.SUCCEEDED
+        assert job.error() is None
+
+
+def test_materialize_one_plain_stream_view_still_enters_backfill(monkeypatch):
+    # Routing-boundary guard: the tile no-op must NOT swallow a plain (non-tile) stream view — it still
+    # enters the windowed-agg backfill path. We make the builder explode and assert the error surfaces.
+    import feast.infra.compute_engines.risingwave.engine as eng_mod
+
+    sentinel = RuntimeError("entered-backfill")
+
+    def _explode(*args, **kwargs):
+        raise sentinel
+
+    monkeypatch.setattr(eng_mod, "RisingWaveFeatureBuilder", _explode)
+    eng = _engine()
+    view = _stream_view(_kafka_source(watermark=True), [_agg("sum")])  # offline=True default, NOT a tile
+    job = eng._materialize_one(
+        MagicMock(), MaterializationTask("proj", view, datetime(2026, 1, 1), datetime(2026, 1, 2))
+    )
+    assert job.status() == MaterializationJobStatus.ERROR
+    assert job.error() is sentinel
 
 
 # (Removed: engine.get_historical_features tests — retrieval is the offline store's
