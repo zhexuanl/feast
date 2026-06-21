@@ -47,6 +47,7 @@ from feast.infra.offline_stores.offline_store import RetrievalJob
 from feast.infra.registry.base_registry import BaseRegistry
 from feast.on_demand_feature_view import OnDemandFeatureView
 from feast.repo_config import RepoConfig
+from feast.utils import _parse_feature_ref
 
 _OFFLINE_STORE_PATH = (
     "feast.infra.compute_engines.risingwave.offline_store.RisingWaveOfflineStore"
@@ -150,6 +151,26 @@ class RisingWaveOfflineStore(PostgreSQLOfflineStore):
         )
 
 
+def _requested_features(fv, feature_refs) -> List[str]:
+    """The subset of ``fv``'s features requested in ``feature_refs``, in the view's declared order.
+
+    The standard Feast offline contract returns ONLY the requested features — a call asking for a
+    subset of a view's features must not pull every column. This mirrors the per-view selection
+    ``_get_requested_feature_views_to_features_dict`` performs (match each reference's view against
+    ``projection.name_to_use()``, collect its feature), reusing Feast's ``_parse_feature_ref`` so
+    versioned references parse identically. Single-view by construction (the caller routes exactly one
+    feature view here), so references for other views / on-demand views simply do not match.
+    """
+    view_name = fv.projection.name_to_use()
+    requested = set()
+    for ref in feature_refs:
+        ref_fv, version_num, ref_feature = _parse_feature_ref(ref)
+        ref_view = f"{ref_fv}@v{version_num}" if version_num is not None else ref_fv
+        if ref_view == view_name:
+            requested.add(ref_feature)
+    return [f.name for f in fv.features if f.name in requested]
+
+
 def _tile_historical_features(
     config, feature_views, tile_fvs, feature_refs, entity_df,
     registry, project, full_feature_names,
@@ -187,6 +208,12 @@ def _tile_historical_features(
     # so the resolved column names cannot drift. The PIT below reads the tiles MV by name, identically
     # for both flavors (only the engine's tiles-MV source differs).
     aggregations = view_aggregations(fv)
+    # Honor feature_refs: keep only the aggregations whose output feature was requested, so a subset
+    # request rolls up (and projects) just those features — not every aggregation of the view.
+    requested = set(_requested_features(fv, feature_refs))
+    aggregations = [
+        a for a in aggregations if a.resolved_name(a.time_window) in requested
+    ]
     column_info = ColumnInfo(
         join_keys=[f.name for f in fv.entity_columns],
         feature_cols=[a.resolved_name(a.time_window) for a in aggregations],
@@ -202,6 +229,8 @@ def _tile_historical_features(
         column_info=column_info,
         aggregations=aggregations,
         aggregation_interval=tile_interval(fv),
+        full_feature_names=full_feature_names,
+        view_name=fv.projection.name_to_use(),
     )
     return PostgreSQLRetrievalJob(
         query=query,
@@ -253,7 +282,8 @@ def _passthrough_historical_features(
     # alone (the Iceberg history carries no created_timestamp_column), so online == offline on ties.
     column_info = ColumnInfo(
         join_keys=[f.name for f in fv.entity_columns],
-        feature_cols=[f.name for f in fv.features],
+        # Honor feature_refs: project only the requested features, not every feature of the view.
+        feature_cols=_requested_features(fv, feature_refs),
         ts_col=ts_col,
         created_ts_col=None,
         field_mapping=None,
@@ -266,6 +296,8 @@ def _passthrough_historical_features(
         history_relation=history_relation,
         column_info=column_info,
         ttl_seconds=int(ttl.total_seconds()) if ttl else None,
+        full_feature_names=full_feature_names,
+        view_name=fv.projection.name_to_use(),
     )
     return PostgreSQLRetrievalJob(
         query=query,

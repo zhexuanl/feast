@@ -233,6 +233,8 @@ def build_passthrough_pit_query(
     history_relation: str,
     column_info: ColumnInfo,
     ttl_seconds: Optional[int] = None,
+    full_feature_names: bool = False,
+    view_name: Optional[str] = None,
 ) -> str:
     """Offline point-in-time training read for a passthrough feature view: for EACH entity row, the latest
     raw feature row at-or-before that row's label timestamp — the as-of cut that makes offline == the
@@ -240,7 +242,11 @@ def build_passthrough_pit_query(
     entity row with no match still appears (NULL features), ROW_NUMBER per entity row ordered by event (then
     created) timestamp DESC, keeping rn = 1. ``ttl_seconds`` bounds the lookback (the value is valid only
     within ttl of the label; older => NULL); unset => no lower bound. Identical entity rows collapse to one
-    output row (PARTITION BY the entity columns), matching the tile PIT's GROUP BY behavior."""
+    output row (PARTITION BY the entity columns), matching the tile PIT's GROUP BY behavior.
+
+    ``column_info.feature_cols`` is already the requested feature subset (the caller restricts it to the
+    features in feature_refs). ``full_feature_names`` aliases every feature output as
+    ``"{view_name}__{feature}"`` (the standard Feast offline contract); entity columns are never prefixed."""
     keys = column_info.join_keys_columns
     # A feature column may coincide with a non-join-key entity_df column (e.g. the label-timestamp column);
     # take such a column from the entity side only, so the inner subquery emits each name once (a duplicate
@@ -258,7 +264,15 @@ def build_passthrough_pit_query(
         asof += f' AND h."{ts}" >= e."{label_ts_column}" - INTERVAL \'{ttl_seconds}\' SECOND'
     order_by = ", ".join(f'h."{c}" DESC' for c in (ts, created) if c)
     partition = ", ".join(f'e."{c}"' for c in entity_columns)
-    out_cols = ", ".join(f'"{c}"' for c in [*entity_columns, *feature_cols])
+    # Entity columns project bare; feature columns take the "{view}__{feature}" alias under
+    # full_feature_names. The inner subquery still emits bare names, so the alias lives only on the outer
+    # projection (mirrors Feast's PIT template, which prefixes feature columns but never the entity keys).
+    prefix = view_name if full_feature_names else None
+    out_entity = [f'"{c}"' for c in entity_columns]
+    out_feats = [
+        f'"{c}" AS "{prefix}__{c}"' if prefix else f'"{c}"' for c in feature_cols
+    ]
+    out_cols = ", ".join([*out_entity, *out_feats])
     return (
         f"SELECT {out_cols} FROM (SELECT {e_cols}, {h_feats}, "
         f"ROW_NUMBER() OVER (PARTITION BY {partition} ORDER BY {order_by}) AS rn "
@@ -323,16 +337,24 @@ def _view_partials(aggregations: List[Aggregation]) -> List[Tuple[str, str]]:
 
 
 def _tile_recombine(
-    agg: Aggregation, *, prefix: str = "", partial_filter: Optional[str] = None
+    agg: Aggregation,
+    *,
+    prefix: str = "",
+    partial_filter: Optional[str] = None,
+    output_prefix: str = "",
 ) -> str:
     """The retrieval-time recombine for one aggregation: an expression over the window-independent
     tile partials aliased to the FINAL per-window ``resolved_name``. ``prefix`` qualifies the partial
     columns for a joined relation (``"t."`` in the offline PIT range-join). ``partial_filter`` is a SQL
     predicate that narrows the tiles to THIS aggregation's window (``CASE WHEN <filter> THEN p END``) —
     used when one query rolls up several windows over a shared join (the multi-window offline PIT); when
-    None the surrounding ``WHERE`` already bounds the window (the per-window online/floored rollups)."""
+    None the surrounding ``WHERE`` already bounds the window (the per-window online/floored rollups).
+    ``output_prefix`` qualifies the OUTPUT alias as ``"{output_prefix}__{resolved_name}"`` for an offline
+    read with full_feature_names; the online/materialize rollups pass none and keep the bare name."""
     col, fn = agg.column, agg.function
     out = agg.resolved_name(agg.time_window)
+    if output_prefix:
+        out = f'"{output_prefix}__{out}"'
 
     def merged(kind: str, op: str = "sum") -> str:
         p = f"{prefix}{kind}_{col}"
@@ -651,10 +673,17 @@ def build_offline_tile_pit_query(
     column_info: ColumnInfo,
     aggregations: List[Aggregation],
     aggregation_interval,
+    full_feature_names: bool = False,
+    view_name: Optional[str] = None,
 ) -> str:
     """Offline point-in-time training rollup for a tile BatchFeatureView. For EACH entity row, rolls
     the tiles up in the request-anchored window ``(end - W, end]`` where ``end = floor(label_ts,
     aggregation_interval)`` — anchored to THAT ROW's label timestamp (NOT a global now()).
+
+    ``aggregations`` is already the requested feature subset (the caller filters it to the features in
+    feature_refs), so each rolled-up column maps to a requested feature. ``full_feature_names`` aliases
+    every feature output as ``"{view_name}__{feature}"`` (the standard Feast offline contract); entity
+    columns are never prefixed. Without it the bare per-window ``resolved_name`` is emitted.
 
     This CANNOT reuse Feast's standard latest-row PIT template: that picks the latest tile <= label,
     which anchors the window at the latest tile WITH DATA, not at floor(label) — they diverge when the
@@ -679,6 +708,7 @@ def build_offline_tile_pit_query(
     e_cols = ", ".join(f'e."{c}"' for c in entity_columns)
     join_on = " AND ".join(f't."{k}" = e."{k}"' for k in keys)
     end = f'date_trunc(\'{unit}\', e."{label_ts_column}")'
+    output_prefix = (view_name or "") if full_feature_names else ""
     rollups = ", ".join(
         _tile_recombine(
             a,
@@ -686,6 +716,7 @@ def build_offline_tile_pit_query(
             partial_filter=(
                 f"t.tile_end > {end} - INTERVAL '{int(a.time_window.total_seconds())}' SECOND"
             ),
+            output_prefix=output_prefix,
         )
         for a in aggregations
     )

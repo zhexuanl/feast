@@ -1988,3 +1988,153 @@ def test_get_historical_features_inlines_dataframe_instead_of_uploading():
     assert parent.called
     passed = parent.call_args.kwargs["entity_df"]
     assert isinstance(passed, str) and passed.startswith("SELECT ")
+
+
+# --- feature_refs subset + full_feature_names on the custom PIT read paths ---
+# The two custom RisingWave read paths (passthrough as-of, tile rollup) must obey the standard Feast
+# offline contract: project ONLY the requested features, and prefix feature outputs as
+# "{view}__{feature}" when full_feature_names is set (entity/join-key columns are never prefixed).
+
+
+def _odfv_registry():
+    # Both _get_requested_feature_views_to_features_dict (positional) and
+    # OnDemandFeatureView.get_requested_odfvs (allow_cache kw) call list_on_demand_feature_views.
+    return SimpleNamespace(
+        list_on_demand_feature_views=lambda project, allow_cache=False: []
+    )
+
+
+def _with_projection(view):
+    # Real FeatureViews carry a projection; the SimpleNamespace fixtures don't. name_to_use() is the
+    # name the offline contract prefixes with, defaulting to the view name (no alias here).
+    view.projection = SimpleNamespace(name_to_use=lambda: view.name)
+    return view
+
+
+def _captured_pit_query(view, feature_refs, full_feature_names):
+    from unittest.mock import patch
+
+    entity_df = pd.DataFrame(
+        {"user_id": ["u1"], "event_timestamp": [pd.Timestamp("2026-06-04")]}
+    )
+    target = (
+        "feast.infra.compute_engines.risingwave.offline_store.PostgreSQLRetrievalJob"
+    )
+    with patch(target) as job:
+        RisingWaveOfflineStore.get_historical_features(
+            config=MagicMock(),
+            feature_views=[view],
+            feature_refs=feature_refs,
+            entity_df=entity_df,
+            registry=_odfv_registry(),
+            project="proj",
+            full_feature_names=full_feature_names,
+        )
+    return job.call_args.kwargs
+
+
+# --- passthrough as-of read ---
+
+
+def test_passthrough_pit_projects_only_the_requested_feature_subset():
+    view = _with_projection(_passthrough_batch_view(feature_cols=("amount", "country")))
+    sql = _captured_pit_query(
+        view, ["user_attr_daily:amount"], full_feature_names=False
+    )["query"]
+    assert '"amount"' in sql  # the requested feature is projected
+    assert "country" not in sql  # the unrequested feature is NOT pulled
+
+
+def test_passthrough_pit_full_feature_names_prefixes_only_features_not_entities():
+    view = _with_projection(_passthrough_batch_view(feature_cols=("amount", "country")))
+    kwargs = _captured_pit_query(
+        view,
+        ["user_attr_daily:amount", "user_attr_daily:country"],
+        full_feature_names=True,
+    )
+    sql = kwargs["query"]
+    assert kwargs["full_feature_names"] is True  # threaded to the retrieval job too
+    assert '"amount" AS "user_attr_daily__amount"' in sql
+    assert '"country" AS "user_attr_daily__country"' in sql
+    # entity / label-timestamp columns are never prefixed
+    assert "user_attr_daily__user_id" not in sql
+    assert "user_attr_daily__event_timestamp" not in sql
+
+
+def test_passthrough_pit_bare_feature_names_when_full_feature_names_false():
+    view = _with_projection(_passthrough_batch_view(feature_cols=("amount", "country")))
+    sql = _captured_pit_query(
+        view,
+        ["user_attr_daily:amount", "user_attr_daily:country"],
+        full_feature_names=False,
+    )["query"]
+    assert '"amount"' in sql and '"country"' in sql
+    assert "user_attr_daily__" not in sql  # no view prefix on any column
+
+
+def test_passthrough_pit_builder_full_feature_names_prefixes_only_feature_columns():
+    # Builder-level pin of the naming contract (independent of the offline-store wiring).
+    ci = ColumnInfo(
+        join_keys=["user_id"], feature_cols=["amount", "country"], ts_col="event_ts",
+        created_ts_col=None, field_mapping=None,
+    )
+    sql = build_passthrough_pit_query(
+        "SELECT 1", ["user_id", "event_timestamp"], "event_timestamp",
+        history_relation="hist", column_info=ci,
+        full_feature_names=True, view_name="user_attr",
+    )
+    assert '"amount" AS "user_attr__amount"' in sql
+    assert '"country" AS "user_attr__country"' in sql
+    assert "user_attr__user_id" not in sql  # entity key bare
+    assert "user_attr__event_timestamp" not in sql  # label ts bare
+
+
+# --- tile rollup read ---
+
+
+def test_offline_tile_pit_rolls_up_only_the_requested_window_subset():
+    view = _with_projection(_batch_view([_agg("sum", 259200), _agg("sum", 2592000)]))
+    sql = _captured_pit_query(
+        view, ["user_txn_daily:sum_amount_259200s"], full_feature_names=False
+    )["query"]
+    assert "sum_amount_259200s" in sql  # the requested 3d window
+    assert "sum_amount_2592000s" not in sql  # the unrequested 30d window is not rolled up
+
+
+def test_offline_tile_pit_full_feature_names_prefixes_only_features_not_entities():
+    view = _with_projection(_batch_view([_agg("sum", 259200), _agg("sum", 2592000)]))
+    kwargs = _captured_pit_query(
+        view,
+        ["user_txn_daily:sum_amount_259200s", "user_txn_daily:sum_amount_2592000s"],
+        full_feature_names=True,
+    )
+    sql = kwargs["query"]
+    assert kwargs["full_feature_names"] is True
+    assert 'AS "user_txn_daily__sum_amount_259200s"' in sql
+    assert 'AS "user_txn_daily__sum_amount_2592000s"' in sql
+    assert "user_txn_daily__user_id" not in sql  # entity key bare
+    assert "user_txn_daily__event_timestamp" not in sql  # label ts bare
+
+
+def test_offline_tile_pit_bare_feature_names_when_full_feature_names_false():
+    view = _with_projection(_batch_view([_agg("sum", 259200)]))
+    sql = _captured_pit_query(
+        view, ["user_txn_daily:sum_amount_259200s"], full_feature_names=False
+    )["query"]
+    assert "AS sum_amount_259200s" in sql  # bare per-window name
+    assert "user_txn_daily__" not in sql  # no view prefix
+
+
+def test_offline_tile_pit_builder_full_feature_names_prefixes_only_feature_columns():
+    # Builder-level pin: the rollup output alias carries the "{view}__{feature}" prefix; entity columns
+    # (projected as e."...") do not.
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(),
+        aggregations=[_agg("sum", 259200)], aggregation_interval=timedelta(days=1),
+        full_feature_names=True, view_name="user_txn_daily",
+    )
+    assert 'AS "user_txn_daily__sum_amount_259200s"' in sql  # feature prefixed
+    assert 'e."user_id"' in sql and "user_txn_daily__user_id" not in sql  # entity key bare
+    assert 'e."event_timestamp"' in sql  # label ts bare
