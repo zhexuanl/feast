@@ -46,6 +46,7 @@ from feast.infra.compute_engines.risingwave.nodes import (
     RWFilterNode,
     RWJoinNode,
     build_batch_tile_select,
+    build_latest_row_select,
     build_offline_tile_pit_query,
     build_online_rollup_select,
     build_streaming_tile_select,
@@ -205,6 +206,42 @@ def test_windowed_select_groups_by_and_emits_window_end():
         emit_on_close=False,
     )
     assert "GROUP BY window_start, window_end" in sql
+
+
+def test_latest_row_select_is_group_topn_newest_per_entity():
+    # A passthrough column is a raw value, served as the newest row per entity (no aggregation, no window).
+    # The latest-row MV is a Group-TopN: ROW_NUMBER() OVER (PARTITION BY keys ORDER BY ts DESC) keeping rn=1.
+    sql = build_latest_row_select(
+        ColumnInfo(
+            join_keys=["user_id"],
+            feature_cols=["amount", "country"],
+            ts_col="event_ts",
+            created_ts_col=None,
+            field_mapping=None,
+        ),
+        "src",
+    )
+    assert "ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY event_ts DESC)" in sql
+    assert sql.rstrip().endswith("= 1")  # keep only the newest row per entity
+    assert "GROUP BY" not in sql and "tumble(" not in sql  # passthrough: no aggregation, no window
+    # projects entity keys + raw feature columns + the event timestamp (servable by the point-lookup)
+    assert sql.startswith("SELECT user_id, amount, country, event_ts FROM")
+
+
+def test_latest_row_select_breaks_ties_on_created_timestamp_like_the_offline_read():
+    # When the source defines a created timestamp, the latest-row MV must break same-event-timestamp ties by
+    # created_ts DESC — the SAME order the offline as-of read uses — so online == offline on ties.
+    sql = build_latest_row_select(
+        ColumnInfo(
+            join_keys=["user_id"],
+            feature_cols=["amount"],
+            ts_col="event_ts",
+            created_ts_col="created_ts",
+            field_mapping=None,
+        ),
+        "src",
+    )
+    assert "ORDER BY event_ts DESC, created_ts DESC" in sql
 
 
 def test_mixed_windows_in_one_view_are_rejected():

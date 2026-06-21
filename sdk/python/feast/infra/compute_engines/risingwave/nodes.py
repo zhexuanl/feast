@@ -186,6 +186,36 @@ def build_windowed_agg_select(
     return select
 
 
+def build_latest_row_select(column_info: ColumnInfo, relation: str) -> str:
+    """Latest-row-per-entity SELECT for a passthrough (non-aggregated) feature view's online MV: project
+    the entity keys + raw feature columns + event timestamp, keeping only the newest row per entity. Shared
+    by provisioning and reconcile so the two definitions cannot drift.
+
+    A passthrough column is a raw value carried through unchanged (no aggregation, no window), so online it
+    is the latest value per entity, last-write-wins by event time — RisingWave maintains
+    ``ROW_NUMBER() OVER (PARTITION BY <keys> ORDER BY <ts> DESC[, <created_ts> DESC]) ... WHERE rn = 1`` as
+    an incrementally-updated Group-TopN (over an append-only source it keeps only the current top row per
+    key), so the MV holds exactly one row per entity. It is served by the SAME point-lookup as an
+    aggregation MV (one row per entity + a timestamp column), so the online read shape does not change.
+
+    The ORDER BY breaks ties on the created timestamp when the source defines one — the SAME order the
+    offline read uses (latest event timestamp, then latest created timestamp), so two rows sharing an
+    entity's newest event timestamp resolve to the SAME row online and offline (no train/serve skew on
+    ties). Offline training reads the raw history with an as-of cut (the latest row at-or-before each label
+    timestamp, same ordering), not this MV, since the MV holds only the current latest row, not the
+    history."""
+    keys = ", ".join(column_info.join_keys_columns)
+    ts = column_info.timestamp_column
+    created_ts = column_info.created_timestamp_column
+    order_by = ", ".join(f"{col} DESC" for col in (ts, created_ts) if col)
+    projection = ", ".join([*column_info.join_keys_columns, *column_info.feature_cols, ts])
+    return (
+        f"SELECT {projection} FROM (SELECT {projection}, "
+        f"ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY {order_by}) AS {DEDUP_ROW_NUMBER} "
+        f"FROM {relation}) AS _ranked WHERE {DEDUP_ROW_NUMBER} = 1"
+    )
+
+
 # --- Batch tile aggregation (partial-aggregate tile model) --------------------------------
 # A BATCH feature view materializes PARTIAL aggregates at the aggregation_interval (tiles), then
 # rolls them up to the requested window AT RETRIEVAL, anchored to the request/label time. This is
