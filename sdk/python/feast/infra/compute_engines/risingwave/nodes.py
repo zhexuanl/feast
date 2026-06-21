@@ -736,6 +736,60 @@ def build_offline_tile_pit_query(
     )
 
 
+def compose_multi_view_pit_query(
+    per_view_queries: List[str],
+    entity_columns: List[str],
+    per_view_feature_cols: List[List[str]],
+) -> str:
+    """Combine each feature view's per-view point-in-time read into ONE training frame by LEFT JOINing
+    them over the shared entity spine.
+
+    Each per-view query (``build_offline_tile_pit_query`` or ``build_passthrough_pit_query``) projects the
+    FULL entity-column set plus that view's feature columns, exactly one row per distinct entity-spine row —
+    the tile builder GROUPs BY the entity columns, the passthrough builder PARTITIONs BY them. So the entity
+    columns ARE the row identity: the first view anchors the spine (it LEFT JOINs from the entity rows, so it
+    retains every one of them) and each remaining view LEFT JOINs back on an equality over all entity
+    columns, contributing only its feature columns. A view with no as-of match for an entity row still yields
+    that row (NULL features), so no entity row is dropped. ``per_view_feature_cols`` is the OUTPUT column
+    name each per-view query emits for its features — already ``"{view}__{feature}"`` when the caller built
+    the views with full_feature_names, so the entity columns (never prefixed) are the only shared columns.
+
+    A single view returns its query verbatim, so the one-view read is unchanged by multi-view support."""
+    if len(per_view_queries) == 1:
+        return per_view_queries[0]
+
+    # Without full_feature_names each view emits bare feature names, so two views projecting the same output
+    # column would put a duplicate, ambiguous column in the joined frame. Refuse clearly instead of emitting
+    # it; the join only requires the feature names across views not to clash. (full_feature_names prefixes
+    # each name with its view, so this never trips there.)
+    owner_of: dict = {}
+    for view_index, feature_cols in enumerate(per_view_feature_cols):
+        for col in feature_cols:
+            if col in owner_of:
+                raise NotImplementedError(
+                    f"feature views at positions {owner_of[col]} and {view_index} both project a feature "
+                    f"column '{col}'; RisingWave offline retrieval cannot join feature views with colliding "
+                    "feature names in one call. Request full_feature_names, give the features distinct "
+                    "names, or retrieve the views separately."
+                )
+            owner_of[col] = view_index
+
+    aliases = [f"_feast_view_{i}" for i in range(len(per_view_queries))]
+    ctes = ", ".join(f'"{alias}" AS ({query})' for alias, query in zip(aliases, per_view_queries))
+    anchor = aliases[0]
+    select_cols = [f'"{anchor}"."{c}"' for c in entity_columns]
+    for alias, feature_cols in zip(aliases, per_view_feature_cols):
+        select_cols.extend(f'"{alias}"."{c}"' for c in feature_cols)
+    # Plain equi-join on the entity columns: Feast join keys and the label timestamp are non-NULL
+    # identifiers, so equality is the right row identity AND keeps the join hashable (a NULL-safe
+    # predicate would force a nested loop). A NULL value in an entity column would not match here.
+    joins = ""
+    for alias in aliases[1:]:
+        on = " AND ".join(f'"{anchor}"."{c}" = "{alias}"."{c}"' for c in entity_columns)
+        joins += f' LEFT JOIN "{alias}" ON {on}'
+    return f'WITH {ctes} SELECT {", ".join(select_cols)} FROM "{anchor}"{joins}'
+
+
 def _quote(identifier: str) -> str:
     return f'"{identifier}"'
 

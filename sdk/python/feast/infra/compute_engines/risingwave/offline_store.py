@@ -13,7 +13,7 @@ PIT query runs on a fresh connection. This store inlines the entity DataFrame as
 (``embed_query`` / CTE mode) — no upload, no async-visibility gap.
 """
 
-from typing import List, Literal, Optional, Union
+from typing import List, Literal, Optional, Tuple, Union
 
 import pandas as pd
 
@@ -35,6 +35,7 @@ from feast.infra.compute_engines.risingwave.names import (
 from feast.infra.compute_engines.risingwave.nodes import (
     build_offline_tile_pit_query,
     build_passthrough_pit_query,
+    compose_multi_view_pit_query,
 )
 from feast.infra.offline_stores import offline_utils
 from feast.infra.offline_stores.contrib.postgres_offline_store.postgres import (
@@ -42,6 +43,9 @@ from feast.infra.offline_stores.contrib.postgres_offline_store.postgres import (
     PostgreSQLOfflineStore,
     PostgreSQLOfflineStoreConfig,
     PostgreSQLRetrievalJob,
+)
+from feast.infra.offline_stores.contrib.postgres_offline_store.postgres_source import (
+    PostgreSQLSource,
 )
 from feast.infra.offline_stores.offline_store import RetrievalJob
 from feast.infra.registry.base_registry import BaseRegistry
@@ -111,27 +115,31 @@ class RisingWaveOfflineStore(PostgreSQLOfflineStore):
         full_feature_names: bool = False,
         **kwargs,
     ) -> RetrievalJob:
-        tile_fvs = [fv for fv in feature_views if is_tile_view(fv)]
-        if tile_fvs:
-            return _tile_historical_features(
-                config, feature_views, tile_fvs, feature_refs, entity_df,
-                registry, project, full_feature_names,
-            )
-        passthrough_fvs = [fv for fv in feature_views if is_passthrough_view(fv)]
-        if passthrough_fvs:
-            # A passthrough view's point-in-time read is an as-of cut over its RAW history (the batch
-            # source), not over the latest-row online MV — a Group-TopN that holds only the current row per
-            # entity, so it cannot answer a past label timestamp. Routed to a custom read; the Postgres
-            # parent would silently read the inert placeholder offline source or assert on an Iceberg source.
-            if len(feature_views) != 1:
+        # Tile and passthrough views need this engine's custom point-in-time reads — a floor-anchored tile
+        # rollup, or a latest-row as-of over raw history — because the Postgres parent would read the inert
+        # placeholder offline source or assert on an Iceberg source. Compose ALL of them (any mix of tile
+        # and passthrough, any count) into one frame over the shared entity spine. Every other view is a
+        # plain source the parent handles directly.
+        custom_fvs = [
+            fv for fv in feature_views if is_tile_view(fv) or is_passthrough_view(fv)
+        ]
+        if custom_fvs:
+            plain_fvs = [
+                fv
+                for fv in feature_views
+                if not (is_tile_view(fv) or is_passthrough_view(fv))
+            ]
+            if plain_fvs:
+                # The parent serves plain views via its own temp-table/CTE PIT join, which has no shared
+                # entity spine with the custom reads — composing the two in one frame is not yet supported.
                 raise NotImplementedError(
-                    "RisingWave passthrough offline retrieval currently supports exactly one feature view "
-                    f"per retrieval; got {len(feature_views)} ({len(passthrough_fvs)} passthrough). Mixing "
-                    "a passthrough view with other views in one get_historical_features call is not yet "
-                    "supported."
+                    "RisingWave offline retrieval cannot yet combine its tile/passthrough views with plain "
+                    f"parent-served views in one call; got {len(plain_fvs)} plain view(s) alongside "
+                    f"{len(custom_fvs)} RisingWave view(s). Request the plain views in a separate "
+                    "get_historical_features call."
                 )
-            return _passthrough_historical_features(
-                config, passthrough_fvs[0], feature_refs, entity_df, registry, project,
+            return _custom_historical_features(
+                config, feature_views, feature_refs, entity_df, registry, project,
                 full_feature_names,
             )
         # Inline a DataFrame entity_df as SQL so the parent uses its embed_query/CTE
@@ -158,8 +166,8 @@ def _requested_features(fv, feature_refs) -> List[str]:
     subset of a view's features must not pull every column. This mirrors the per-view selection
     ``_get_requested_feature_views_to_features_dict`` performs (match each reference's view against
     ``projection.name_to_use()``, collect its feature), reusing Feast's ``_parse_feature_ref`` so
-    versioned references parse identically. Single-view by construction (the caller routes exactly one
-    feature view here), so references for other views / on-demand views simply do not match.
+    versioned references parse identically. Called once per requested view, so references for other views
+    (in a multi-view retrieval) and for on-demand views simply do not match this view's name.
     """
     view_name = fv.projection.name_to_use()
     requested = set()
@@ -171,38 +179,66 @@ def _requested_features(fv, feature_refs) -> List[str]:
     return [f.name for f in fv.features if f.name in requested]
 
 
-def _tile_historical_features(
-    config, feature_views, tile_fvs, feature_refs, entity_df,
-    registry, project, full_feature_names,
+def _custom_historical_features(
+    config, feature_views, feature_refs, entity_df, registry, project, full_feature_names,
 ) -> RetrievalJob:
-    # Floor-anchored range-agg PIT for tile feature views (build_offline_tile_pit_query). The
-    # standard latest-row template anchors at the latest tile WITH DATA, not floor(label) — wrong
-    # when recent intervals are empty. One tile FV per query for now; mixing tile
-    # with stream/other FVs in one retrieval is not yet supported.
-    if len(feature_views) != 1:
-        raise NotImplementedError(
-            "RisingWave offline tile rollup currently supports exactly one tile feature view per "
-            f"retrieval; got {len(feature_views)} views ({len(tile_fvs)} tile). Mixing tile feature "
-            "views with stream/other views in one get_historical_features call is not yet supported."
-        )
+    """Point-in-time training for any combination of RisingWave tile and passthrough views in one call.
+
+    Each requested view contributes a per-view point-in-time read over ONE shared, inlined entity spine —
+    a tile rollup anchored at floor(label), or a latest-row as-of over raw history. The reads are LEFT
+    JOINed back to the spine on the entity-row identity (the entity columns) into a single frame, the same
+    shape the Postgres parent returns for plain views. With a single requested view the composed query IS
+    that view's per-view read, byte-for-byte unchanged."""
     if entity_df is None:
         raise NotImplementedError(
-            "RisingWave offline tile rollup requires an entity dataframe (the per-label PIT anchor); "
-            "entity-less retrieval is not supported."
+            "RisingWave offline retrieval requires an entity dataframe (the per-label point-in-time "
+            "anchor); entity-less retrieval is not supported."
         )
-    fv = tile_fvs[0]
-    if isinstance(entity_df, pd.DataFrame):
-        entity_columns = list(entity_df.columns)
-        label_ts_column = offline_utils.infer_event_timestamp_from_entity_df(
-            dict(entity_df.dtypes)
-        )
-        entity_df_sql = _entity_df_to_sql(entity_df)
-    else:
+    if not isinstance(entity_df, pd.DataFrame):
         raise NotImplementedError(
-            "RisingWave offline tile rollup currently requires a DataFrame entity_df (it is inlined "
-            "as SQL); a SQL-string entity_df is not yet supported."
+            "RisingWave offline retrieval currently requires a DataFrame entity_df (it is inlined as SQL); "
+            "a SQL-string entity_df is not yet supported."
         )
+    entity_columns = list(entity_df.columns)
+    label_ts_column = offline_utils.infer_event_timestamp_from_entity_df(dict(entity_df.dtypes))
+    entity_df_sql = _entity_df_to_sql(entity_df)
 
+    per_view_queries: List[str] = []
+    per_view_feature_cols: List[List[str]] = []
+    for fv in feature_views:
+        if is_tile_view(fv):
+            query, feature_cols = _tile_pit_query(
+                fv, feature_refs, entity_df_sql, entity_columns, label_ts_column,
+                project, full_feature_names,
+            )
+        else:
+            query, feature_cols = _passthrough_pit_query(
+                fv, feature_refs, entity_df_sql, entity_columns, label_ts_column,
+                project, full_feature_names,
+            )
+        per_view_queries.append(query)
+        per_view_feature_cols.append(feature_cols)
+
+    query = compose_multi_view_pit_query(
+        per_view_queries, entity_columns, per_view_feature_cols
+    )
+    return PostgreSQLRetrievalJob(
+        query=query,
+        config=config,
+        full_feature_names=full_feature_names,
+        on_demand_feature_views=OnDemandFeatureView.get_requested_odfvs(
+            feature_refs, project, registry
+        ),
+    )
+
+
+def _tile_pit_query(
+    fv, feature_refs, entity_df_sql, entity_columns, label_ts_column, project, full_feature_names,
+) -> Tuple[str, List[str]]:
+    # Floor-anchored range-agg PIT for a tile feature view (build_offline_tile_pit_query). The standard
+    # latest-row template anchors at the latest tile WITH DATA, not floor(label) — wrong when recent
+    # intervals are empty.
+    #
     # view_aggregations reads the SAME spec the engine provisioned the tiles with — a batch tile view's
     # IcebergSource custom_options, or a streaming tile view's native StreamFeatureView.aggregations —
     # so the resolved column names cannot drift. The PIT below reads the tiles MV by name, identically
@@ -214,9 +250,11 @@ def _tile_historical_features(
     aggregations = [
         a for a in aggregations if a.resolved_name(a.time_window) in requested
     ]
+    resolved = [a.resolved_name(a.time_window) for a in aggregations]
+    view_name = fv.projection.name_to_use()
     column_info = ColumnInfo(
         join_keys=[f.name for f in fv.entity_columns],
-        feature_cols=[a.resolved_name(a.time_window) for a in aggregations],
+        feature_cols=resolved,
         ts_col=label_ts_column,
         created_ts_col=None,
         field_mapping=None,
@@ -230,60 +268,60 @@ def _tile_historical_features(
         aggregations=aggregations,
         aggregation_interval=tile_interval(fv),
         full_feature_names=full_feature_names,
-        view_name=fv.projection.name_to_use(),
+        view_name=view_name,
     )
-    return PostgreSQLRetrievalJob(
-        query=query,
-        config=config,
-        full_feature_names=full_feature_names,
-        on_demand_feature_views=OnDemandFeatureView.get_requested_odfvs(
-            feature_refs, project, registry
-        ),
-    )
+    # The output column for each aggregation is its per-window resolved_name, prefixed with the view name
+    # under full_feature_names (the alias build_offline_tile_pit_query emits) — the names the composed join
+    # projects for this view.
+    feature_cols = [
+        f"{view_name}__{r}" if full_feature_names else r for r in resolved
+    ]
+    return query, feature_cols
 
 
-def _passthrough_historical_features(
-    config, fv, feature_refs, entity_df, registry, project, full_feature_names,
-) -> RetrievalJob:
+def _passthrough_pit_query(
+    fv, feature_refs, entity_df_sql, entity_columns, label_ts_column, project, full_feature_names,
+) -> Tuple[str, List[str]]:
     # Point-in-time training for a passthrough view: for each entity row, the latest RAW feature row
     # at-or-before its label timestamp (within ttl) — the as-of cut that makes offline == the latest-row
     # online MV. Reads the raw history relation, not the latest-row MV (a Group-TopN holding only the
     # current row). A batch passthrough's own Iceberg source IS the history; a streaming passthrough reads
-    # the Iceberg source provisioned over its stream batch_source (the historical log backing the stream).
-    if entity_df is None:
-        raise NotImplementedError(
-            "RisingWave passthrough offline retrieval requires an entity dataframe (the per-label PIT "
-            "anchor); entity-less retrieval is not supported."
-        )
-    if not isinstance(entity_df, pd.DataFrame):
-        raise NotImplementedError(
-            "RisingWave passthrough offline retrieval currently requires a DataFrame entity_df (it is "
-            "inlined as SQL); a SQL-string entity_df is not yet supported."
-        )
-    entity_columns = list(entity_df.columns)
-    label_ts_column = offline_utils.infer_event_timestamp_from_entity_df(dict(entity_df.dtypes))
-    entity_df_sql = _entity_df_to_sql(entity_df)
-
+    # its stream's batch_source — an Iceberg source the engine provisioned over it, or a PostgreSQL source
+    # read directly over pgwire.
     if is_passthrough_stream(fv):
         history = getattr(fv.stream_source, "batch_source", None)
-        if not isinstance(history, IcebergSource):
+        if isinstance(history, IcebergSource):
+            # The Iceberg source the engine provisioned over the stream's batch_source.
+            history_relation = passthrough_history_source_name(project, fv.name)
+            ts_col = history.timestamp_field
+        elif isinstance(history, PostgreSQLSource):
+            # RisingWave reads a Postgres relation directly over pgwire (this store subclasses the
+            # Postgres offline store), so the as-of read queries the PostgreSQLSource's table/query in
+            # place — nothing is provisioned for it. get_table_query_string() parenthesizes a query-based
+            # source, which build_passthrough_pit_query aliases as the history relation.
+            history_relation = history.get_table_query_string()
+            ts_col = history.timestamp_field
+        else:
             raise NotImplementedError(
-                f"passthrough stream view '{fv.name}' has no Iceberg batch source (the historical log "
-                "backing the stream), so offline point-in-time training is not available; declare a "
-                "batch_source on the stream's KafkaSource, or serve the view online only."
+                f"passthrough stream view '{fv.name}' has no readable batch source backing the stream "
+                "(an Iceberg or PostgreSQL source), so offline point-in-time training is not available; "
+                "declare an Iceberg or PostgreSQL batch_source on the stream's KafkaSource, or serve the "
+                "view online only."
             )
-        history_relation = passthrough_history_source_name(project, fv.name)
-        ts_col = history.timestamp_field
     else:
         history_relation = source_name(project, fv.name)
         ts_col = fv.batch_source.timestamp_field
 
-    # created_ts is intentionally omitted: the online latest-row MV and this read both order by event time
-    # alone (the Iceberg history carries no created_timestamp_column), so online == offline on ties.
+    # Honor feature_refs: project only the requested features, not every feature of the view.
+    requested = _requested_features(fv, feature_refs)
+    view_name = fv.projection.name_to_use()
+    # created_ts is intentionally omitted: the online latest-row MV orders by event time alone, so this
+    # read must too (online == offline on ties). A streaming passthrough's Iceberg history carries no
+    # created_timestamp_column; a PostgreSQL batch_source's created_timestamp_column is deliberately
+    # ignored here, since using it would order this read differently from the online Group-TopN MV.
     column_info = ColumnInfo(
         join_keys=[f.name for f in fv.entity_columns],
-        # Honor feature_refs: project only the requested features, not every feature of the view.
-        feature_cols=_requested_features(fv, feature_refs),
+        feature_cols=requested,
         ts_col=ts_col,
         created_ts_col=None,
         field_mapping=None,
@@ -297,13 +335,12 @@ def _passthrough_historical_features(
         column_info=column_info,
         ttl_seconds=int(ttl.total_seconds()) if ttl else None,
         full_feature_names=full_feature_names,
-        view_name=fv.projection.name_to_use(),
+        view_name=view_name,
     )
-    return PostgreSQLRetrievalJob(
-        query=query,
-        config=config,
-        full_feature_names=full_feature_names,
-        on_demand_feature_views=OnDemandFeatureView.get_requested_odfvs(
-            feature_refs, project, registry
-        ),
-    )
+    # Each requested feature projects under its own name, prefixed with the view name under
+    # full_feature_names (the alias build_passthrough_pit_query emits) — the names the composed join
+    # projects for this view. A feature colliding with an entity column would have raised in the builder.
+    feature_cols = [
+        f"{view_name}__{f}" if full_feature_names else f for f in requested
+    ]
+    return query, feature_cols

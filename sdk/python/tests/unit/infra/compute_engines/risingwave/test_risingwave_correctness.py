@@ -2236,3 +2236,138 @@ def test_offline_tile_pit_builder_full_feature_names_prefixes_only_feature_colum
     assert 'AS "user_txn_daily__sum_amount_259200s"' in sql  # feature prefixed
     assert 'e."user_id"' in sql and "user_txn_daily__user_id" not in sql  # entity key bare
     assert 'e."event_timestamp"' in sql  # label ts bare
+
+
+# --- multi-view composition: LEFT JOIN each view's per-view PIT over one shared entity spine ---
+# A FeatureService mixing tile + passthrough views (or several of either) trains in ONE
+# get_historical_features call: each view's per-view point-in-time read becomes a CTE over the shared
+# entity spine, and the CTEs are LEFT JOINed back on the entity columns (the row identity) into one frame.
+
+
+def _captured_multi_view_query(views, feature_refs, full_feature_names):
+    from unittest.mock import patch
+
+    entity_df = pd.DataFrame(
+        {"user_id": ["u1"], "event_timestamp": [pd.Timestamp("2026-06-04")]}
+    )
+    target = (
+        "feast.infra.compute_engines.risingwave.offline_store.PostgreSQLRetrievalJob"
+    )
+    with patch(target) as job:
+        RisingWaveOfflineStore.get_historical_features(
+            config=MagicMock(),
+            feature_views=views,
+            feature_refs=feature_refs,
+            entity_df=entity_df,
+            registry=_odfv_registry(),
+            project="proj",
+            full_feature_names=full_feature_names,
+        )
+    return job.call_args.kwargs["query"]
+
+
+def test_multi_view_left_joins_tile_and_passthrough_over_one_spine():
+    tile = _with_projection(_batch_view([_agg("sum", 259200)]))  # user_txn_daily
+    passthrough = _with_projection(_passthrough_batch_view(("country",)))  # user_attr_daily
+    sql = _captured_multi_view_query(
+        [tile, passthrough],
+        ["user_txn_daily:sum_amount_259200s", "user_attr_daily:country"],
+        full_feature_names=False,
+    )
+    # one composed query: a CTE per view, LEFT JOINed over the shared entity spine
+    assert sql.startswith("WITH ")
+    assert '"_feast_view_0" AS (' in sql and '"_feast_view_1" AS (' in sql
+    assert ' LEFT JOIN "_feast_view_1" ON ' in sql
+    # the row identity is the entity columns (joined across views), NOT the features
+    assert '"_feast_view_0"."user_id" = "_feast_view_1"."user_id"' in sql
+    assert '"_feast_view_0"."event_timestamp" = "_feast_view_1"."event_timestamp"' in sql
+    # each view's per-view PIT is present as a CTE...
+    assert "date_trunc('day'" in sql  # tile rollup CTE
+    assert "ROW_NUMBER() OVER (PARTITION BY" in sql  # passthrough as-of CTE
+    assert "LEFT JOIN proj_user_attr_daily_src h" in sql  # passthrough reads its batch source
+    # ...and each view's feature column is projected into the single output frame
+    assert '"_feast_view_0"."sum_amount_259200s"' in sql
+    assert '"_feast_view_1"."country"' in sql
+
+
+def test_multi_view_full_feature_names_projects_prefixed_feature_columns():
+    # full_feature_names prefixes each feature output as "{view}__{feature}" — distinct per view, so two
+    # views' features cannot collide; the composed frame projects those prefixed names.
+    tile = _with_projection(_batch_view([_agg("sum", 259200)]))
+    passthrough = _with_projection(_passthrough_batch_view(("country",)))
+    sql = _captured_multi_view_query(
+        [tile, passthrough],
+        ["user_txn_daily:sum_amount_259200s", "user_attr_daily:country"],
+        full_feature_names=True,
+    )
+    assert 'AS "user_txn_daily__sum_amount_259200s"' in sql  # tile CTE prefixes its feature
+    assert '"country" AS "user_attr_daily__country"' in sql  # passthrough CTE prefixes its feature
+    assert '"_feast_view_0"."user_txn_daily__sum_amount_259200s"' in sql  # projected from the frame
+    assert '"_feast_view_1"."user_attr_daily__country"' in sql
+    # entity columns are joined bare (never prefixed), so the spine identity is unambiguous
+    assert '"_feast_view_0"."user_id" = "_feast_view_1"."user_id"' in sql
+
+
+def test_single_view_query_is_unchanged_by_multi_view_support():
+    # A single requested view must NOT be wrapped in the multi-view CTE join — the bare per-view PIT is
+    # returned byte-for-byte, so multi-view support is a no-op on the one-view path.
+    from feast.infra.compute_engines.risingwave.names import tiles_name
+
+    tile = _with_projection(_batch_view([_agg("sum", 259200)]))
+    sql = _captured_multi_view_query(
+        [tile], ["user_txn_daily:sum_amount_259200s"], full_feature_names=False
+    )
+    assert "_feast_view_" not in sql  # no multi-view CTE wrapper
+    assert sql.startswith("SELECT ")
+    expected = build_offline_tile_pit_query(
+        _entity_df_to_sql(
+            pd.DataFrame(
+                {"user_id": ["u1"], "event_timestamp": [pd.Timestamp("2026-06-04")]}
+            )
+        ),
+        ["user_id", "event_timestamp"],
+        "event_timestamp",
+        tiles_relation=tiles_name("proj", "user_txn_daily"),
+        column_info=ColumnInfo(
+            join_keys=["user_id"],
+            feature_cols=["sum_amount_259200s"],
+            ts_col="event_timestamp",
+            created_ts_col=None,
+            field_mapping=None,
+        ),
+        aggregations=list(tile.batch_source.aggregations),
+        aggregation_interval=timedelta(days=1),
+        full_feature_names=False,
+        view_name="user_txn_daily",
+    )
+    assert sql == expected  # byte-identical to the standalone single-view builder output
+
+
+def test_multi_view_without_full_feature_names_rejects_colliding_feature_names():
+    # Two views projecting the same bare feature name would put a duplicate column in the joined frame;
+    # reject clearly. (full_feature_names disambiguates by prefixing — see the test above.)
+    a = _with_projection(_passthrough_batch_view(("amount",), name="attr_a"))
+    b = _with_projection(_passthrough_batch_view(("amount",), name="attr_b"))
+    with pytest.raises(NotImplementedError, match="colliding feature names"):
+        _captured_multi_view_query(
+            [a, b], ["attr_a:amount", "attr_b:amount"], full_feature_names=False
+        )
+
+
+def test_get_historical_features_rejects_custom_plus_plain_view_mix():
+    # A plain (parent-served) view has no shared entity spine with the custom reads, so mixing it with a
+    # tile/passthrough view in one call is rejected rather than silently dropping it.
+    tile = _with_projection(_batch_view([_agg("sum", 259200)]))
+    plain = SimpleNamespace(name="plain_view")  # neither tile nor passthrough
+    entity_df = pd.DataFrame(
+        {"user_id": ["u1"], "event_timestamp": [pd.Timestamp("2026-06-04")]}
+    )
+    with pytest.raises(NotImplementedError, match="plain parent-served views"):
+        RisingWaveOfflineStore.get_historical_features(
+            config=MagicMock(),
+            feature_views=[tile, plain],
+            feature_refs=["user_txn_daily:sum_amount_259200s"],
+            entity_df=entity_df,
+            registry=_odfv_registry(),
+            project="proj",
+        )
