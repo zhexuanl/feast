@@ -377,17 +377,33 @@ def _validate_windows(aggregations: List[Aggregation], aggregation_interval) -> 
     NOT require a single window."""
     _assert_tile_supported(aggregations)
     _assert_distinct_output_names(aggregations)
-    windows = set()
+    # group_aggregations_by_window owns the non-null-window check + the distinct-ascending window set
+    # (one source of truth shared with the engine/apply provisioning path); here we only layer on the
+    # multiple-of-interval precondition the rollup needs.
+    windows = [secs for secs, _ in group_aggregations_by_window(aggregations)]
+    for secs in windows:
+        _assert_window_multiple_of_interval(secs, aggregation_interval)
+    return windows
+
+
+def group_aggregations_by_window(
+    aggregations: List[Aggregation],
+) -> List[Tuple[int, List[Aggregation]]]:
+    """Group aggregations by their (distinct, non-null) window seconds, ascending. Each group becomes
+    ONE online rollup MV (the engine provisions one now()-anchored MV per window — RisingWave can't put
+    now() inside a CASE, so windows can't share an MV) AND one OnlineView serving shard (apply). The
+    engine and apply MUST group identically so the per-window MV names match — hence this single shared
+    helper. Pure (no interval): callers that need the multiple-of-interval precondition run
+    ``_validate_windows`` first."""
+    groups: dict = {}
     for a in aggregations:
         if a.time_window is None:
             raise ValueError(
                 "tile rollup needs a non-null time_window on every aggregation; "
                 f"got None on {a.function}({a.column})."
             )
-        secs = int(a.time_window.total_seconds())
-        _assert_window_multiple_of_interval(secs, aggregation_interval)
-        windows.add(secs)
-    return sorted(windows)
+        groups.setdefault(int(a.time_window.total_seconds()), []).append(a)
+    return [(secs, groups[secs]) for secs in sorted(groups)]
 
 
 def _tile_rollup_exprs(aggregations: List[Aggregation], prefix: str = "") -> str:

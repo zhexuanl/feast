@@ -22,6 +22,7 @@ from feast.data_source import KafkaSource, PushSource
 from feast.infra.compute_engines.risingwave.engine import (
     RisingWaveComputeEngine,
     _batch_drop_ddl,
+    _existing_online_window_secs,
     _iceberg_sink_ddl,
     _iceberg_source_ddl,
     _iceberg_storage_opts,
@@ -40,6 +41,7 @@ from feast.infra.compute_engines.risingwave.nodes import (
     build_online_rollup_select,
     build_tile_rollup_select,
     build_windowed_agg_select,
+    group_aggregations_by_window,
 )
 from feast.infra.compute_engines.dag.context import ColumnInfo, ExecutionContext
 from feast.infra.compute_engines.dag.model import DAGFormat
@@ -557,6 +559,19 @@ def test_offline_tile_pit_multi_window_mean_uses_filtered_sum_and_count():
     assert "INTERVAL '2592000' SECOND AND t.tile_end <=" in sql  # join bounded by the 30d max window
 
 
+def test_group_aggregations_by_window_groups_distinct_windows_ascending():
+    # the engine provisions one online MV per group and apply derives one serving shard per group, so
+    # the grouping is the single source of truth for the window set. Distinct windows, ascending.
+    a3d = _agg("sum", 259200)
+    a30d = _agg("sum", 2592000)
+    mean7d = _agg("mean", 604800)
+    groups = group_aggregations_by_window([a30d, a3d, mean7d, a3d])
+    assert [secs for secs, _ in groups] == [259200, 604800, 2592000]  # ascending, distinct
+    by_secs = {secs: aggs for secs, aggs in groups}
+    assert by_secs[259200] == [a3d, a3d]  # both 3d aggs land in one group
+    assert by_secs[604800] == [mean7d]
+
+
 def test_offline_tile_pit_multi_window_still_requires_window_multiple_of_interval():
     # distinct windows are allowed, but EACH must be a whole number of tiles
     with pytest.raises(ValueError, match="multiple"):
@@ -692,15 +707,32 @@ def test_provision_batch_emits_source_tiles_mv_and_online_rollup_mv():
     assert "tile_end" in tiles_sql
     assert "sum(amount) AS sum_amount" in tiles_sql  # window-independent partial (not per-window)
 
-    # online rollup MV: the point-looked-up _online name, plain now() window over the tiles MV
+    # online rollup MV: the point-looked-up per-window name, plain now() window over the tiles MV
     assert rollup_sql.startswith("CREATE MATERIALIZED VIEW")
-    assert '"proj_user_txn_daily_online"' in rollup_sql
+    assert '"proj_user_txn_daily_online_259200s"' in rollup_sql  # per-window MV name (window in suffix)
     assert "FROM proj_user_txn_daily_tiles" in rollup_sql  # reads FROM the tiles MV
     assert "now() - INTERVAL '259200' SECOND" in rollup_sql
     assert "tile_end <= now()" in rollup_sql
     assert "date_trunc" not in rollup_sql  # RW rejects two-sided date_trunc(now()) in an MV
     assert "max(tile_end) AS window_end" in rollup_sql  # PIT stamp for the point-lookup
     assert f"sum(sum_amount) AS {feat}" in rollup_sql  # rolls the window-independent partial up
+
+
+def test_provision_batch_emits_one_online_mv_per_window():
+    # multi-window: ONE tiles MV (shared, deduped partials) + one now()-anchored online MV PER window.
+    aggs = [_agg("sum", 259200), _agg("sum", 2592000), _agg("mean", 604800)]
+    view = _batch_view(aggs)
+    ddl = _engine()._provision_batch_ddl("proj", view)
+    assert len(ddl) == 1 + 1 + 3  # source + tiles + 3 per-window online MVs (3d, 7d, 30d)
+    joined = "\n".join(ddl)
+    # exactly ONE tiles MV (window-independent partials shared across all windows)
+    assert joined.count('"proj_user_txn_daily_tiles"') == 1
+    # one online MV per DISTINCT window, named with the window suffix
+    for w in (259200, 604800, 2592000):
+        assert f'"proj_user_txn_daily_online_{w}s"' in joined
+    # the 30d sum MV rolls only the 30d sum; the 7d mean MV rolls sum/count for mean@7d
+    assert "sum(sum_amount) AS sum_amount_2592000s" in joined
+    assert "sum(sum_amount) / NULLIF(sum(count_amount), 0) AS mean_amount_604800s" in joined
 
 
 def test_iceberg_source_ddl_escapes_single_quotes_in_table_name():
@@ -742,13 +774,89 @@ def test_provision_batch_rejects_non_additive_aggregation(function):
 
 
 def test_batch_drop_ddl_drops_both_mvs_and_source_with_no_sink():
-    view = _batch_view([_agg("sum")])
+    view = _batch_view([_agg("sum", 259200)])
     stmts = _batch_drop_ddl("proj", view)
-    # drop order: online rollup MV, then the tiles MV it reads, then the source
-    assert stmts[0] == 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_online"'
+    # drop order: per-window online rollup MV(s), then the tiles MV they read, then the source
+    assert stmts[0] == 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_online_259200s"'
     assert stmts[1] == 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_tiles"'
     assert stmts[2].startswith("DROP SOURCE")
     assert not any("SINK" in s for s in stmts)  # none provisioned, none to drop
+
+
+def test_existing_online_window_secs_parses_only_this_views_per_window_mvs():
+    # Catalog-driven reconcile: identify this tile view's per-window online MVs (to drop orphans when a
+    # re-apply shrinks the window set) WITHOUT matching the tiles MV, another view, or a non-numeric tail.
+    class _Cur:
+        def execute(self, _sql):
+            self._rows = [
+                ("proj_v_online_259200s",),   # match
+                ("proj_v_online_2592000s",),  # match
+                ("proj_v_tiles",),            # not an online MV
+                ("proj_v_online_xs",),        # non-numeric window -> ignore
+                ("proj_other_online_5s",),    # different view -> ignore
+            ]
+
+        def fetchall(self):
+            return self._rows
+
+    assert _existing_online_window_secs(_Cur(), "proj", "v") == {259200, 2592000}
+
+
+def test_update_drops_orphaned_per_window_mv_on_window_shrink(monkeypatch):
+    # A re-apply that drops the 7d window must DROP that window's online MV (Feast routes a same-name
+    # edit to views_to_keep, and CREATE...IF NOT EXISTS never removes it). Capture the executed DDL.
+    eng = _engine()
+    view = _batch_view([_agg("sum", 259200), _agg("sum", 2592000)])  # desired: 3d + 30d
+    executed = []
+
+    class _Cur:
+        def execute(self, sql):
+            executed.append(sql)
+            if sql.startswith("SELECT matviewname"):
+                self._rows = [
+                    ("proj_user_txn_daily_online_259200s",),
+                    ("proj_user_txn_daily_online_604800s",),   # the orphaned 7d MV from a prior apply
+                    ("proj_user_txn_daily_online_2592000s",),
+                ]
+
+        def fetchall(self):
+            return self._rows
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    monkeypatch.setattr(
+        "feast.infra.compute_engines.risingwave.engine._connect", lambda config: _Conn()
+    )
+    eng.update("proj", [], [view], [], [])
+    drops = [s for s in executed if s.startswith("DROP MATERIALIZED VIEW") and "604800s" in s]
+    assert drops == ['DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_online_604800s"']
+    # the surviving windows are NOT dropped (only re-created via IF NOT EXISTS)
+    assert not any('online_259200s"' in s and s.startswith("DROP") for s in executed)
+
+
+def test_batch_drop_ddl_drops_every_per_window_mv():
+    # a multi-window FV provisions N online MVs -> teardown must drop ALL N (else orphaned MVs leak)
+    view = _batch_view([_agg("sum", 259200), _agg("sum", 2592000)])
+    stmts = _batch_drop_ddl("proj", view)
+    assert 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_online_259200s"' in stmts
+    assert 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_online_2592000s"' in stmts
+    assert 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_tiles"' in stmts
+    # the tiles MV is dropped AFTER the online MVs that read it (dependency order)
+    assert stmts.index('DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_tiles"') == 2
 
 
 # (Removed: engine.get_historical_features tests — retrieval is the offline store's

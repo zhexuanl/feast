@@ -37,8 +37,10 @@ from feast.infra.compute_engines.risingwave.job import (
     RisingWaveMaterializationJob,
 )
 from feast.infra.compute_engines.risingwave.names import (
+    base_name,
     offline_sink_name,
     online_mv_name,
+    online_window_mv_name,
     source_name,
     tiles_name,
 )
@@ -51,6 +53,7 @@ from feast.infra.compute_engines.risingwave.nodes import (
     build_batch_tile_select,
     build_online_rollup_select,
     build_windowed_agg_select,
+    group_aggregations_by_window,
 )
 from feast.infra.compute_engines.dag.context import ColumnInfo
 from feast.infra.offline_stores.offline_store import OfflineStore
@@ -275,13 +278,34 @@ def _drop_ddl(project: str, view) -> List[str]:
 
 
 def _batch_drop_ddl(project: str, view) -> List[str]:
-    # Mirror of _drop_ddl for a tile BatchFeatureView: drop the online rollup MV, then the tiles
-    # MV it reads, then the source. No Iceberg sink is provisioned (the MVs are read directly).
-    return [
-        f'DROP MATERIALIZED VIEW IF EXISTS "{online_mv_name(project, view.name)}"',
-        f'DROP MATERIALIZED VIEW IF EXISTS "{tiles_name(project, view.name)}"',
-        f'DROP SOURCE IF EXISTS "{source_name(project, view.name)}"',
+    # Mirror of _drop_ddl for a tile BatchFeatureView: drop the per-window online rollup MVs, then the
+    # tiles MV they read, then the source. No Iceberg sink is provisioned (the MVs are read directly).
+    # The window set comes from the SAME group_aggregations_by_window split the engine provisioned with.
+    ddl = [
+        f'DROP MATERIALIZED VIEW IF EXISTS "{online_window_mv_name(project, view.name, window_secs)}"'
+        for window_secs, _ in group_aggregations_by_window(view_aggregations(view))
     ]
+    ddl.append(f'DROP MATERIALIZED VIEW IF EXISTS "{tiles_name(project, view.name)}"')
+    ddl.append(f'DROP SOURCE IF EXISTS "{source_name(project, view.name)}"')
+    return ddl
+
+
+def _existing_online_window_secs(cur, project: str, view_name: str) -> set:
+    """The window-seconds of the per-window online MVs that physically EXIST for a tile view, read
+    from RisingWave's pg-compatible catalog. update() diffs this against the DESIRED window set to drop
+    MVs orphaned when a view's window set shrinks/changes on re-apply: Feast routes a same-name edited
+    view to ``views_to_keep`` (not ``views_to_delete``) and ``CREATE ... IF NOT EXISTS`` never removes a
+    no-longer-provisioned window's MV, so its now()-anchored MV would otherwise run forever, unreachable
+    by any future provision/teardown (which only name the current window set)."""
+    prefix = f"{base_name(project, view_name)}_online_"
+    cur.execute("SELECT matviewname FROM pg_matviews")
+    found = set()
+    for (name,) in cur.fetchall():
+        if name.startswith(prefix) and name.endswith("s"):
+            secs = name[len(prefix) : -1]
+            if secs.isdigit():
+                found.add(int(secs))
+    return found
 
 
 class RisingWaveComputeEngine(ComputeEngine):
@@ -334,6 +358,14 @@ class RisingWaveComputeEngine(ComputeEngine):
                     for stmt in self._provision_ddl(project, view):
                         cur.execute(stmt)
                 elif is_tile_fv(view):
+                    # Reconcile the window set: drop per-window online MVs for windows this re-apply no
+                    # longer provisions (a same-name edit lands here, not in views_to_delete), then
+                    # (re)create the current set. Without this, a removed window's MV is orphaned.
+                    desired = {w for w, _ in group_aggregations_by_window(view_aggregations(view))}
+                    for secs in _existing_online_window_secs(cur, project, view.name) - desired:
+                        cur.execute(
+                            f'DROP MATERIALIZED VIEW IF EXISTS "{online_window_mv_name(project, view.name, secs)}"'
+                        )
                     for stmt in self._provision_batch_ddl(project, view):
                         cur.execute(stmt)
 
@@ -394,31 +426,35 @@ class RisingWaveComputeEngine(ComputeEngine):
         ]
 
     def _provision_batch_ddl(self, project: str, view) -> List[str]:
-        """Registry-free DDL for one tile-aggregating BatchFeatureView: an Iceberg source, a
-        continuous TILES MV (``build_batch_tile_select`` — per-(entity, tile_end) partials), and an
-        ONLINE ROLLUP MV over those tiles (``build_online_rollup_select`` — the request-anchored
-        ``now()`` window rollup, one row per entity). RisingWave maintains both MVs incrementally as
+        """Registry-free DDL for one tile-aggregating BatchFeatureView: an Iceberg source, a continuous
+        TILES MV (``build_batch_tile_select`` — per-(entity, tile_end) partials over window-independent
+        partials), and ONE ONLINE ROLLUP MV PER DISTINCT WINDOW (``build_online_rollup_select`` — the
+        request-anchored ``now()`` window rollup, one row per entity). One tile set is reused across all
+        windows (established feature stores); each window gets its own now()-anchored MV because RisingWave rejects now()
+        inside a CASE in a two-sided temporal-filter MV. RisingWave maintains every MV incrementally as
         the Iceberg table grows (verified live), so there is no scheduler. The point-lookup reads the
-        ROLLUP MV (``online_mv_name``) unchanged — the tiles MV is internal plumbing. NO Iceberg sink
-        yet (the MVs are read directly; durable tile history is a later increment). Offline training
-        rolls the SAME tiles up with ``build_tile_rollup_select`` anchored to each label timestamp."""
+        per-window MV (``online_window_mv_name``) holding the requested feature's window — the tiles MV
+        is internal plumbing. NO Iceberg sink yet (the MVs are read directly; durable tile history is a
+        later increment). Offline training rolls the SAME tiles up per label timestamp."""
         interval = tile_interval(view)
         column_info = _batch_column_info(view)
         aggs = view_aggregations(view)
         src = source_name(project, view.name)
         tiles = tiles_name(project, view.name)
-        mv = online_mv_name(project, view.name)
-        tile_select = build_batch_tile_select(
-            column_info, aggs, src, aggregation_interval=interval
-        )
-        rollup_select = build_online_rollup_select(
-            column_info, aggs, tiles, aggregation_interval=interval
-        )
-        return [
+        ddl = [
             _iceberg_source_ddl(src, view.batch_source.table, self.config),
-            _materialized_view_ddl(tiles, tile_select),
-            _materialized_view_ddl(mv, rollup_select),
+            _materialized_view_ddl(
+                tiles,
+                build_batch_tile_select(column_info, aggs, src, aggregation_interval=interval),
+            ),
         ]
+        for window_secs, window_aggs in group_aggregations_by_window(aggs):
+            rollup_select = build_online_rollup_select(
+                column_info, window_aggs, tiles, aggregation_interval=interval
+            )
+            mv = online_window_mv_name(project, view.name, window_secs)
+            ddl.append(_materialized_view_ddl(mv, rollup_select))
+        return ddl
 
     def _materialize_one(
         self, registry: BaseRegistry, task: MaterializationTask, **kwargs
