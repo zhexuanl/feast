@@ -338,13 +338,23 @@ def _deployed_source_table(cur, name: str) -> Optional[str]:
     does not exist. A tile view's tiles MV reads its source by the (stable) source NAME, so the
     underlying Iceberg table only appears in the ``CREATE SOURCE ... table.name='...'`` definition —
     this is the only way to detect that a kept view was repointed at a different table (which the MV
-    definitions cannot reveal). Single quotes in the table are doubled in the DDL; we un-double them."""
+    definitions cannot reveal). Single quotes in the table are doubled in the DDL; we un-double them.
+
+    Note: unlike a materialized view (whose SELECT RisingWave stores VERBATIM), a source's WITH clause is
+    RE-RENDERED in the catalog (spaces around ``=``, expanded types) — verified live — so we EXTRACT the
+    ``table.name`` option with a spacing-tolerant regex rather than comparing the whole definition."""
     cur.execute("SELECT definition FROM rw_catalog.rw_sources WHERE name = %s", (name,))
     row = cur.fetchone()
     if not row:
         return None
     m = re.search(r"(?:^|[\s,(])table\.name\s*=\s*'((?:[^']|'')*)'", row[0])
     return m.group(1).replace("''", "'") if m else None
+
+
+def _norm_sql(sql):
+    """Whitespace-normalize a SELECT for definition comparison (RW stores our SELECT verbatim modulo
+    whitespace). None stays None so a missing deployed object never compares equal to a desired one."""
+    return None if sql is None else " ".join(sql.split())
 
 
 def _plan_batch_reconcile(
@@ -362,9 +372,7 @@ def _plan_batch_reconcile(
     serving) untouched. A materialization-affecting change re-materializes; an unchanged view is a
     no-op (no rebuild, no serving blip)."""
 
-    def norm(sql):
-        return None if sql is None else " ".join(sql.split())
-
+    norm = _norm_sql
     if norm(deployed_tiles) != norm(desired_tiles):
         return True, list(deployed_online), []
     drops = [
@@ -427,8 +435,7 @@ class RisingWaveComputeEngine(ComputeEngine):
                         cur.execute(stmt)
             for view in views_to_keep:
                 if isinstance(view, StreamFeatureView):
-                    for stmt in self._provision_ddl(project, view):
-                        cur.execute(stmt)
+                    self._reconcile_stream_view(cur, project, view)
                 elif is_tile_fv(view):
                     self._reconcile_batch_view(cur, project, view)
 
@@ -475,18 +482,41 @@ class RisingWaveComputeEngine(ComputeEngine):
         column_info = _registry_free_column_info(view)
         src = source_name(project, view.name)
         mv = online_mv_name(project, view.name)
-        select = build_windowed_agg_select(
-            column_info,
-            list(view.aggregations),
-            src,
-            source_is_retractable=_source_is_retractable(source),
-            emit_on_close=emit_on_close,
-        )
         return [
             _source_ddl(src, source, view),
-            _materialized_view_ddl(mv, select),
+            _materialized_view_ddl(mv, self._stream_mv_select(project, view)),
             _iceberg_sink_ddl(offline_sink_name(project, view.name), mv, column_info, self.config),
         ]
+
+    def _stream_mv_select(self, project: str, view) -> str:
+        """The EOWC windowed-aggregation SELECT for a stream view's online MV — the ONE definition shared
+        by provisioning and reconcile so the two cannot drift."""
+        return build_windowed_agg_select(
+            _registry_free_column_info(view),
+            list(view.aggregations),
+            source_name(project, view.name),
+            source_is_retractable=_source_is_retractable(view.stream_source),
+            emit_on_close=bool(self.config.emit_on_window_close),
+        )
+
+    def _reconcile_stream_view(self, cur, project: str, view) -> None:
+        """Reconcile a KEPT StreamFeatureView to its current definition (re-materialize on a change;
+        no-op when unchanged) — the stream analogue of ``_reconcile_batch_view``. ``CREATE ... IF NOT
+        EXISTS`` would keep the old EOWC MV, so a changed aggregation would silently serve/train under
+        the OLD definition. Compare the MV's deployed SELECT (RW catalog, stored verbatim) against the
+        desired one; on a change drop the graph (sink -> MV -> source, dependents first) and re-provision.
+
+        Both online serving AND offline training read this EOWC MV (the offline source is a PostgreSQL
+        query over it, ADR-0005-gated), so re-materializing the MV keeps online == offline under the new
+        definition — no skew. (The Iceberg sink is a separate durable copy training does NOT read; its
+        table may retain pre-change rows after a re-materialize — harmless, but a future tidy-up.)"""
+        mv = online_mv_name(project, view.name)
+        desired = self._stream_mv_select(project, view)
+        if _norm_sql(_deployed_mv_select(cur, mv)) != _norm_sql(desired):
+            for stmt in _drop_ddl(project, view):
+                cur.execute(stmt)
+            for stmt in self._provision_ddl(project, view):
+                cur.execute(stmt)
 
     def _provision_batch_ddl(self, project: str, view) -> List[str]:
         """Registry-free DDL for one tile-aggregating BatchFeatureView: an Iceberg source, a continuous

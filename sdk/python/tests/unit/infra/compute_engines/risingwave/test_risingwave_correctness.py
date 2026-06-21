@@ -669,6 +669,45 @@ def test_provision_emits_source_mv_and_iceberg_sink():
     assert '"window_end" AS event_timestamp' in sink_sql
 
 
+class _ReconcileCur:
+    # Records executed DDL; answers the rw_catalog MV-definition lookup with the given deployed def.
+    def __init__(self, deployed_def):
+        self.executed = []
+        self._deployed = deployed_def
+
+    def execute(self, sql, params=None):
+        self.executed.append(sql)
+        if sql.startswith("SELECT definition"):
+            self._row = (self._deployed,) if self._deployed is not None else None
+
+    def fetchone(self):
+        return self._row
+
+
+def test_reconcile_stream_view_noop_when_definition_unchanged():
+    # A kept stream view whose deployed EOWC MV matches the desired SELECT must NOT be touched (no
+    # rebuild, no serving blip) — the verbatim-catalog comparison sees no change.
+    eng = _engine(emit_on_window_close=True)
+    view = _stream_view(_kafka_source(watermark=True), [_agg("sum")])
+    desired = eng._stream_mv_select("proj", view)
+    cur = _ReconcileCur(f"CREATE MATERIALIZED VIEW proj_user_txn_online AS {desired}")
+    eng._reconcile_stream_view(cur, "proj", view)
+    assert not any(s.startswith(("DROP", "CREATE")) for s in cur.executed)  # only the catalog SELECT ran
+
+
+def test_reconcile_stream_view_reprovisions_on_definition_change():
+    # A changed aggregation => the deployed MV SELECT differs => drop the graph (sink -> MV -> source,
+    # dependents first) and re-provision (source -> MV -> sink). Without this the old MV would persist.
+    eng = _engine(emit_on_window_close=True)
+    view = _stream_view(_kafka_source(watermark=True), [_agg("sum")])
+    cur = _ReconcileCur("CREATE MATERIALIZED VIEW proj_user_txn_online AS SELECT stale")
+    eng._reconcile_stream_view(cur, "proj", view)
+    drops = [s for s in cur.executed if s.startswith("DROP")]
+    creates = [s for s in cur.executed if s.startswith("CREATE")]
+    assert [s.split()[1] for s in drops] == ["SINK", "MATERIALIZED", "SOURCE"]  # dependents first
+    assert [s.split()[1] for s in creates] == ["SOURCE", "MATERIALIZED", "SINK"]  # base first
+
+
 # --- Phase 6 Inc 2: BATCH feature view provisioning (Iceberg source -> tiles MV) ---
 
 
@@ -838,10 +877,12 @@ def test_deployed_source_table_extracts_iceberg_table_name():
         def fetchone(self):
             return self._row
 
+    # RW RE-RENDERS a source's WITH clause in its catalog (spaces around '=', expanded types) — NOT
+    # verbatim like an MV — so the parser must match that stored form, not the engine's emitted DDL.
     ddl = (
-        "CREATE SOURCE proj_v_src WITH (connector='iceberg', catalog.name='feast', "
-        "catalog.type='storage', warehouse.path='s3a://feast/wh', database.name='feast', "
-        "table.name='o''brien_txn')"  # embedded quote, doubled in the DDL
+        "CREATE SOURCE proj_v_src WITH (connector = 'iceberg', catalog.name = 'feast', "
+        "catalog.type = 'storage', warehouse.path = 's3a://feast/wh', database.name = 'feast', "
+        "table.name = 'o''brien_txn')"  # embedded quote, doubled
     )
     assert _deployed_source_table(_Cur((ddl,)), "proj_v_src") == "o'brien_txn"
     assert _deployed_source_table(_Cur(None), "missing") is None  # absent source
