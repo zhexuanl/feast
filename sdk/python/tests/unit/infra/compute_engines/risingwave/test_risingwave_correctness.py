@@ -70,6 +70,9 @@ from feast.infra.compute_engines.utils import ENTITY_ROW_ID, ENTITY_TS_ALIAS
 from feast.infra.offline_stores.contrib.postgres_offline_store.postgres import (
     EntitySelectMode,
 )
+from feast.infra.offline_stores.contrib.postgres_offline_store.postgres_source import (
+    PostgreSQLSource,
+)
 
 
 def _column_info(feature_cols=("amount_sum_3600s",)):
@@ -1614,18 +1617,27 @@ def test_passthrough_pit_query_is_asof_latest_per_entity():
     assert "GROUP BY" not in sql  # latest-row pick, not an aggregation
 
 
-def test_passthrough_pit_query_dedups_feature_colliding_with_an_entity_column():
-    # A feature named like a non-join-key entity_df column (e.g. the label-ts column) must be projected ONCE
-    # (from the entity side), or the inner subquery emits a duplicate/ambiguous column and the query fails.
+def test_passthrough_pit_query_rejects_feature_colliding_with_an_entity_column():
+    # A feature named like a non-join-key entity_df column (e.g. the label-ts column) is ambiguous: the
+    # as-of read cannot return both the feature and the entity column under one name. Fail clearly instead
+    # of silently shadowing the feature with the entity column (and dropping its full_feature_names alias).
     ci = ColumnInfo(
         join_keys=["user_id"], feature_cols=["event_ts", "amount"], ts_col="event_ts",
         created_ts_col=None, field_mapping=None,
     )
-    sql = build_passthrough_pit_query(
-        "SELECT 1", ["user_id", "event_ts"], "event_ts", history_relation="hist", column_info=ci,
+    with pytest.raises(ValueError, match="collide with an entity-dataframe column"):
+        build_passthrough_pit_query(
+            "SELECT 1", ["user_id", "event_ts"], "event_ts", history_relation="hist", column_info=ci,
+        )
+    # a non-colliding feature set is unaffected
+    ci2 = ColumnInfo(
+        join_keys=["user_id"], feature_cols=["amount"], ts_col="event_ts",
+        created_ts_col=None, field_mapping=None,
     )
-    assert 'e."user_id", e."event_ts", h."amount",' in sql  # event_ts from e only, amount from h
-    assert 'h."event_ts"' not in sql.split("ROW_NUMBER")[0]  # not double-projected on the h side
+    sql = build_passthrough_pit_query(
+        "SELECT 1", ["user_id", "event_ts"], "event_ts", history_relation="hist", column_info=ci2,
+    )
+    assert 'h."amount"' in sql
 
 
 def test_offline_passthrough_streaming_without_iceberg_history_is_rejected_clearly():
@@ -1689,6 +1701,92 @@ def test_reconcile_passthrough_stream_provisions_missing_history_source():
     assert any(
         s.startswith('CREATE SOURCE IF NOT EXISTS "proj_user_attr_history"') for s in cur.executed
     )
+
+
+# --- passthrough offline over a PostgreSQL batch_source (read directly over pgwire, not provisioned) ---
+
+
+def _passthrough_stream_view_with_pg_history(table="attr_hist_pg", query=None):
+    # A streaming passthrough whose Kafka source carries a PostgreSQL batch_source. RisingWave reads a
+    # Postgres relation directly over pgwire, so the offline as-of read queries it in place — no provisioned
+    # Iceberg history source. A projection is set because the offline read resolves the view name.
+    src = _kafka_source(watermark=False)
+    src.batch_source = PostgreSQLSource(
+        name="attr_hist_pg", table=table, query=query, timestamp_field="event_ts"
+    )
+    view = _passthrough_stream_view(src)
+    view.projection = SimpleNamespace(name_to_use=lambda: view.name)
+    return view
+
+
+def test_offline_passthrough_streaming_reads_postgres_table_batch_source_directly():
+    # A streaming passthrough whose Kafka source declares a PostgreSQL batch_source: the as-of read queries
+    # that PG table in place as the history relation — NOT a provisioned {base}_history Iceberg source.
+    from unittest.mock import patch
+
+    view = _passthrough_stream_view_with_pg_history(table="attr_hist_pg")
+    entity_df = pd.DataFrame({"user_id": ["A"], "event_timestamp": [pd.Timestamp("2026-01-01")]})
+    registry = MagicMock()
+    registry.list_on_demand_feature_views.return_value = []
+    target = "feast.infra.compute_engines.risingwave.offline_store.PostgreSQLRetrievalJob"
+    with patch(target) as job:
+        RisingWaveOfflineStore.get_historical_features(
+            config=MagicMock(), feature_views=[view], feature_refs=["user_attr:amount"],
+            entity_df=entity_df, registry=registry, project="proj",
+        )
+    sql = job.call_args.kwargs["query"]
+    assert "LEFT JOIN attr_hist_pg h ON" in sql  # the PG table queried directly as the history relation
+    assert "proj_user_attr_history" not in sql  # no provisioned Iceberg history source is referenced
+    assert 'h."event_ts" <= e."event_timestamp"' in sql  # as-of cut on the PG source's timestamp_field
+    assert "ROW_NUMBER() OVER (PARTITION BY" in sql and sql.rstrip().endswith("rn = 1")
+    assert 'h."amount"' in sql  # the requested feature projected from the PG history side
+
+
+def test_offline_passthrough_streaming_reads_postgres_query_batch_source_as_subquery():
+    # A query-based PostgreSQL batch_source: get_table_query_string() parenthesizes the query, which the PIT
+    # builder aliases as the history relation (LEFT JOIN (subquery) h) — valid over pgwire.
+    from unittest.mock import patch
+
+    view = _passthrough_stream_view_with_pg_history(table=None, query="SELECT * FROM raw_attr")
+    entity_df = pd.DataFrame({"user_id": ["A"], "event_timestamp": [pd.Timestamp("2026-01-01")]})
+    registry = MagicMock()
+    registry.list_on_demand_feature_views.return_value = []
+    target = "feast.infra.compute_engines.risingwave.offline_store.PostgreSQLRetrievalJob"
+    with patch(target) as job:
+        RisingWaveOfflineStore.get_historical_features(
+            config=MagicMock(), feature_views=[view], feature_refs=["user_attr:amount"],
+            entity_df=entity_df, registry=registry, project="proj",
+        )
+    sql = job.call_args.kwargs["query"]
+    assert "LEFT JOIN (SELECT * FROM raw_attr) h ON" in sql
+
+
+def test_provision_passthrough_stream_with_postgres_history_adds_no_history_source():
+    # A PostgreSQL batch_source is read directly over pgwire at training time, so provisioning emits only
+    # the Kafka source + latest-row MV — NO {base}_history source (there is nothing to provision).
+    eng = _engine()
+    view = _passthrough_stream_view_with_pg_history(table="attr_hist_pg")
+    ddl = eng._provision_passthrough_ddl("proj", view)
+    assert len(ddl) == 2
+    assert ddl[0].startswith("CREATE SOURCE") and "connector='kafka'" in ddl[0]
+    assert ddl[1].startswith("CREATE MATERIALIZED VIEW")
+    assert not any("_history" in s for s in ddl)
+
+
+def test_reconcile_passthrough_stream_with_postgres_history_is_noop_when_unchanged():
+    # A PostgreSQL batch_source provisions no history source, so the history-table-repoint check (which keys
+    # on an IcebergSource batch_source) naturally skips it — a kept, unchanged PG-history passthrough must
+    # NOT spuriously rebuild.
+    eng = _engine()
+    view = _passthrough_stream_view_with_pg_history(table="attr_hist_pg")
+    desired = eng._passthrough_mv_select("proj", view)
+    cur = _ReconcileCur(
+        f"CREATE MATERIALIZED VIEW proj_user_attr_online AS {desired}",
+        source_def=_rendered_kafka_source_def(),  # topic/bootstrap unchanged
+        source_cols=_passthrough_source_cols(),  # column types unchanged
+    )
+    eng._reconcile_passthrough_view(cur, "proj", view)
+    assert not any(s.startswith(("DROP", "CREATE")) for s in cur.executed)
 
 
 # --- offline materialize routing: tile views no-op (offline reads the live tiles MV directly) ---

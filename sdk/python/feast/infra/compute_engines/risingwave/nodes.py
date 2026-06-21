@@ -248,10 +248,18 @@ def build_passthrough_pit_query(
     features in feature_refs). ``full_feature_names`` aliases every feature output as
     ``"{view_name}__{feature}"`` (the standard Feast offline contract); entity columns are never prefixed."""
     keys = column_info.join_keys_columns
-    # A feature column may coincide with a non-join-key entity_df column (e.g. the label-timestamp column);
-    # take such a column from the entity side only, so the inner subquery emits each name once (a duplicate
-    # would make the outer reference ambiguous). Mirrors build_latest_row_select's dedup.
-    feature_cols = [f for f in column_info.feature_cols if f not in entity_columns]
+    # A passthrough feature must not be named like an entity-dataframe column (the timestamp/label column, a
+    # join key, or another spine column): the as-of read would have to return both the feature (from the
+    # history) and the entity column under ONE name. Reject it clearly rather than silently shadowing the
+    # feature with the entity column (and, under full_feature_names, dropping its "{view}__{feature}" alias).
+    collisions = [f for f in column_info.feature_cols if f in entity_columns]
+    if collisions:
+        raise ValueError(
+            f"passthrough feature column(s) {collisions} collide with an entity-dataframe column; the "
+            f"point-in-time read cannot return both the feature and the entity column under one name. "
+            f"Rename the feature(s), or remove the column(s) from the entity dataframe."
+        )
+    feature_cols = column_info.feature_cols
     ts = column_info.timestamp_column
     created = column_info.created_timestamp_column
     e_cols = ", ".join(f'e."{c}"' for c in entity_columns)
