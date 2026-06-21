@@ -97,6 +97,17 @@ def _stream_view(source, aggs, offline=True):
     )
 
 
+def _stream_tile_view(source, aggs, interval_secs=86400):
+    # A streaming-tile view = a StreamFeatureView carrying Feast's NATIVE enable_tiling + tiling_hop_size
+    # (the tile interval) alongside its aggregations. The engine reads tiling_hop_size as the tile size
+    # (tile_interval) and is_streaming_tile keys on enable_tiling + aggregations. Windows are > interval
+    # (the ourfs authoring guarantees this).
+    view = _stream_view(source, aggs)
+    view.enable_tiling = True
+    view.tiling_hop_size = timedelta(seconds=interval_secs)
+    return view
+
+
 def _engine(emit_on_window_close=True):
     engine = RisingWaveComputeEngine.__new__(RisingWaveComputeEngine)
     engine.config = SimpleNamespace(
@@ -991,6 +1002,102 @@ def test_batch_drop_ddl_drops_every_per_window_mv():
     assert 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_tiles"' in stmts
     # the tiles MV is dropped AFTER the online MVs that read it (dependency order)
     assert stmts.index('DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_tiles"') == 2
+
+
+# --- S4: STREAMING tile feature view provisioning (watermarked Kafka source -> EOWC tiles MV) ---
+
+
+def test_provision_streaming_tile_emits_watermarked_source_eowc_tiles_and_online_rollup():
+    # daily (86400s) tiles, 3-day (259200s) window: a watermarked Kafka source, an EOWC TUMBLE tiles MV,
+    # and the SAME now()-anchored online rollup MV as the batch path (only the tile source differs).
+    agg = _agg("sum", window_seconds=259200)
+    view = _stream_tile_view(_kafka_source(watermark=True), [agg], interval_secs=86400)
+    ddl = _engine()._provision_streaming_tile_ddl("proj", view)
+    assert len(ddl) == 3  # source + tiles MV + online rollup MV; NO Iceberg sink (MVs read directly)
+    source_sql, tiles_sql, rollup_sql = ddl
+    feat = agg.resolved_name(agg.time_window)
+
+    # watermarked Kafka source (NOT iceberg) — the streaming tile source
+    assert source_sql.startswith("CREATE SOURCE")
+    assert "connector='kafka'" in source_sql
+    assert "WATERMARK FOR" in source_sql
+
+    # tiles MV: EOWC TUMBLE at the interval, window_end AS tile_end (vs the batch date_trunc GROUP BY)
+    assert tiles_sql.startswith("CREATE MATERIALIZED VIEW")
+    assert '"proj_user_txn_tiles"' in tiles_sql
+    assert "tumble(" in tiles_sql
+    assert "window_end AS tile_end" in tiles_sql
+    assert tiles_sql.endswith("EMIT ON WINDOW CLOSE")
+    assert "sum(amount) AS sum_amount" in tiles_sql  # window-independent partial (not per-window)
+
+    # online rollup MV: byte-identical shape to the batch path (reads the tiles MV, now()-anchored)
+    assert rollup_sql.startswith("CREATE MATERIALIZED VIEW")
+    assert '"proj_user_txn_online_259200s"' in rollup_sql
+    assert "FROM proj_user_txn_tiles" in rollup_sql
+    assert "now() - INTERVAL '259200' SECOND" in rollup_sql
+    assert "tile_end <= now()" in rollup_sql
+    assert f"sum(sum_amount) AS {feat}" in rollup_sql
+
+    # NO Iceberg sink (the streaming tile path mirrors the batch tile path — MVs read directly)
+    assert not any("CREATE SINK" in s for s in ddl)
+
+
+def test_provision_streaming_tile_emits_one_online_mv_per_window():
+    # multi-window: ONE shared EOWC tiles MV (window-independent partials) + one now() online MV PER window.
+    aggs = [_agg("sum", 259200), _agg("sum", 2592000), _agg("mean", 604800)]
+    view = _stream_tile_view(_kafka_source(watermark=True), aggs, interval_secs=86400)
+    ddl = _engine()._provision_streaming_tile_ddl("proj", view)
+    assert len(ddl) == 1 + 1 + 3  # source + tiles + 3 per-window online MVs (3d, 7d, 30d)
+    joined = "\n".join(ddl)
+    assert joined.count('"proj_user_txn_tiles"') == 1  # exactly one tiles MV, shared across windows
+    assert sum(1 for s in ddl if "tumble(" in s) == 1  # the single EOWC tiles MV
+    for w in (259200, 604800, 2592000):
+        assert f'"proj_user_txn_online_{w}s"' in joined
+    assert "sum(sum_amount) AS sum_amount_2592000s" in joined
+    assert "sum(sum_amount) / NULLIF(sum(count_amount), 0) AS mean_amount_604800s" in joined
+
+
+@pytest.mark.parametrize("emit_on_window_close", [True, False])
+def test_provision_streaming_tile_always_requires_a_source_watermark(emit_on_window_close):
+    # EOWC is INTRINSIC to the tile model (build_streaming_tile_select always EMIT ON WINDOW CLOSE), so —
+    # unlike a plain stream MV whose EOWC is opt-in via emit_on_window_close — the watermark is required
+    # regardless of the engine's emit_on_window_close config. Without it the EOWC tiles never emit.
+    view = _stream_tile_view(_kafka_source(watermark=False), [_agg("sum", 259200)], interval_secs=86400)
+    with pytest.raises(ValueError, match="watermark"):
+        _engine(emit_on_window_close=emit_on_window_close)._provision_streaming_tile_ddl("proj", view)
+
+
+def test_provision_streaming_tile_rejects_pushsource():
+    # isinstance check fires before any attribute access, so __new__ is enough.
+    push = PushSource.__new__(PushSource)
+    view = _stream_tile_view(push, [_agg("sum", 259200)], interval_secs=86400)
+    with pytest.raises(ValueError, match="PushSource"):
+        _engine()._provision_streaming_tile_ddl("proj", view)
+
+
+def test_provision_streaming_tile_requires_a_tiling_hop_size():
+    # enable_tiling without a tiling_hop_size -> is_streaming_tile is True but tile_interval is None.
+    # Guard with the actionable fix instead of an opaque 'NoneType' AttributeError in the SQL builder.
+    view = _stream_tile_view(_kafka_source(watermark=True), [_agg("sum", 259200)], interval_secs=86400)
+    view.tiling_hop_size = None  # an enable_tiling SFV authored without the hop
+    with pytest.raises(ValueError, match="tiling_hop_size"):
+        _engine()._provision_streaming_tile_ddl("proj", view)
+
+
+def test_multi_window_streaming_tile_would_fail_the_plain_stream_path():
+    # Routing-precedence rationale + intermediate-state fail-safe: a streaming-tile view is BOTH a
+    # StreamFeatureView AND tile-like, so update()/teardown check is_streaming_tile FIRST. The plain
+    # stream path (build_windowed_agg_select, one EOWC MV) REJECTS multi-window aggregations, so a
+    # streaming-tile view mis-routed there fails LOUDLY (never silently mis-provisions) — and the tile
+    # path is the only one that can provision it.
+    aggs = [_agg("sum", 259200), _agg("sum", 2592000)]
+    view = _stream_tile_view(_kafka_source(watermark=True), aggs, interval_secs=86400)
+    with pytest.raises(ValueError):  # the plain stream path can't build multi-window
+        _engine()._stream_mv_select("proj", view)
+    # ... but the streaming-tile path provisions one tiles MV + one online MV per window.
+    ddl = _engine()._provision_streaming_tile_ddl("proj", view)
+    assert sum(1 for s in ddl if "tumble(" in s) == 1
+    assert len([s for s in ddl if "_online_" in s]) == 2
 
 
 # (Removed: engine.get_historical_features tests — retrieval is the offline store's

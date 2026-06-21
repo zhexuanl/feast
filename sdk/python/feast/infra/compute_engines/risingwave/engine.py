@@ -46,6 +46,7 @@ from feast.infra.compute_engines.risingwave.names import (
     tiles_name,
 )
 from feast.infra.compute_engines.risingwave.iceberg_source import (
+    is_streaming_tile,
     is_tile_fv,
     tile_interval,
     view_aggregations,
@@ -53,6 +54,7 @@ from feast.infra.compute_engines.risingwave.iceberg_source import (
 from feast.infra.compute_engines.risingwave.nodes import (
     build_batch_tile_select,
     build_online_rollup_select,
+    build_streaming_tile_select,
     build_windowed_agg_select,
     group_aggregations_by_window,
 )
@@ -427,14 +429,26 @@ class RisingWaveComputeEngine(ComputeEngine):
         with _connect(self.config) as conn, conn.cursor() as cur:
             cur.execute("set sink_decouple = false")  # required before Iceberg sinks (upsert_table.slt:2)
             for view in views_to_delete:
-                if isinstance(view, StreamFeatureView):
+                # is_streaming_tile FIRST: a streaming-tile view IS a StreamFeatureView, but its physical
+                # objects are the tile graph (N online MVs + tiles MV + source, no Iceberg sink), so it
+                # tears down via _batch_drop_ddl, not _drop_ddl.
+                if is_streaming_tile(view):
+                    for stmt in _batch_drop_ddl(project, view):
+                        cur.execute(stmt)
+                elif isinstance(view, StreamFeatureView):
                     for stmt in _drop_ddl(project, view):
                         cur.execute(stmt)
                 elif is_tile_fv(view):
                     for stmt in _batch_drop_ddl(project, view):
                         cur.execute(stmt)
             for view in views_to_keep:
-                if isinstance(view, StreamFeatureView):
+                # is_streaming_tile FIRST (it is also a StreamFeatureView): provision the tile graph.
+                # CREATE ... IF NOT EXISTS makes the first apply provision and a re-apply a no-op;
+                # definition-change reconcile for kept streaming-tile views is a later increment.
+                if is_streaming_tile(view):
+                    for stmt in self._provision_streaming_tile_ddl(project, view):
+                        cur.execute(stmt)
+                elif isinstance(view, StreamFeatureView):
                     self._reconcile_stream_view(cur, project, view)
                 elif is_tile_fv(view):
                     self._reconcile_batch_view(cur, project, view)
@@ -447,7 +461,11 @@ class RisingWaveComputeEngine(ComputeEngine):
     ):
         with _connect(self.config) as conn, conn.cursor() as cur:
             for view in fvs:
-                if isinstance(view, StreamFeatureView):
+                # is_streaming_tile FIRST (it is also a StreamFeatureView): tear down the tile graph.
+                if is_streaming_tile(view):
+                    for stmt in _batch_drop_ddl(project, view):
+                        cur.execute(stmt)
+                elif isinstance(view, StreamFeatureView):
                     for stmt in _drop_ddl(project, view):
                         cur.execute(stmt)
                 elif is_tile_fv(view):
@@ -545,6 +563,69 @@ class RisingWaveComputeEngine(ComputeEngine):
             _materialized_view_ddl(
                 tiles,
                 build_batch_tile_select(column_info, aggs, src, aggregation_interval=interval),
+            ),
+        ]
+        for window_secs, window_aggs in group_aggregations_by_window(aggs):
+            rollup_select = build_online_rollup_select(
+                column_info, window_aggs, tiles, aggregation_interval=interval
+            )
+            mv = online_window_mv_name(project, view.name, window_secs)
+            ddl.append(_materialized_view_ddl(mv, rollup_select))
+        return ddl
+
+    def _provision_streaming_tile_ddl(self, project: str, view) -> List[str]:
+        """Registry-free DDL for one STREAMING tile feature view: a watermarked Kafka source, a
+        continuous EOWC TILES MV (``build_streaming_tile_select`` — per-(entity, tile_end)
+        window-INDEPENDENT partials tumbled at the aggregation_interval), and ONE now()-anchored online
+        rollup MV PER DISTINCT WINDOW (``build_online_rollup_select``). Same topology as the batch tile
+        path (one tiles MV + N rollup MVs, NO Iceberg sink — the offline tile PIT reads the tiles MV
+        directly); only the tile SOURCE differs: a watermarked Kafka source tumbled EMIT ON WINDOW CLOSE
+        vs an Iceberg ``date_trunc`` GROUP BY. The rollup MVs and the offline PIT are byte-identical to
+        the batch path (S2 spike), so serving/training reuse the same code.
+
+        EOWC tiles require a watermark on the source timestamp: a late event is dropped once at its tile
+        boundary, which is exactly what keeps online == offline (both read the same EOWC tiles —
+        ADR-0005 parity). This is intrinsic to the tile model, so — unlike a plain stream MV, whose EOWC
+        is opt-in via ``emit_on_window_close`` — the watermark is ALWAYS required here; reject a source
+        that sets none (the EOWC tiles would never emit)."""
+        source = view.stream_source
+        if isinstance(source, PushSource):
+            raise ValueError(
+                f"streaming-tile view '{view.name}' uses a PushSource, which is too thin to compile to "
+                "a RisingWave CREATE SOURCE (data_source.py:851-882). Use a KafkaSource."
+            )
+        if not isinstance(source, KafkaSource):
+            raise ValueError(
+                "RisingWaveComputeEngine requires a KafkaSource-backed streaming-tile view; "
+                f"'{view.name}' has {type(source).__name__}."
+            )
+        if source.kafka_options.watermark_delay_threshold is None:
+            raise ValueError(
+                "a streaming-tile view's EOWC tiles require a watermark on the source timestamp (a late "
+                "event is dropped once at its tile boundary, keeping online == offline), but the "
+                f"KafkaSource for '{view.name}' sets no watermark_delay_threshold "
+                "(eowc_group_agg.slt:8-12). Set one."
+            )
+        # enable_tiling without a tiling_hop_size: is_streaming_tile is True (it keys on enable_tiling +
+        # aggregations) but tile_interval is None — fail loud with the fix rather than an opaque
+        # 'NoneType' AttributeError deep in the tile SQL builder. (StreamFeatureView leaves
+        # tiling_hop_size None when unset — its 5-min default is only a local for window validation.)
+        if view.tiling_hop_size is None:
+            raise ValueError(
+                f"streaming-tile view '{view.name}' has enable_tiling=True but no tiling_hop_size (the "
+                "tile interval). Set tiling_hop_size to 1 hour or 1 day (the streaming tile grid)."
+            )
+
+        interval = tile_interval(view)
+        column_info = _registry_free_column_info(view)
+        aggs = view_aggregations(view)
+        src = source_name(project, view.name)
+        tiles = tiles_name(project, view.name)
+        ddl = [
+            _source_ddl(src, source, view),
+            _materialized_view_ddl(
+                tiles,
+                build_streaming_tile_select(column_info, aggs, src, aggregation_interval=interval),
             ),
         ]
         for window_secs, window_aggs in group_aggregations_by_window(aggs):
