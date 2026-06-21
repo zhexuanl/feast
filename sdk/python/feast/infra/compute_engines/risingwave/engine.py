@@ -351,6 +351,51 @@ def _deployed_source_table(cur, name: str) -> Optional[str]:
     return m.group(1).replace("''", "'") if m else None
 
 
+def _deployed_kafka_source_opts(cur, name: str) -> Optional[tuple]:
+    """The Kafka connector options of a deployed source as RisingWave stores them — the tuple
+    ``(topic, bootstrap_servers, watermark_secs)`` — or None if the source does not exist. A stream (or
+    streaming-tile) view reads its source by the (stable) source NAME, so a repointed topic, a moved
+    bootstrap server, or a changed watermark delay live ONLY in the ``CREATE SOURCE`` definition, never in
+    any materialized-view SELECT — reading them back from the catalog is the only way to detect that a kept
+    view's source changed (a repointed topic would keep feeding stale data; a changed watermark would
+    silently shift late-event admission and break train/serve parity).
+
+    Like ``_deployed_source_table``, a source's WITH clause is RE-RENDERED in the catalog (spaces around
+    ``=``, expanded types) rather than stored verbatim, so each option is EXTRACTED with a spacing-tolerant
+    regex; single quotes doubled in the DDL are un-doubled. The watermark delay is parsed from the column
+    list's ``WATERMARK FOR <ts> AS <ts> - INTERVAL '<n>' SECOND`` (the only INTERVAL a Kafka source DDL
+    carries); a source with no watermark yields None for that slot."""
+    cur.execute("SELECT definition FROM rw_catalog.rw_sources WHERE name = %s", (name,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    definition = row[0]
+    topic = re.search(r"(?:^|[\s,(])topic\s*=\s*'((?:[^']|'')*)'", definition)
+    bootstrap = re.search(
+        r"(?:^|[\s,(])properties\.bootstrap\.server\s*=\s*'((?:[^']|'')*)'", definition
+    )
+    watermark = re.search(r"INTERVAL\s+'(\d+)'\s+SECOND", definition)
+    return (
+        topic.group(1).replace("''", "'") if topic else None,
+        bootstrap.group(1).replace("''", "'") if bootstrap else None,
+        int(watermark.group(1)) if watermark else None,
+    )
+
+
+def _desired_kafka_source_opts(source: KafkaSource) -> tuple:
+    """The desired ``(topic, bootstrap_servers, watermark_secs)`` from a view's KafkaSource, in the same
+    shape ``_deployed_kafka_source_opts`` reads back so the two compare directly. ``watermark_secs`` is the
+    integer-second watermark delay (matching ``_source_ddl``'s ``INTERVAL '<n>' SECOND``), or None when the
+    source sets no watermark."""
+    opts = source.kafka_options
+    wm = opts.watermark_delay_threshold
+    return (
+        opts.topic,
+        opts.kafka_bootstrap_servers,
+        int(wm.total_seconds()) if wm is not None else None,
+    )
+
+
 def _norm_sql(sql):
     """Whitespace-normalize a SELECT for definition comparison (RW stores our SELECT verbatim modulo
     whitespace). None stays None so a missing deployed object never compares equal to a desired one."""
@@ -521,6 +566,12 @@ class RisingWaveComputeEngine(ComputeEngine):
         the OLD definition. Compare the MV's deployed SELECT (RW catalog, stored verbatim) against the
         desired one; on a change drop the graph (sink -> MV -> source, dependents first) and re-provision.
 
+        A repointed topic/bootstrap or a changed watermark delay lives only in the ``CREATE SOURCE``
+        definition (the EOWC MV reads the source by its stable name), not in any MV SELECT, so it is read
+        back from the source catalog (``_deployed_kafka_source_opts``) and triggers the same drop+reprovision
+        — else a repointed topic keeps feeding stale data, or a changed watermark silently shifts late-event
+        admission and breaks train/serve parity. The drop+reprovision already drops and recreates the source.
+
         Both online serving AND offline training read this EOWC MV (the offline source is a PostgreSQL
         query over it), so re-materializing the MV keeps online == offline under the new
         definition — no skew.
@@ -532,8 +583,18 @@ class RisingWaveComputeEngine(ComputeEngine):
         MV retention is introduced), the re-materialize must purge that table out-of-band (catalog
         drop, or a definition-versioned table name) to keep the durable archive consistent."""
         mv = online_mv_name(project, view.name)
+        src = source_name(project, view.name)
         desired = self._stream_mv_select(project, view)
-        if _norm_sql(_deployed_mv_select(cur, mv)) != _norm_sql(desired):
+        mv_changed = _norm_sql(_deployed_mv_select(cur, mv)) != _norm_sql(desired)
+        # A repointed topic/bootstrap or a changed watermark shows in NO MV SELECT (the EOWC MV reads the
+        # source by its stable name), so read the source opts back from the catalog and reprovision on a
+        # difference too. ``deployed is None`` (unprovisioned) is handled by mv_changed (the MV is absent).
+        deployed_opts = _deployed_kafka_source_opts(cur, src)
+        source_changed = (
+            deployed_opts is not None
+            and deployed_opts != _desired_kafka_source_opts(view.stream_source)
+        )
+        if mv_changed or source_changed:
             for stmt in _drop_ddl(project, view):
                 cur.execute(stmt)
             for stmt in self._provision_ddl(project, view):
@@ -704,10 +765,11 @@ class RisingWaveComputeEngine(ComputeEngine):
         the tiles MV, re-provision). Tiles MV unchanged (window-independent partials, so adding/removing a
         window does not touch it) -> reconcile only the per-window online MVs.
 
-        Kafka-source-change follow-up (deferred — same gap as ``_reconcile_stream_view``): a repointed
-        topic/bootstrap does not show in any MV definition (the tiles MV reads the source by its stable
-        name), so it is not detected here. The batch path detects an Iceberg-table repoint via the source
-        catalog; the Kafka analogue (reading topic/bootstrap from rw_sources) is not yet implemented."""
+        A repointed topic/bootstrap or a changed watermark delay does not show in any MV definition (the
+        tiles MV reads the source by its stable name), so it is read back from the source catalog
+        (``_deployed_kafka_source_opts``) and, on a difference, forces a full re-materialize (which already
+        drops+recreates the source) — else the tiles keep reading the stale topic, or admit late events
+        under the old watermark, diverging online from offline."""
         interval = tile_interval(view)
         column_info = _registry_free_column_info(view)
         aggs = view_aggregations(view)
@@ -734,6 +796,17 @@ class RisingWaveComputeEngine(ComputeEngine):
             deployed_tiles=_deployed_mv_select(cur, tiles),
             deployed_online=deployed_online,
         )
+        # A repointed topic/bootstrap or a changed watermark lives only in the CREATE SOURCE definition (the
+        # tiles MV reads the source by its stable name), so detect it from the source catalog and force a
+        # full re-materialize — which already drops+recreates the source below — else the tiles keep reading
+        # the stale topic, or admit late events under the old watermark, diverging online from offline.
+        deployed_opts = _deployed_kafka_source_opts(cur, src)
+        source_changed = (
+            deployed_opts is not None
+            and deployed_opts != _desired_kafka_source_opts(view.stream_source)
+        )
+        if source_changed:
+            full_rebuild, drops, creates = True, list(deployed_online), []
         for name in drops:  # online MVs (dependents) first
             cur.execute(f'DROP MATERIALIZED VIEW IF EXISTS "{name}"')
         if full_rebuild:

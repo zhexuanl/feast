@@ -22,8 +22,10 @@ from feast.data_source import KafkaSource, PushSource
 from feast.infra.compute_engines.risingwave.engine import (
     RisingWaveComputeEngine,
     _batch_drop_ddl,
+    _deployed_kafka_source_opts,
     _deployed_mv_select,
     _deployed_source_table,
+    _desired_kafka_source_opts,
     _existing_online_window_secs,
     _iceberg_sink_ddl,
     _iceberg_source_ddl,
@@ -718,18 +720,59 @@ def test_provision_emits_source_mv_and_iceberg_sink():
 
 
 class _ReconcileCur:
-    # Records executed DDL; answers the rw_catalog MV-definition lookup with the given deployed def.
-    def __init__(self, deployed_def):
+    # Records executed DDL; answers the MV-definition lookup (rw_materialized_views) with deployed_def and
+    # the source lookup (rw_sources) with source_def. None => the catalog row is absent (object missing).
+    def __init__(self, deployed_def, source_def=None):
         self.executed = []
         self._deployed = deployed_def
+        self._source_def = source_def
+        self._row = None
 
     def execute(self, sql, params=None):
         self.executed.append(sql)
         if sql.startswith("SELECT definition"):
-            self._row = (self._deployed,) if self._deployed is not None else None
+            val = self._source_def if "rw_sources" in sql else self._deployed
+            self._row = (val,) if val is not None else None
 
     def fetchone(self):
         return self._row
+
+
+def _rendered_kafka_source_def(topic="txn", bootstrap="localhost:9092", watermark_secs=30):
+    # The CREATE SOURCE definition as RisingWave RE-RENDERS it in rw_catalog.rw_sources (verified live on
+    # v3.0.0): spaces around '=' in the WITH clause, the WATERMARK in the column list, option names (incl.
+    # dotted) preserved, single quotes doubled. Used to prove the spacing-tolerant extraction matches the
+    # real rendering, not just the no-space form the engine emits.
+    t = topic.replace("'", "''")
+    b = bootstrap.replace("'", "''")
+    return (
+        'CREATE SOURCE "proj_user_txn_src" ("user_id" VARCHAR, "amount" DOUBLE, '
+        '"event_ts" TIMESTAMP, WATERMARK FOR "event_ts" AS "event_ts" - '
+        f"INTERVAL '{watermark_secs}' SECOND) WITH (connector = 'kafka', "
+        f"properties.bootstrap.server = '{b}', topic = '{t}', "
+        "scan.startup.mode = 'earliest') FORMAT PLAIN ENCODE JSON"
+    )
+
+
+def test_deployed_kafka_source_opts_extracts_from_rerendered_definition():
+    # RW re-renders the WITH clause (spaces around '=') and doubles single quotes, so the extraction must be
+    # spacing-tolerant and un-double — verified against the real v3.0.0 rendering shape.
+    cur = _ReconcileCur(None, source_def=_rendered_kafka_source_def(topic="a'b", watermark_secs=45))
+    assert _deployed_kafka_source_opts(cur, "proj_user_txn_src") == ("a'b", "localhost:9092", 45)
+
+
+def test_deployed_kafka_source_opts_none_when_source_absent():
+    # An absent source row (a never-provisioned view) reads back None, so source_changed stays False and the
+    # MV-absence drives provisioning instead (never a spurious "changed" against a missing source).
+    cur = _ReconcileCur(None, source_def=None)
+    assert _deployed_kafka_source_opts(cur, "proj_user_txn_src") is None
+
+
+def test_desired_kafka_source_opts_none_watermark_when_unset():
+    # A source with no watermark yields None for the watermark slot, matching what the catalog reads back
+    # (no INTERVAL in the DDL) — so a watermark-less source reconciles to a no-op, not a phantom change.
+    view = _stream_view(_kafka_source(watermark=False), [_agg("sum")])
+    assert _desired_kafka_source_opts(view.stream_source) == ("txn", "localhost:9092", None)
 
 
 def test_reconcile_stream_view_noop_when_definition_unchanged():
@@ -754,6 +797,54 @@ def test_reconcile_stream_view_reprovisions_on_definition_change():
     creates = [s for s in cur.executed if s.startswith("CREATE")]
     assert [s.split()[1] for s in drops] == ["SINK", "MATERIALIZED", "SOURCE"]  # dependents first
     assert [s.split()[1] for s in creates] == ["SOURCE", "MATERIALIZED", "SINK"]  # base first
+
+
+def test_reconcile_stream_view_noop_when_source_unchanged():
+    # MV unchanged AND the deployed source — RE-RENDERED by RW (spaces around '=') — extracts to the SAME
+    # (topic, bootstrap, watermark) as the view's KafkaSource => no spurious rebuild. This pins that the
+    # spacing-tolerant extraction does not see the re-render as a change (a verbatim compare would).
+    eng = _engine(emit_on_window_close=True)
+    view = _stream_view(_kafka_source(watermark=True), [_agg("sum")])
+    desired_mv = eng._stream_mv_select("proj", view)
+    cur = _ReconcileCur(
+        f"CREATE MATERIALIZED VIEW proj_user_txn_online AS {desired_mv}",
+        source_def=_rendered_kafka_source_def(),  # topic=txn, bootstrap=localhost:9092, watermark=30
+    )
+    eng._reconcile_stream_view(cur, "proj", view)
+    assert not any(s.startswith(("DROP", "CREATE")) for s in cur.executed)  # only the catalog SELECTs ran
+
+
+def test_reconcile_stream_view_reprovisions_on_topic_change():
+    # MV unchanged but the source was repointed at a different topic — invisible in any MV SELECT, caught
+    # from the source catalog. Drop the graph (sink -> MV -> source) + reprovision so serving stops reading
+    # the stale topic.
+    eng = _engine(emit_on_window_close=True)
+    view = _stream_view(_kafka_source(watermark=True), [_agg("sum")])
+    desired_mv = eng._stream_mv_select("proj", view)
+    cur = _ReconcileCur(
+        f"CREATE MATERIALIZED VIEW proj_user_txn_online AS {desired_mv}",
+        source_def=_rendered_kafka_source_def(topic="OLD_TOPIC"),
+    )
+    eng._reconcile_stream_view(cur, "proj", view)
+    drops = [s for s in cur.executed if s.startswith("DROP")]
+    creates = [s for s in cur.executed if s.startswith("CREATE")]
+    assert [s.split()[1] for s in drops] == ["SINK", "MATERIALIZED", "SOURCE"]  # dependents first
+    assert [s.split()[1] for s in creates] == ["SOURCE", "MATERIALIZED", "SINK"]  # base first
+
+
+def test_reconcile_stream_view_reprovisions_on_watermark_change():
+    # A changed watermark_delay_threshold shifts late-event admission (train/serve parity) but shows in NO
+    # MV SELECT — only in the source's WATERMARK clause. Detect it from the source catalog and reprovision.
+    eng = _engine(emit_on_window_close=True)
+    view = _stream_view(_kafka_source(watermark=True), [_agg("sum")])  # desired watermark = 30s
+    desired_mv = eng._stream_mv_select("proj", view)
+    cur = _ReconcileCur(
+        f"CREATE MATERIALIZED VIEW proj_user_txn_online AS {desired_mv}",
+        source_def=_rendered_kafka_source_def(watermark_secs=99),  # deployed 99s != desired 30s
+    )
+    eng._reconcile_stream_view(cur, "proj", view)
+    assert any(s.startswith("DROP SOURCE") for s in cur.executed)
+    assert any(s.startswith("CREATE SOURCE") for s in cur.executed)
 
 
 # --- BATCH feature view provisioning (Iceberg source -> tiles MV) ---
@@ -1103,22 +1194,28 @@ class _TileReconcileCur:
     ``_existing_online_window_secs``) and the ``rw_catalog`` MV-definition lookup (for
     ``_deployed_mv_select``), and records executed DDL. ``deployed`` maps an MV name -> the
     ``CREATE MATERIALIZED VIEW <name> AS <select>`` definition RisingWave stores verbatim; an absent name
-    => the MV does not exist."""
+    => the MV does not exist. Also answers the rw_sources source-definition lookup (for
+    ``_deployed_kafka_source_opts``) with ``source_def``; source_def=None => the source row is absent."""
 
-    def __init__(self, deployed):
+    def __init__(self, deployed, source_def=None):
         self.executed = []
         self._deployed = deployed
+        self._source_def = source_def
         self._name = None
+        self._is_source = False
 
     def execute(self, sql, params=None):
         self.executed.append(sql)
         if sql.startswith("SELECT definition"):
+            self._is_source = "rw_sources" in sql
             self._name = params[0]
 
     def fetchall(self):
         return [(name,) for name in self._deployed]  # all deployed MV names (tiles + per-window online)
 
     def fetchone(self):
+        if self._is_source:
+            return (self._source_def,) if self._source_def is not None else None
         defn = self._deployed.get(self._name)
         return (defn,) if defn is not None else None
 
@@ -1192,6 +1289,37 @@ def test_reconcile_streaming_tile_adds_only_the_new_window_mv():
     assert len(creates) == 1 and "proj_user_txn_online_2592000s" in creates[0]  # only the new window
     assert "tumble(" not in creates[0]  # NOT a tiles rebuild
     assert not any(s.startswith("DROP") for s in cur.executed)  # nothing removed
+
+
+def test_reconcile_streaming_tile_noop_when_source_unchanged():
+    # Tiles + per-window MVs unchanged AND the deployed source (RE-RENDERED by RW) extracts to the same opts
+    # as the view's KafkaSource => no rebuild. Pins that the source readback does not over-reconcile.
+    eng = _engine()
+    view = _reconcilable_streaming_tile_view()  # _kafka_source: topic=txn, bootstrap=localhost:9092, wm=30
+    deployed = _deployed_from_provision_ddl(eng._provision_streaming_tile_ddl("proj", view))
+    cur = _TileReconcileCur(deployed, source_def=_rendered_kafka_source_def())
+    eng._reconcile_streaming_tile_view(cur, "proj", view)
+    assert not any(s.startswith(("DROP", "CREATE")) for s in cur.executed)  # only catalog SELECTs ran
+
+
+def test_reconcile_streaming_tile_full_rebuild_when_source_changed():
+    # Tiles + per-window MVs unchanged, but the source was repointed (topic) — caught from the source
+    # catalog (it shows in no MV SELECT). Force a full re-materialize: drop all online MVs + the tiles MV +
+    # the source, then reprovision, so the tiles stop reading the stale topic.
+    eng = _engine()
+    view = _reconcilable_streaming_tile_view()
+    deployed = _deployed_from_provision_ddl(eng._provision_streaming_tile_ddl("proj", view))
+    cur = _TileReconcileCur(deployed, source_def=_rendered_kafka_source_def(topic="OLD_TOPIC"))
+    eng._reconcile_streaming_tile_view(cur, "proj", view)
+    assert 'DROP SOURCE IF EXISTS "proj_user_txn_src"' in cur.executed
+    assert 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_tiles"' in cur.executed
+    drops_online = [
+        s for s in cur.executed if s.startswith("DROP MATERIALIZED VIEW") and "_online_" in s
+    ]
+    assert len(drops_online) == 2  # both per-window online MVs dropped (full rebuild, not granular)
+    creates = [s for s in cur.executed if s.startswith("CREATE MATERIALIZED VIEW")]
+    assert len(creates) == 3  # tiles + both per-window online MVs re-created
+    assert any(s.startswith("CREATE SOURCE") for s in cur.executed)  # the source is re-created
 
 
 def test_multi_window_streaming_tile_would_fail_the_plain_stream_path():
