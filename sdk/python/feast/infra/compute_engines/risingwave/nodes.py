@@ -196,48 +196,87 @@ def build_windowed_agg_select(
 # request time. Verified end-to-end live on RW v3.0.0: spike/sql/05c_batch_tiles.sql.
 
 # The tile model materializes per-(entity, tile) PARTIALS that recombine additively across the tiles
-# in a window. Two families:
+# in a window. WINDOW-INDEPENDENT (Established feature stores: one tile set reused across every time-window): a partial is
+# keyed by (function-family, column), NOT by window — ``sum_amount``, ``count_amount``, ``min_amount``,
+# ``max_amount``, ``sumsq_amount``. So a ``sum(amount)`` over 3d and another over 30d SHARE the one
+# ``sum_amount`` tile partial, and ``mean(amount)`` reuses the same ``sum_amount`` + ``count_amount``.
+# Two families:
 #   ADDITIVE — one partial == the aggregate; recombine: sum/sum/min/max (count rolls up by SUMMING
-#     per-tile counts). Named by the feature's resolved_name so tile/rollup/serve share one column.
+#     per-tile counts).
 #   COMPOSITE — the aggregate is NOT additive, but decomposes into additive partials that DO merge
 #     and a recombine formula (Chronon's IR: Average = {sum, count}; Variance via {sum, sumsq, count},
-#     var = (Σx² − (Σx)²/n)/n). Partials are named ``<resolved>__sm/__cnt/__sqs``.
-# count_distinct/approx have no safe additive sketch merge — still rejected.
+#     var = (Σx² − (Σx)²/n)/n).
+# Each aggregation's OUTPUT column is still its per-window ``resolved_name`` (e.g. ``sum_amount_259200s``);
+# only the stored tile partials are window-independent. count_distinct/approx have no safe additive
+# sketch merge — still rejected.
 _ADDITIVE_TILE_FN = frozenset({"sum", "count", "min", "max"})
 _COMPOSITE_TILE_FN = frozenset({"mean", "var_pop", "var_samp", "stddev_pop", "stddev_samp"})
 _TILE_SUPPORTED_FN = _ADDITIVE_TILE_FN | _COMPOSITE_TILE_FN
 
 
-def _tile_partials(agg: Aggregation) -> List[Tuple[str, str]]:
-    """The per-tile partial columns (name, SQL aggregate) for one aggregation. Additive functions
-    have ONE partial (the aggregate itself); composite functions (mean/var/stddev) have the additive
+def _partials_for(agg: Aggregation) -> List[Tuple[str, str]]:
+    """The WINDOW-INDEPENDENT per-tile partial columns (name, SQL aggregate) one aggregation needs.
+    Named by (function-family, column) so multiple windows / functions on the same column share a
+    partial. Additive functions need ONE partial; composite (mean/var/stddev) need the additive
     sub-partials that merge across tiles."""
-    out = agg.resolved_name(agg.time_window)
-    col = agg.column
-    fn = agg.function
-    if fn in _ADDITIVE_TILE_FN:
-        return [(out, f"{fn}({col})")]
-    partials = [(f"{out}__sm", f"sum({col})"), (f"{out}__cnt", f"count({col})")]
+    col, fn = agg.column, agg.function
+    if fn == "sum":
+        return [(f"sum_{col}", f"sum({col})")]
+    if fn == "count":
+        return [(f"count_{col}", f"count({col})")]
+    if fn in {"min", "max"}:
+        return [(f"{fn}_{col}", f"{fn}({col})")]
+    partials = [(f"sum_{col}", f"sum({col})"), (f"count_{col}", f"count({col})")]
     if fn in {"var_pop", "var_samp", "stddev_pop", "stddev_samp"}:
-        partials.append((f"{out}__sqs", f"sum({col} * {col})"))
+        partials.append((f"sumsq_{col}", f"sum({col} * {col})"))
     return partials
 
 
-def _tile_recombine(agg: Aggregation, prefix: str = "") -> str:
-    """The retrieval-time recombine for one aggregation: an expression over its per-tile partials
-    aliased to the FINAL ``resolved_name``. ``prefix`` qualifies the partial columns for a joined
-    relation (``"t."`` in the offline PIT range-join)."""
+def _view_partials(aggregations: List[Aggregation]) -> List[Tuple[str, str]]:
+    """The deduped union of every aggregation's window-independent partials = the tiles MV's partial
+    columns. ``setdefault`` keeps one entry per partial name (the materialize-SQL is identical for a
+    given (family, column), so dedup is safe)."""
+    out: dict = {}
+    for a in aggregations:
+        for name, sql in _partials_for(a):
+            out.setdefault(name, sql)
+    return list(out.items())
+
+
+def _tile_recombine(
+    agg: Aggregation, *, prefix: str = "", partial_filter: Optional[str] = None
+) -> str:
+    """The retrieval-time recombine for one aggregation: an expression over the window-independent
+    tile partials aliased to the FINAL per-window ``resolved_name``. ``prefix`` qualifies the partial
+    columns for a joined relation (``"t."`` in the offline PIT range-join). ``partial_filter`` is a SQL
+    predicate that narrows the tiles to THIS aggregation's window (``CASE WHEN <filter> THEN p END``) —
+    used when one query rolls up several windows over a shared join (the multi-window offline PIT); when
+    None the surrounding ``WHERE`` already bounds the window (the per-window online/floored rollups)."""
+    col, fn = agg.column, agg.function
     out = agg.resolved_name(agg.time_window)
-    fn = agg.function
-    if fn in {"sum", "count"}:  # count recombines by SUMMING per-tile counts
-        return f"sum({prefix}{out}) AS {out}"
+
+    def merged(kind: str, op: str = "sum") -> str:
+        p = f"{prefix}{kind}_{col}"
+        inner = f"CASE WHEN {partial_filter} THEN {p} END" if partial_filter else p
+        return f"{op}({inner})"
+
+    if fn == "sum":
+        return f"{merged('sum')} AS {out}"
+    if fn == "count":  # count recombines by SUMMING per-tile counts
+        return f"{merged('count')} AS {out}"
     if fn in {"min", "max"}:
-        return f"{fn}({prefix}{out}) AS {out}"
-    sm, cnt = f"sum({prefix}{out}__sm)", f"sum({prefix}{out}__cnt)"
+        return f"{merged(fn, fn)} AS {out}"
+    sm, cnt = merged("sum"), merged("count")
     if fn == "mean":
         return f"{sm} / NULLIF({cnt}, 0) AS {out}"
-    # variance/stddev: (Σx² − (Σx)²/n) / n  (population) or / (n−1) (sample); stddev = sqrt(var)
-    centered = f"(sum({prefix}{out}__sqs) - {sm} * {sm} / NULLIF({cnt}, 0))"
+    # variance/stddev: (Σx² − (Σx)²/n) / n  (population) or / (n−1) (sample); stddev = sqrt(var).
+    # GREATEST(..., 0) clamps the centered sum-of-squared-deviations to non-negative: the single-pass
+    # computational form is catastrophic-cancellation-prone, so over large-magnitude values summed in
+    # RisingWave's nondeterministic parallel order the residual can round slightly NEGATIVE — an
+    # impossible variance, and (since RW's sqrt ERRORS on negative input) a hard query failure for
+    # stddev. RisingWave's OWN native var/stddev plan wraps the identical expression in Greatest(_, 0)
+    # (over_window_function plan output), so we match it.
+    centered = f"GREATEST({merged('sumsq')} - {sm} * {sm} / NULLIF({cnt}, 0), 0)"
     denom = f"NULLIF({cnt} - 1, 0)" if fn.endswith("_samp") else f"NULLIF({cnt}, 0)"
     var = f"{centered} / {denom}"
     return f"sqrt({var}) AS {out}" if fn.startswith("stddev") else f"{var} AS {out}"
@@ -288,6 +327,12 @@ def _assert_window_multiple_of_interval(window_secs: int, aggregation_interval) 
     # for interval-boundary tiles, (now - W, now] selects the SAME tiles as
     # (floor(now, interval) - W, floor(now, interval)] only when W is a multiple of the interval.
     interval_secs = int(aggregation_interval.total_seconds())
+    # A zero/negative window is not None (so the None guards miss it) yet 0 % interval == 0, so it would
+    # slip through to emit an always-empty (end, end] range -> every feature silently NULL. Reject it.
+    if window_secs <= 0:
+        raise ValueError(
+            f"time_window must be a positive whole multiple of aggregation_interval; got {window_secs}s."
+        )
     if window_secs % interval_secs != 0:
         raise ValueError(
             f"time_window ({window_secs}s) must be a whole multiple of aggregation_interval "
@@ -296,21 +341,61 @@ def _assert_window_multiple_of_interval(window_secs: int, aggregation_interval) 
 
 
 def _validate_window_rollup(aggregations: List[Aggregation], aggregation_interval) -> int:
-    """Shared precondition for the three rollup builders (offline floored, online now(), offline PIT):
+    """Single-window precondition for the per-window rollup builders (offline floored, online now()):
     tile-supported aggs only, a single window, and window a whole multiple of the interval. Returns
-    window_secs. Centralized so the online and offline rollups CANNOT validate differently (ADR-0004)."""
+    window_secs. Centralized so the online and offline rollups CANNOT validate differently (ADR-0004).
+    Online is per-window (the engine provisions one now()-anchored MV per distinct window), so each of
+    those MVs is built from a single-window aggregation subset."""
     _assert_tile_supported(aggregations)
+    _assert_distinct_output_names(aggregations)
     window_secs = _single_window_secs(aggregations)
     _assert_window_multiple_of_interval(window_secs, aggregation_interval)
     return window_secs
 
 
+def _assert_distinct_output_names(aggregations: List[Aggregation]) -> None:
+    # Each aggregation projects one rollup column aliased to its resolved_name. resolved_name returns an
+    # explicit ``name`` verbatim (ignoring the window), so two aggregations sharing a name — or two
+    # identical aggregations — collide on one alias, emitting ``... AS feat, ... AS feat`` (a duplicate
+    # output column RisingWave rejects, or a silently-arbitrary pick for a by-name reader). The partial
+    # columns are deduped (``_view_partials``); the OUTPUT columns must be guaranteed distinct too.
+    names = [a.resolved_name(a.time_window) for a in aggregations]
+    dupes = sorted({n for n in names if names.count(n) > 1})
+    if dupes:
+        raise ValueError(
+            f"tile aggregations resolve to duplicate output column name(s) {dupes}; give each "
+            f"aggregation a distinct name (resolved_name uses an explicit name verbatim, ignoring the "
+            f"window, so same-name aggregations on different windows still collide)."
+        )
+
+
+def _validate_windows(aggregations: List[Aggregation], aggregation_interval) -> List[int]:
+    """Multi-window precondition for the offline PIT builder: tile-supported aggs only, distinct output
+    names, and EVERY aggregation's (non-null) window a whole multiple of the interval. Returns the
+    DISTINCT window seconds ascending. The aggregations may carry different windows over the ONE shared
+    tile set (Established feature stores: tiles reused across time-windows), so unlike ``_validate_window_rollup`` this does
+    NOT require a single window."""
+    _assert_tile_supported(aggregations)
+    _assert_distinct_output_names(aggregations)
+    windows = set()
+    for a in aggregations:
+        if a.time_window is None:
+            raise ValueError(
+                "tile rollup needs a non-null time_window on every aggregation; "
+                f"got None on {a.function}({a.column})."
+            )
+        secs = int(a.time_window.total_seconds())
+        _assert_window_multiple_of_interval(secs, aggregation_interval)
+        windows.add(secs)
+    return sorted(windows)
+
+
 def _tile_rollup_exprs(aggregations: List[Aggregation], prefix: str = "") -> str:
-    """The per-aggregation recombine projection, shared by ALL rollup builders so online and offline
-    recombine per-tile partials IDENTICALLY (ADR-0004 no-drift — a single source of truth, via
-    ``_tile_recombine``). ``prefix`` qualifies the partial columns for a joined relation (``"t."`` in
-    the offline PIT range-join)."""
-    return ", ".join(_tile_recombine(a, prefix) for a in aggregations)
+    """The per-aggregation recombine projection for the SINGLE-window rollup builders (the surrounding
+    WHERE bounds the window, so no per-agg ``partial_filter``). Shared by online + floored rollups so
+    they recombine per-tile partials IDENTICALLY (ADR-0004 no-drift — one source of truth, via
+    ``_tile_recombine``). ``prefix`` qualifies the partial columns for a joined relation."""
+    return ", ".join(_tile_recombine(a, prefix=prefix) for a in aggregations)
 
 
 def build_batch_tile_select(
@@ -330,12 +415,23 @@ def build_batch_tile_select(
         raise ValueError("build_batch_tile_select requires at least one aggregation")
     _assert_tile_supported(aggregations)
     unit = _tile_unit(aggregation_interval)
+    # Window-independent partials, deduped across aggregations: one ``sum_amount`` serves every window
+    # and every function on ``amount``. Additive functions emit one partial (the aggregate); composite
+    # (mean/var/stddev) emit several (sum/count/sumsq).
+    view_partials = _view_partials(aggregations)
+    # The partials are bare ``{family}_{col}`` names selected next to the GROUP BY join keys. If an
+    # entity column is literally named like a partial (e.g. a key ``sum_amount`` with a sum(amount)
+    # agg), the tiles MV would have two identically-named columns and RisingWave rejects the DDL —
+    # fail fast with a clear message instead of a confusing duplicate-column error downstream.
+    key_clash = sorted(set(column_info.join_keys_columns) & {name for (name, _) in view_partials})
+    if key_clash:
+        raise ValueError(
+            f"entity/join-key column(s) {key_clash} collide with tile partial column name(s); rename "
+            f"the entity column(s) (tile partials are named '<function>_<column>', e.g. sum_amount)."
+        )
     keys = ", ".join(column_info.join_keys_columns)
     bucket = f"date_trunc('{unit}', {column_info.timestamp_column})"
-    # additive functions emit one partial (the aggregate); composite (mean/var/stddev) emit several.
-    partials = ", ".join(
-        f"{expr} AS {name}" for a in aggregations for (name, expr) in _tile_partials(a)
-    )
+    partials = ", ".join(f"{expr} AS {name}" for (name, expr) in view_partials)
     return (
         f"SELECT {keys}, {bucket} + INTERVAL '1 {unit}' AS tile_end, {partials} "
         f"FROM {relation} GROUP BY {keys}, {bucket}"
@@ -422,23 +518,39 @@ def build_offline_tile_pit_query(
     which anchors the window at the latest tile WITH DATA, not at floor(label) — they diverge when the
     most recent intervals have no events (verified live: 180/280/230 vs a wrong 180/280/280). So we
     range-JOIN the inlined entity rows to the tiles and GROUP BY the entity row. LEFT JOIN so a row
-    with no tiles in range still appears (NULL feature). Single tile feature view per query for now.
+    with no tiles in range still appears (NULL feature).
+
+    MULTI-WINDOW: the aggregations may carry DIFFERENT windows over the ONE shared tile set (Established feature stores:
+    tiles reused across time-windows). The join reads tiles up to the MAX window once; each aggregation
+    recombines only the tiles inside ITS window via a per-agg ``CASE`` on ``tile_end`` — all windows in
+    one query, one pass over the tiles.
 
     TTL note: the feature view's ``ttl`` is intentionally NOT applied as a second lower bound. For an
     aggregation feature view the ``time_window`` IS the lookback bound (Chronon semantics); a
     ttl shorter than the window would silently shrink the aggregation below what the user requested, and
     a longer ttl is a no-op. So the window is the single, authoritative bound."""
-    window_secs = _validate_window_rollup(aggregations, aggregation_interval)
+    if not aggregations:
+        raise ValueError("build_offline_tile_pit_query requires at least one aggregation")
+    max_window = max(_validate_windows(aggregations, aggregation_interval))
     unit = _tile_unit(aggregation_interval)
     keys = column_info.join_keys_columns
     e_cols = ", ".join(f'e."{c}"' for c in entity_columns)
     join_on = " AND ".join(f't."{k}" = e."{k}"' for k in keys)
     end = f'date_trunc(\'{unit}\', e."{label_ts_column}")'
-    rollups = _tile_rollup_exprs(aggregations, prefix="t.")
+    rollups = ", ".join(
+        _tile_recombine(
+            a,
+            prefix="t.",
+            partial_filter=(
+                f"t.tile_end > {end} - INTERVAL '{int(a.time_window.total_seconds())}' SECOND"
+            ),
+        )
+        for a in aggregations
+    )
     return (
         f"SELECT {e_cols}, {rollups} FROM ({entity_df_sql}) e "
         f"LEFT JOIN {tiles_relation} t ON {join_on} "
-        f"AND t.tile_end > {end} - INTERVAL '{window_secs}' SECOND AND t.tile_end <= {end} "
+        f"AND t.tile_end > {end} - INTERVAL '{max_window}' SECOND AND t.tile_end <= {end} "
         f"GROUP BY {e_cols}"
     )
 

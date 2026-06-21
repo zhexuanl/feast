@@ -267,8 +267,8 @@ def test_batch_tile_select_buckets_by_interval_and_stamps_tile_end():
     )
     # 1-day tiles, stamped by tile_end (the event-time upper boundary of the tile).
     assert "date_trunc('day', event_ts) + INTERVAL '1 day' AS tile_end" in sql
-    # the tile holds the PARTIAL sum under the final feature's resolved name.
-    assert "sum(amount) AS sum_amount_2592000s" in sql
+    # the tile holds the WINDOW-INDEPENDENT partial sum (one sum_amount serves every window).
+    assert "sum(amount) AS sum_amount" in sql
     assert "GROUP BY user_id, date_trunc('day', event_ts)" in sql
 
 
@@ -276,7 +276,7 @@ def test_batch_tile_count_partial_is_count():
     sql = build_batch_tile_select(
         _column_info(), [_agg("count", 2592000)], "src", aggregation_interval=timedelta(days=1)
     )
-    assert "count(amount) AS count_amount_2592000s" in sql
+    assert "count(amount) AS count_amount" in sql
 
 
 def test_batch_tile_rollup_recombines_partials_in_request_anchored_window():
@@ -284,8 +284,8 @@ def test_batch_tile_rollup_recombines_partials_in_request_anchored_window():
         _column_info(), [_agg("sum", 2592000)], "tiles",
         aggregation_interval=timedelta(days=1), as_of_sql="$1",
     )
-    # sum partials roll up with sum, under the same feature name.
-    assert "sum(sum_amount_2592000s) AS sum_amount_2592000s" in sql
+    # sum partials (window-independent sum_amount) roll up with sum, output under the per-window name.
+    assert "sum(sum_amount) AS sum_amount_2592000s" in sql
     # request-anchored sliding window: end = the most-recent aggregation_interval boundary <= as_of.
     assert "tile_end > date_trunc('day', $1) - INTERVAL '2592000' SECOND" in sql
     assert "tile_end <= date_trunc('day', $1)" in sql
@@ -298,19 +298,19 @@ def test_batch_tile_count_rollup_combiner_is_sum():
         aggregation_interval=timedelta(days=1), as_of_sql="$1",
     )
     # COUNT tiles recombine by SUMMING the per-tile counts (not count()).
-    assert "sum(count_amount_2592000s) AS count_amount_2592000s" in sql
+    assert "sum(count_amount) AS count_amount_2592000s" in sql
 
 
 def test_batch_tile_min_max_roll_up_with_min_max():
     tile = build_batch_tile_select(
         _column_info(), [_agg("max", 2592000)], "src", aggregation_interval=timedelta(days=1)
     )
-    assert "max(amount) AS max_amount_2592000s" in tile
+    assert "max(amount) AS max_amount" in tile
     roll = build_tile_rollup_select(
         _column_info(), [_agg("max", 2592000)], "tiles",
         aggregation_interval=timedelta(days=1), as_of_sql="$1",
     )
-    assert "max(max_amount_2592000s) AS max_amount_2592000s" in roll
+    assert "max(max_amount) AS max_amount_2592000s" in roll
 
 
 @pytest.mark.parametrize("function", ["count_distinct", "approx_count_distinct"])
@@ -326,8 +326,9 @@ def test_batch_tile_mean_emits_sum_and_count_partials():
     sql = build_batch_tile_select(
         _column_info(), [_agg("mean", 2592000)], "src", aggregation_interval=timedelta(days=1)
     )
-    assert "sum(amount) AS mean_amount_2592000s__sm" in sql
-    assert "count(amount) AS mean_amount_2592000s__cnt" in sql
+    # mean reuses the window-independent sum_amount + count_amount partials (no per-window __sm/__cnt).
+    assert "sum(amount) AS sum_amount" in sql
+    assert "count(amount) AS count_amount" in sql
 
 
 def test_mean_rollup_recombines_sum_over_count():
@@ -336,8 +337,7 @@ def test_mean_rollup_recombines_sum_over_count():
         aggregation_interval=timedelta(days=1), as_of_sql="$1",
     )
     assert (
-        "sum(mean_amount_2592000s__sm) / NULLIF(sum(mean_amount_2592000s__cnt), 0) "
-        "AS mean_amount_2592000s" in sql
+        "sum(sum_amount) / NULLIF(sum(count_amount), 0) AS mean_amount_2592000s" in sql
     )
 
 
@@ -345,7 +345,7 @@ def test_batch_tile_stddev_emits_sumsq_partial():
     sql = build_batch_tile_select(
         _column_info(), [_agg("stddev_pop", 2592000)], "src", aggregation_interval=timedelta(days=1)
     )
-    assert "sum(amount * amount) AS stddev_pop_amount_2592000s__sqs" in sql
+    assert "sum(amount * amount) AS sumsq_amount" in sql
 
 
 def test_stddev_pop_rollup_is_sqrt_of_population_variance():
@@ -354,8 +354,11 @@ def test_stddev_pop_rollup_is_sqrt_of_population_variance():
         aggregation_interval=timedelta(days=1), as_of_sql="$1",
     )
     assert "sqrt(" in sql  # stddev = sqrt(variance)
-    assert "stddev_pop_amount_2592000s__sqs" in sql  # uses sum-of-squares
-    assert "NULLIF(sum(stddev_pop_amount_2592000s__cnt), 0)) AS stddev_pop_amount_2592000s" in sql  # /n
+    assert "sumsq_amount" in sql  # uses the window-independent sum-of-squares partial
+    assert "NULLIF(sum(count_amount), 0)) AS stddev_pop_amount_2592000s" in sql  # /n
+    # GREATEST(..., 0) clamps the centered sum-of-squares so rounding can't yield a negative variance /
+    # a sqrt-of-negative runtime failure (matches RisingWave's own native var/stddev plan).
+    assert "GREATEST(" in sql
 
 
 def test_var_samp_rollup_divides_by_n_minus_1():
@@ -363,7 +366,8 @@ def test_var_samp_rollup_divides_by_n_minus_1():
         _column_info(), [_agg("var_samp", 2592000)], "tiles",
         aggregation_interval=timedelta(days=1), as_of_sql="$1",
     )
-    assert "NULLIF(sum(var_samp_amount_2592000s__cnt) - 1, 0) AS var_samp_amount_2592000s" in sql
+    assert "NULLIF(sum(count_amount) - 1, 0) AS var_samp_amount_2592000s" in sql
+    assert "GREATEST(" in sql  # non-negative variance clamp (no negative variance from cancellation)
 
 
 def test_batch_tile_rejects_non_standard_interval():
@@ -385,8 +389,8 @@ def test_online_rollup_uses_plain_now_two_sided_window():
     assert "tile_end > now() - INTERVAL '2592000' SECOND" in sql
     assert "tile_end <= now()" in sql
     assert "date_trunc" not in sql
-    # combiner rolls per-tile sum partials up under the same feature name
-    assert "sum(sum_amount_2592000s) AS sum_amount_2592000s" in sql
+    # combiner rolls the window-independent sum_amount partial up under the per-window feature name
+    assert "sum(sum_amount) AS sum_amount_2592000s" in sql
     # one row per entity; window_end is the PIT stamp the point-lookup ORDER BYs
     assert "max(tile_end) AS window_end" in sql
     assert "GROUP BY user_id" in sql
@@ -397,7 +401,7 @@ def test_online_rollup_count_combiner_is_sum():
         _column_info(), [_agg("count", 2592000)], "tiles",
         aggregation_interval=timedelta(days=1),
     )
-    assert "sum(count_amount_2592000s) AS count_amount_2592000s" in sql
+    assert "sum(count_amount) AS count_amount_2592000s" in sql
 
 
 @pytest.mark.parametrize("function", ["count_distinct", "approx_count_distinct"])
@@ -427,6 +431,18 @@ def test_tile_rollup_offline_also_rejects_window_not_multiple_of_interval():
         )
 
 
+def test_online_rollup_is_single_window_one_mv_per_window():
+    # SLICE BOUNDARY: the now()-anchored online MV is per-window (RW rejects now() inside a CASE in a
+    # two-sided temporal-filter MV, so multi-window online = N separate per-window MVs the engine loops
+    # over). The builder therefore takes a SINGLE window; two windows is rejected, not silently merged.
+    # (Multi-window OFFLINE, by contrast, is one query — see the multi-window PIT tests above.)
+    with pytest.raises(ValueError, match="single non-null time_window"):
+        build_online_rollup_select(
+            _column_info(), [_agg("sum", 259200), _agg("sum", 2592000)], "tiles",
+            aggregation_interval=timedelta(days=1),
+        )
+
+
 # --- offline tile PIT: floor-anchored range-agg join, per entity-row label ---
 
 
@@ -443,7 +459,8 @@ def test_offline_tile_pit_anchors_window_at_floor_of_each_label():
     # window anchored at floor(THIS ROW's label), not a global now() and not the latest tile
     assert "t.tile_end > date_trunc('day', e.\"event_timestamp\") - INTERVAL '259200' SECOND" in sql
     assert "t.tile_end <= date_trunc('day', e.\"event_timestamp\")" in sql
-    assert "sum(t.sum_amount_259200s) AS sum_amount_259200s" in sql  # combiner rolls partials up
+    # each agg recombines its OWN window via a CASE on tile_end over the window-independent partial
+    assert "THEN t.sum_amount END) AS sum_amount_259200s" in sql
     assert 'GROUP BY e."user_id", e."event_timestamp"' in sql  # one output row per entity-label
 
 
@@ -454,7 +471,7 @@ def test_offline_tile_pit_count_combiner_is_sum():
         tiles_relation="t", column_info=_column_info(),
         aggregations=[_agg("count", 259200)], aggregation_interval=timedelta(days=1),
     )
-    assert "sum(t.count_amount_259200s) AS count_amount_259200s" in sql
+    assert "THEN t.count_amount END) AS count_amount_259200s" in sql
 
 
 @pytest.mark.parametrize("function", ["count_distinct", "approx_count_distinct"])
@@ -476,8 +493,131 @@ def test_offline_tile_pit_does_not_apply_ttl_only_the_window_bounds():
         tiles_relation="t", column_info=_column_info(),
         aggregations=[_agg("sum", 259200)], aggregation_interval=timedelta(days=1),
     )
-    assert sql.count("t.tile_end >") == 1  # only the window lower bound, no ttl lower bound
+    # two window-derived lower bounds — the join (max window) + the per-agg CASE — both '259200' (the
+    # window); NO third ttl bound. Pin: every lower bound is the window interval, and no 'ttl' filter.
+    assert sql.count("t.tile_end >") == 2
+    assert sql.count("- INTERVAL '259200' SECOND") == 2
     assert "ttl" not in sql.lower()
+
+
+# --- Multi-window from ONE tile set (Established feature stores: tiles reused across time-windows) ---
+
+
+def test_batch_tile_partials_are_window_independent_and_deduped():
+    # sum@3d + sum@30d + mean@7d on the SAME column share ONE sum_amount partial; mean adds count_amount.
+    sql = build_batch_tile_select(
+        _column_info(),
+        [_agg("sum", 259200), _agg("sum", 2592000), _agg("mean", 604800)],
+        "src", aggregation_interval=timedelta(days=1),
+    )
+    assert sql.count("AS sum_amount") == 1  # one partial for both sum windows AND mean's sum
+    assert sql.count("AS count_amount") == 1  # one partial for mean's count
+    assert "sum(amount) AS sum_amount" in sql
+    assert "count(amount) AS count_amount" in sql
+    # partials carry NO per-window suffix (that lives only on the rollup OUTPUT names)
+    assert "sum_amount_" not in sql and "count_amount_" not in sql
+
+
+def test_offline_tile_pit_multi_window_rolls_each_window_from_one_tile_set():
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(),
+        aggregations=[_agg("sum", 259200), _agg("sum", 2592000)],
+        aggregation_interval=timedelta(days=1),
+    )
+    end = "date_trunc('day', e.\"event_timestamp\")"
+    # the JOIN reads tiles up to the MAX window (30d) once
+    assert f"t.tile_end > {end} - INTERVAL '2592000' SECOND AND t.tile_end <= {end}" in sql
+    # each window recombines the SAME sum_amount partial, narrowed to its own window by a CASE
+    assert (
+        f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '259200' SECOND THEN t.sum_amount END) "
+        "AS sum_amount_259200s" in sql
+    )
+    assert (
+        f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '2592000' SECOND THEN t.sum_amount END) "
+        "AS sum_amount_2592000s" in sql
+    )
+
+
+def test_offline_tile_pit_multi_window_mean_uses_filtered_sum_and_count():
+    # mean@7d alongside sum@30d: mean recombines sum_amount/count_amount BOTH filtered to its 7d window,
+    # while the join is bounded by the max (30d) window.
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(),
+        aggregations=[_agg("mean", 604800), _agg("sum", 2592000)],
+        aggregation_interval=timedelta(days=1),
+    )
+    end = "date_trunc('day', e.\"event_timestamp\")"
+    case_sum = f"CASE WHEN t.tile_end > {end} - INTERVAL '604800' SECOND THEN t.sum_amount END"
+    case_cnt = f"CASE WHEN t.tile_end > {end} - INTERVAL '604800' SECOND THEN t.count_amount END"
+    assert f"sum({case_sum}) / NULLIF(sum({case_cnt}), 0) AS mean_amount_604800s" in sql
+    assert "INTERVAL '2592000' SECOND AND t.tile_end <=" in sql  # join bounded by the 30d max window
+
+
+def test_offline_tile_pit_multi_window_still_requires_window_multiple_of_interval():
+    # distinct windows are allowed, but EACH must be a whole number of tiles
+    with pytest.raises(ValueError, match="multiple"):
+        build_offline_tile_pit_query(
+            "SELECT 1", ["user_id", "event_timestamp"], "event_timestamp",
+            tiles_relation="t", column_info=_column_info(),
+            aggregations=[_agg("sum", 259200), _agg("sum", 3600)],  # 1h is not a multiple of 1-day
+            aggregation_interval=timedelta(days=1),
+        )
+
+
+def test_offline_tile_pit_rejects_empty_aggregations():
+    # same fail-fast guard as the other three tile builders (clear message, not a cryptic max([]) error)
+    with pytest.raises(ValueError, match="at least one aggregation"):
+        build_offline_tile_pit_query(
+            "SELECT 1", ["user_id", "event_timestamp"], "event_timestamp",
+            tiles_relation="t", column_info=_column_info(),
+            aggregations=[], aggregation_interval=timedelta(days=1),
+        )
+
+
+def test_tile_rejects_zero_length_window():
+    # timedelta(0) is non-null and 0 % interval == 0, so it slips past the None + multiple guards and
+    # would emit an always-empty (end, end] range -> silently all-NULL. Reject it with a clear message.
+    zero = Aggregation(column="amount", function="sum", time_window=timedelta(0))
+    with pytest.raises(ValueError, match="positive whole multiple"):
+        build_online_rollup_select(
+            _column_info(), [zero], "tiles", aggregation_interval=timedelta(days=1)
+        )
+    with pytest.raises(ValueError, match="positive whole multiple"):
+        build_offline_tile_pit_query(
+            "SELECT 1", ["user_id", "event_timestamp"], "event_timestamp",
+            tiles_relation="t", column_info=_column_info(),
+            aggregations=[zero], aggregation_interval=timedelta(days=1),
+        )
+
+
+def test_tile_rejects_duplicate_output_names():
+    # two aggregations sharing an explicit name resolve to the SAME output column (resolved_name uses
+    # the name verbatim, ignoring the window) -> duplicate SELECT alias. Reject before emitting bad SQL.
+    a = Aggregation(column="amount", function="sum", time_window=timedelta(days=3), name="total")
+    b = Aggregation(column="amount", function="sum", time_window=timedelta(days=30), name="total")
+    with pytest.raises(ValueError, match="duplicate output column"):
+        build_offline_tile_pit_query(
+            "SELECT 1", ["user_id", "event_timestamp"], "event_timestamp",
+            tiles_relation="t", column_info=_column_info(),
+            aggregations=[a, b], aggregation_interval=timedelta(days=1),
+        )
+
+
+def test_batch_tile_rejects_entity_column_colliding_with_partial_name():
+    # an entity/join key literally named like a tile partial ('sum_amount') would make the tiles MV have
+    # two identically-named columns -> RW rejects the DDL. Fail fast with a clear message instead.
+    ci = ColumnInfo(
+        join_keys=["sum_amount"], feature_cols=["amount"], ts_col="event_ts",
+        created_ts_col=None, field_mapping=None,
+    )
+    with pytest.raises(ValueError, match="collide with tile partial"):
+        build_batch_tile_select(
+            ci, [_agg("sum", 2592000)], "src", aggregation_interval=timedelta(days=1)
+        )
 
 
 # --- Provisioning guards ---
@@ -550,7 +690,7 @@ def test_provision_batch_emits_source_tiles_mv_and_online_rollup_mv():
     assert '"proj_user_txn_daily_tiles"' in tiles_sql
     assert "date_trunc('day'" in tiles_sql
     assert "tile_end" in tiles_sql
-    assert feat in tiles_sql  # the partial carries the FINAL feature's resolved_name
+    assert "sum(amount) AS sum_amount" in tiles_sql  # window-independent partial (not per-window)
 
     # online rollup MV: the point-looked-up _online name, plain now() window over the tiles MV
     assert rollup_sql.startswith("CREATE MATERIALIZED VIEW")
@@ -560,7 +700,7 @@ def test_provision_batch_emits_source_tiles_mv_and_online_rollup_mv():
     assert "tile_end <= now()" in rollup_sql
     assert "date_trunc" not in rollup_sql  # RW rejects two-sided date_trunc(now()) in an MV
     assert "max(tile_end) AS window_end" in rollup_sql  # PIT stamp for the point-lookup
-    assert f"sum({feat}) AS {feat}" in rollup_sql  # combiner rolls partials up under one name
+    assert f"sum(sum_amount) AS {feat}" in rollup_sql  # rolls the window-independent partial up
 
 
 def test_iceberg_source_ddl_escapes_single_quotes_in_table_name():
