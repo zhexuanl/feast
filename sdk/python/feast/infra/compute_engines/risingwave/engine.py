@@ -746,8 +746,9 @@ class RisingWaveComputeEngine(ComputeEngine):
         Offline training reads the RAW history with an as-of cut, not this MV. A batch passthrough's own
         Iceberg source IS that history. A streaming passthrough's Kafka stream is not queryable as history,
         so when its stream source declares an Iceberg batch_source (the historical log backing the stream)
-        we ALSO provision an Iceberg source over it for the offline read; absent one, the view is
-        online-only and offline retrieval is refused."""
+        we ALSO provision an Iceberg source over it for the offline read. A PostgreSQL batch_source needs
+        no provisioning here — RisingWave reads it directly over pgwire at training time. Absent a readable
+        batch_source, the view is online-only and offline retrieval is refused."""
         src = source_name(project, view.name)
         mv = online_mv_name(project, view.name)
         if is_passthrough_stream(view):
@@ -773,6 +774,8 @@ class RisingWaveComputeEngine(ComputeEngine):
                         passthrough_history_source_name(project, view.name), history.table, self.config
                     )
                 )
+            # A PostgreSQL batch_source is intentionally NOT provisioned: the offline read queries it
+            # directly over pgwire, so there is no history source to create here.
             return ddl
         source_ddl = _iceberg_source_ddl(src, view.batch_source.table, self.config)
         return [source_ddl, _materialized_view_ddl(mv, self._passthrough_mv_select(project, view))]
