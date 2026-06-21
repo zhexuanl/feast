@@ -517,7 +517,7 @@ def test_offline_tile_pit_does_not_apply_ttl_only_the_window_bounds():
     assert "ttl" not in sql.lower()
 
 
-# --- Streaming tiles (S1): the EOWC-tumble twin of build_batch_tile_select ---
+# --- Streaming tiles: the EOWC-tumble twin of build_batch_tile_select ---
 
 
 def test_streaming_tile_select_mirrors_batch_partials_via_eowc_tumble():
@@ -1004,7 +1004,7 @@ def test_batch_drop_ddl_drops_every_per_window_mv():
     assert stmts.index('DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_tiles"') == 2
 
 
-# --- S4: STREAMING tile feature view provisioning (watermarked Kafka source -> EOWC tiles MV) ---
+# --- STREAMING tile feature view provisioning (watermarked Kafka source -> EOWC tiles MV) ---
 
 
 def test_provision_streaming_tile_emits_watermarked_source_eowc_tiles_and_online_rollup():
@@ -1085,7 +1085,7 @@ def test_provision_streaming_tile_requires_a_tiling_hop_size():
 
 
 def test_is_tile_view_unions_batch_and_streaming_tile():
-    # S5 offline + serving routing keys on is_tile_view: BOTH a batch tile FV and a streaming tile view
+    # offline + serving routing keys on is_tile_view: BOTH a batch tile FV and a streaming tile view
     # take the tile path (per-window rollup MVs online + tile PIT offline); a plain stream view does not.
     assert is_tile_view(_batch_view([_agg("sum", 259200)]))  # batch tile (IcebergSource)
     assert is_tile_view(
@@ -1094,7 +1094,7 @@ def test_is_tile_view_unions_batch_and_streaming_tile():
     assert not is_tile_view(_stream_view(_kafka_source(watermark=True), [_agg("sum", 259200)]))  # plain stream
 
 
-# --- S6: STREAMING tile reconcile (verbatim-catalog comparison drives re-materialize) ---
+# --- STREAMING tile reconcile (verbatim-catalog comparison drives re-materialize) ---
 
 
 class _TileReconcileCur:
@@ -1125,7 +1125,7 @@ class _TileReconcileCur:
 def _deployed_from_provision_ddl(ddl):
     # Turn the engine's provision DDL into the {name: stored-definition} the catalog would hold: RW stores
     # each 'CREATE MATERIALIZED VIEW IF NOT EXISTS "<name>" AS <select>' as 'CREATE MATERIALIZED VIEW
-    # <name> AS <select>' (verbatim modulo whitespace — verified v3.0.0). The MV-name ' AS ' precedes any
+    # <name> AS <select>' (verbatim modulo whitespace, on RisingWave v3.0.0). The MV-name ' AS ' precedes any
     # in-SELECT ' AS ', so split(" AS ", 1) lands on it.
     deployed = {}
     for stmt in ddl:

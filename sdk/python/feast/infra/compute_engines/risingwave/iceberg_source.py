@@ -207,7 +207,7 @@ def view_aggregations(view) -> List[Aggregation]:
 def is_streaming_tile(view) -> bool:
     """A STREAMING tile feature view: a ``StreamFeatureView`` with Feast's NATIVE ``enable_tiling`` set and
     aggregations. We REUSE Feast's own ``StreamFeatureView.enable_tiling`` / ``tiling_hop_size`` (both
-    round-trip through the registry — verified) rather than inventing a carrier, so this one check works at
+    round-trip through the registry) rather than inventing a carrier, so this one check works at
     every altitude. The tiles are materialized by an EOWC TUMBLE at ``tiling_hop_size``; everything
     downstream is the shared per-window rollup. Mutually exclusive with ``is_tile_fv`` (a stream view has
     no IcebergSource batch source)."""

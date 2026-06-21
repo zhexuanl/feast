@@ -580,13 +580,13 @@ class RisingWaveComputeEngine(ComputeEngine):
         path (one tiles MV + N rollup MVs, NO Iceberg sink — the offline tile PIT reads the tiles MV
         directly); only the tile SOURCE differs: a watermarked Kafka source tumbled EMIT ON WINDOW CLOSE
         vs an Iceberg ``date_trunc`` GROUP BY. The rollup MVs and the offline PIT are byte-identical to
-        the batch path (S2 spike), so serving/training reuse the same code.
+        the batch path, so serving/training reuse the same code.
 
         EOWC tiles require a watermark on the source timestamp: a late event is dropped once at its tile
-        boundary, which is exactly what keeps online == offline (both read the same EOWC tiles —
-        ADR-0005 parity). This is intrinsic to the tile model, so — unlike a plain stream MV, whose EOWC
-        is opt-in via ``emit_on_window_close`` — the watermark is ALWAYS required here; reject a source
-        that sets none (the EOWC tiles would never emit)."""
+        boundary, which is exactly what keeps online == offline (both read the same EOWC tiles).
+        This is intrinsic to the tile model, so — unlike a plain stream MV, whose EOWC is opt-in via
+        ``emit_on_window_close`` — the watermark is ALWAYS required here; reject a source that sets none
+        (the EOWC tiles would never emit)."""
         source = view.stream_source
         if isinstance(source, PushSource):
             raise ValueError(
@@ -602,8 +602,7 @@ class RisingWaveComputeEngine(ComputeEngine):
             raise ValueError(
                 "a streaming-tile view's EOWC tiles require a watermark on the source timestamp (a late "
                 "event is dropped once at its tile boundary, keeping online == offline), but the "
-                f"KafkaSource for '{view.name}' sets no watermark_delay_threshold "
-                "(eowc_group_agg.slt:8-12). Set one."
+                f"KafkaSource for '{view.name}' sets no watermark_delay_threshold. Set one."
             )
         # enable_tiling without a tiling_hop_size: is_streaming_tile is True (it keys on enable_tiling +
         # aggregations) but tile_interval is None — fail loud with the fix rather than an opaque
