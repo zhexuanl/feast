@@ -208,7 +208,16 @@ def build_latest_row_select(column_info: ColumnInfo, relation: str) -> str:
     ts = column_info.timestamp_column
     created_ts = column_info.created_timestamp_column
     order_by = ", ".join(f"{col} DESC" for col in (ts, created_ts) if col)
-    projection = ", ".join([*column_info.join_keys_columns, *column_info.feature_cols, ts])
+    # Project each column once: a feature column may coincide with an entity key or the timestamp (a
+    # passthrough schema can name a feature the same as a key/ts), and a duplicated output column would make
+    # CREATE MATERIALIZED VIEW fail on an ambiguous column.
+    projection_cols: List[str] = []
+    seen: set = set()
+    for col in [*column_info.join_keys_columns, *column_info.feature_cols, ts]:
+        if col not in seen:
+            projection_cols.append(col)
+            seen.add(col)
+    projection = ", ".join(projection_cols)
     return (
         f"SELECT {projection} FROM (SELECT {projection}, "
         f"ROW_NUMBER() OVER (PARTITION BY {keys} ORDER BY {order_by}) AS {DEDUP_ROW_NUMBER} "

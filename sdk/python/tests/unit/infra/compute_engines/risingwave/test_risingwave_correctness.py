@@ -34,9 +34,16 @@ from feast.infra.compute_engines.risingwave.engine import (
     _iceberg_sink_ddl,
     _iceberg_source_ddl,
     _iceberg_storage_opts,
+    _passthrough_drop_ddl,
     _plan_batch_reconcile,
 )
-from feast.infra.compute_engines.risingwave.iceberg_source import IcebergSource, is_tile_view
+from feast.infra.compute_engines.risingwave.iceberg_source import (
+    IcebergSource,
+    is_passthrough_fv,
+    is_passthrough_stream,
+    is_passthrough_view,
+    is_tile_view,
+)
 from feast.infra.compute_engines.risingwave.offline_store import (
     RisingWaveOfflineStore,
     RisingWaveOfflineStoreConfig,
@@ -242,6 +249,23 @@ def test_latest_row_select_breaks_ties_on_created_timestamp_like_the_offline_rea
         "src",
     )
     assert "ORDER BY event_ts DESC, created_ts DESC" in sql
+
+
+def test_latest_row_select_projects_each_column_once_when_a_feature_equals_the_timestamp():
+    # A passthrough schema may name a feature the same as the timestamp (or an entity key); the projection
+    # must list it once, or CREATE MATERIALIZED VIEW fails on an ambiguous duplicate output column.
+    sql = build_latest_row_select(
+        ColumnInfo(
+            join_keys=["user_id"],
+            feature_cols=["amount", "event_ts"],  # 'event_ts' coincides with the ts column
+            ts_col="event_ts",
+            created_ts_col=None,
+            field_mapping=None,
+        ),
+        "src",
+    )
+    assert sql.startswith("SELECT user_id, amount, event_ts FROM")  # event_ts appears once, not twice
+    assert sql.count("SELECT user_id, amount, event_ts,") == 1  # inner projection also deduped
 
 
 def test_mixed_windows_in_one_view_are_rejected():
@@ -761,22 +785,29 @@ def test_provision_emits_source_mv_and_iceberg_sink():
 
 
 class _ReconcileCur:
-    # Records executed DDL; answers the MV-definition lookup (rw_materialized_views) with deployed_def and
-    # the source lookup (rw_sources) with source_def. None => the catalog row is absent (object missing).
-    def __init__(self, deployed_def, source_def=None):
+    # Records executed DDL; answers the MV-definition lookup (rw_materialized_views) with deployed_def, the
+    # source lookup (rw_sources) with source_def, and the source column-schema lookup
+    # (information_schema.columns) with source_cols ([(name, data_type)]). None => the catalog row is absent.
+    def __init__(self, deployed_def, source_def=None, source_cols=None):
         self.executed = []
         self._deployed = deployed_def
         self._source_def = source_def
+        self._source_cols = source_cols
         self._row = None
+        self._cols_query = False
 
     def execute(self, sql, params=None):
         self.executed.append(sql)
+        self._cols_query = "information_schema.columns" in sql
         if sql.startswith("SELECT definition"):
             val = self._source_def if "rw_sources" in sql else self._deployed
             self._row = (val,) if val is not None else None
 
     def fetchone(self):
         return self._row
+
+    def fetchall(self):
+        return list(self._source_cols) if (self._cols_query and self._source_cols) else []
 
 
 def _rendered_kafka_source_def(topic="txn", bootstrap="localhost:9092", watermark_secs=30):
@@ -1377,6 +1408,175 @@ def test_multi_window_streaming_tile_would_fail_the_plain_stream_path():
     ddl = _engine()._provision_streaming_tile_ddl("proj", view)
     assert sum(1 for s in ddl if "tumble(" in s) == 1
     assert len([s for s in ddl if "_online_" in s]) == 2
+
+
+# --- passthrough (Attribute) provisioning + reconcile: a latest-row MV, no aggregation ---
+
+
+def _passthrough_stream_view(source, feature_cols=("amount", "country"), name="user_attr"):
+    # A streaming passthrough view: a StreamFeatureView-shaped view with raw feature columns and NO
+    # aggregations (the Attribute flavor). The engine serves it as the latest row per entity.
+    return SimpleNamespace(
+        name=name,
+        stream_source=source,
+        aggregations=[],
+        entity_columns=[SimpleNamespace(name="user_id", dtype="String")],
+        features=[SimpleNamespace(name=c, dtype="Float64") for c in feature_cols],
+        offline=True,
+    )
+
+
+def _passthrough_batch_view(feature_cols=("amount",), name="user_attr_daily"):
+    # A batch passthrough view: a plain FeatureView whose batch_source is an IcebergSource with NO tile
+    # aggregation spec — raw columns served as the latest row per entity.
+    return SimpleNamespace(
+        name=name,
+        batch_source=IcebergSource(table="attr_ice", timestamp_field="event_ts"),
+        entity_columns=[SimpleNamespace(name="user_id", dtype="String")],
+        features=[SimpleNamespace(name=c, dtype="Float64") for c in feature_cols],
+        offline=True,
+    )
+
+
+def test_passthrough_discriminators_select_only_no_aggregation_views():
+    ps = _passthrough_stream_view(_kafka_source(watermark=False))
+    pb = _passthrough_batch_view()
+    assert is_passthrough_stream(ps) and is_passthrough_view(ps) and not is_passthrough_fv(ps)
+    assert is_passthrough_fv(pb) and is_passthrough_view(pb) and not is_passthrough_stream(pb)
+    # NOT passthrough: an aggregating stream, a streaming tile, and a batch tile all have aggregations.
+    assert not is_passthrough_view(_stream_view(_kafka_source(watermark=True), [_agg("sum")]))
+    assert not is_passthrough_view(
+        _stream_tile_view(_kafka_source(watermark=True), [_agg("sum", 259200)], interval_secs=86400)
+    )
+    assert not is_passthrough_view(_batch_view([_agg("sum", 259200)]))
+
+
+def test_provision_passthrough_stream_emits_source_with_raw_cols_and_latest_row_mv():
+    eng = _engine()
+    view = _passthrough_stream_view(_kafka_source(watermark=False))
+    ddl = eng._provision_passthrough_ddl("proj", view)
+    assert len(ddl) == 2  # source + latest-row MV; NO Iceberg sink on the online path
+    source_sql, mv_sql = ddl
+    assert source_sql.startswith("CREATE SOURCE") and "connector='kafka'" in source_sql
+    assert '"amount"' in source_sql and '"country"' in source_sql  # raw feature columns declared
+    assert "WATERMARK" not in source_sql  # a latest-row Group-TopN needs no watermark
+    assert mv_sql.startswith("CREATE MATERIALIZED VIEW")
+    assert "ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY event_ts DESC)" in mv_sql
+    assert "tumble(" not in mv_sql and "GROUP BY" not in mv_sql  # passthrough: no window, no aggregation
+
+
+def test_provision_passthrough_batch_emits_iceberg_source_and_latest_row_mv():
+    eng = _engine()
+    view = _passthrough_batch_view()
+    ddl = eng._provision_passthrough_ddl("proj", view)
+    assert len(ddl) == 2
+    source_sql, mv_sql = ddl
+    assert source_sql.startswith("CREATE SOURCE") and "connector='iceberg'" in source_sql
+    assert mv_sql.startswith("CREATE MATERIALIZED VIEW")
+    assert "ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY event_ts DESC)" in mv_sql
+
+
+def _passthrough_source_cols(amount_type="double precision"):
+    # The (name, canonical type) rows information_schema.columns reports for the deployed passthrough source
+    # of _passthrough_stream_view (user_id String, amount/country Float64, event_ts ts).
+    return [
+        ("user_id", "character varying"),
+        ("amount", amount_type),
+        ("country", "double precision"),
+        ("event_ts", "timestamp without time zone"),
+    ]
+
+
+def test_passthrough_drop_ddl_drops_sink_mv_then_source():
+    # Dependents first; the SINK is dropped too because the online MV name is shared with the plain-stream
+    # shape — a shape migration would otherwise orphan that shape's sink and block the MV drop.
+    ddl = _passthrough_drop_ddl("proj", _passthrough_stream_view(_kafka_source(watermark=False)))
+    assert ddl == [
+        'DROP SINK IF EXISTS "proj_user_attr_offline"',
+        'DROP MATERIALIZED VIEW IF EXISTS "proj_user_attr_online"',
+        'DROP SOURCE IF EXISTS "proj_user_attr_src"',
+    ]
+
+
+def test_reconcile_passthrough_noop_when_unchanged():
+    # Deployed latest-row MV matches the desired SELECT and the source opts (topic, bootstrap) match -> no
+    # rebuild. The re-rendered source carries a watermark, but passthrough ignores it (Group-TopN), so it
+    # must NOT trigger a spurious change.
+    eng = _engine()
+    view = _passthrough_stream_view(_kafka_source(watermark=False))
+    desired = eng._passthrough_mv_select("proj", view)
+    cur = _ReconcileCur(
+        f"CREATE MATERIALIZED VIEW proj_user_attr_online AS {desired}",
+        source_def=_rendered_kafka_source_def(),  # topic=txn, bootstrap=localhost:9092 (watermark ignored)
+        source_cols=_passthrough_source_cols(),  # deployed column types match the desired schema
+    )
+    eng._reconcile_passthrough_view(cur, "proj", view)
+    assert not any(s.startswith(("DROP", "CREATE")) for s in cur.executed)
+
+
+def test_reconcile_passthrough_reprovisions_on_mv_change():
+    eng = _engine()
+    view = _passthrough_stream_view(_kafka_source(watermark=False))
+    cur = _ReconcileCur(
+        "CREATE MATERIALIZED VIEW proj_user_attr_online AS SELECT stale",
+        source_def=_rendered_kafka_source_def(),
+    )
+    eng._reconcile_passthrough_view(cur, "proj", view)
+    drops = [s for s in cur.executed if s.startswith("DROP")]
+    creates = [s for s in cur.executed if s.startswith("CREATE")]
+    assert [s.split()[1] for s in drops] == ["SINK", "MATERIALIZED", "SOURCE"]  # dependents first
+    assert [s.split()[1] for s in creates] == ["SOURCE", "MATERIALIZED"]  # source then MV
+
+
+def test_reconcile_passthrough_stream_reprovisions_on_topic_change():
+    # MV unchanged but the Kafka source was repointed at a different topic -> caught from the catalog.
+    eng = _engine()
+    view = _passthrough_stream_view(_kafka_source(watermark=False))
+    desired = eng._passthrough_mv_select("proj", view)
+    cur = _ReconcileCur(
+        f"CREATE MATERIALIZED VIEW proj_user_attr_online AS {desired}",
+        source_def=_rendered_kafka_source_def(topic="OTHER_TOPIC"),
+    )
+    eng._reconcile_passthrough_view(cur, "proj", view)
+    assert any(s.startswith("DROP SOURCE") for s in cur.executed)
+    assert any(s.startswith("CREATE SOURCE") for s in cur.executed)
+
+
+def test_reconcile_passthrough_stream_reprovisions_on_feature_dtype_change():
+    # A passthrough feature dtype change keeps the same column name, so the latest-row MV SELECT is unchanged
+    # and the topic/bootstrap are unchanged — but the Kafka source declares the column with the OLD type.
+    # Detected from information_schema (the column schema changed) -> rebuild source + MV, else the source
+    # parses the field under the wrong type and serves a stale schema.
+    eng = _engine()
+    view = _passthrough_stream_view(_kafka_source(watermark=False))  # amount is Float64 -> double precision
+    desired = eng._passthrough_mv_select("proj", view)
+    cur = _ReconcileCur(
+        f"CREATE MATERIALIZED VIEW proj_user_attr_online AS {desired}",
+        source_def=_rendered_kafka_source_def(),  # topic/bootstrap unchanged
+        source_cols=_passthrough_source_cols(amount_type="character varying"),  # deployed amount is VARCHAR
+    )
+    eng._reconcile_passthrough_view(cur, "proj", view)
+    assert any(s.startswith("DROP SOURCE") for s in cur.executed)
+    assert any(s.startswith("CREATE SOURCE") for s in cur.executed)
+
+
+def test_reconcile_passthrough_batch_reprovisions_on_table_repoint():
+    # A repointed Iceberg table shows in no MV SELECT (the MV reads the source by name); detect it from the
+    # source catalog and re-provision.
+    eng = _engine()
+    view = _passthrough_batch_view()  # batch_source.table == "attr_ice"
+    desired = eng._passthrough_mv_select("proj", view)
+    stale_source = (
+        'CREATE SOURCE "proj_user_attr_daily_src" WITH (connector = \'iceberg\', '
+        "table.name = 'OLD_TABLE')"
+    )
+    cur = _ReconcileCur(
+        f"CREATE MATERIALIZED VIEW proj_user_attr_daily_online AS {desired}",
+        source_def=stale_source,
+    )
+    eng._reconcile_passthrough_view(cur, "proj", view)
+    assert any(s.startswith("DROP SOURCE") for s in cur.executed)
+    assert any(s.startswith("CREATE SOURCE") for s in cur.executed)
 
 
 # --- offline materialize routing: tile views no-op (offline reads the live tiles MV directly) ---

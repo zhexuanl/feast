@@ -46,6 +46,8 @@ from feast.infra.compute_engines.risingwave.names import (
     tiles_name,
 )
 from feast.infra.compute_engines.risingwave.iceberg_source import (
+    is_passthrough_stream,
+    is_passthrough_view,
     is_streaming_tile,
     is_tile_fv,
     is_tile_view,
@@ -54,6 +56,7 @@ from feast.infra.compute_engines.risingwave.iceberg_source import (
 )
 from feast.infra.compute_engines.risingwave.nodes import (
     build_batch_tile_select,
+    build_latest_row_select,
     build_online_rollup_select,
     build_streaming_tile_select,
     build_windowed_agg_select,
@@ -84,6 +87,27 @@ _RW_TYPE = {
     "Bytes": "BYTEA",
     "UnixTimestamp": "TIMESTAMP",
 }
+
+# RisingWave CREATE-clause type -> the canonical name RisingWave reports in information_schema.columns
+# (verified live on v3.0.0). Used to compare a deployed source's column types against the desired schema,
+# since the catalog reports canonical names ("double precision", "character varying") rather than the
+# CREATE-clause form ("DOUBLE PRECISION", "VARCHAR").
+_RW_CANONICAL_TYPE = {
+    "BIGINT": "bigint",
+    "INT": "integer",
+    "DOUBLE PRECISION": "double precision",
+    "REAL": "real",
+    "VARCHAR": "character varying",
+    "BOOLEAN": "boolean",
+    "BYTEA": "bytea",
+    "TIMESTAMP": "timestamp without time zone",
+}
+
+
+def _canonical_type(dtype) -> str:
+    # The canonical information_schema type for a Feast dtype, defaulting to VARCHAR's canonical form for an
+    # unmapped dtype (matching _passthrough_source_ddl's VARCHAR fallback).
+    return _RW_CANONICAL_TYPE.get(_RW_TYPE.get(str(dtype), "VARCHAR"), "character varying")
 
 
 class RisingWaveComputeEngineConfig(FeastConfigBaseModel):
@@ -154,6 +178,21 @@ def _batch_column_info(view) -> ColumnInfo:
     )
 
 
+def _passthrough_column_info(view) -> ColumnInfo:
+    # Column info for a passthrough view's latest-row MV: feature_cols are the RAW feature columns (carried
+    # through unchanged, not resolved aggregation names). The source is the Kafka stream for a streaming
+    # passthrough, the Iceberg batch source otherwise. created_ts is carried when the source declares it, so
+    # the latest-row MV breaks same-event-timestamp ties the way the offline read does.
+    source = view.stream_source if is_passthrough_stream(view) else view.batch_source
+    return ColumnInfo(
+        join_keys=[f.name for f in view.entity_columns],
+        feature_cols=[f.name for f in view.features],
+        ts_col=source.timestamp_field,
+        created_ts_col=getattr(source, "created_timestamp_column", None) or None,
+        field_mapping=None,
+    )
+
+
 def _sql_str(value: str) -> str:
     # Escape a value going into a single-quoted SQL string literal / connector option. Mirrors
     # Feast's snowflake.py _escape_snowflake_sql_string and RW's own option-quoting rules.
@@ -206,6 +245,17 @@ def _source_is_retractable(source) -> bool:
     return False
 
 
+def _kafka_source_with(source: KafkaSource) -> str:
+    # The Kafka connector WITH clause + encoding shared by every Kafka CREATE SOURCE (aggregation and
+    # passthrough). Only JSON encoding is supported for now; non-JSON formats are not yet implemented.
+    return (
+        "WITH (connector='kafka', "
+        f"properties.bootstrap.server='{_sql_str(source.kafka_options.kafka_bootstrap_servers)}', "
+        f"topic='{_sql_str(source.kafka_options.topic)}', scan.startup.mode='earliest') "
+        "FORMAT PLAIN ENCODE JSON"
+    )
+
+
 def _source_ddl(name: str, source: KafkaSource, view) -> str:
     # Placeholder typing: raw aggregation-input columns are not in view.features, and
     # their types are not carried on the FeatureView, so we emit placeholder types.
@@ -230,10 +280,32 @@ def _source_ddl(name: str, source: KafkaSource, view) -> str:
 
     return (
         f'CREATE SOURCE IF NOT EXISTS "{name}" ({", ".join(cols)}{watermark}) '
-        "WITH (connector='kafka', "
-        f"properties.bootstrap.server='{_sql_str(source.kafka_options.kafka_bootstrap_servers)}', "
-        f"topic='{_sql_str(source.kafka_options.topic)}', scan.startup.mode='earliest') "
-        "FORMAT PLAIN ENCODE JSON"  # only JSON encoding is supported for now; non-JSON formats not yet implemented
+        + _kafka_source_with(source)
+    )
+
+
+def _passthrough_source_ddl(name: str, source: KafkaSource, view) -> str:
+    # The Kafka CREATE SOURCE for a passthrough (non-aggregated) stream view: the column list is the entity
+    # keys + the RAW feature columns (typed from the declared schema, not a placeholder — a passthrough
+    # column IS a source column) + the event timestamp (+ the created timestamp when the source defines one,
+    # so the latest-row MV can break same-timestamp ties the way the offline read does). No watermark: the
+    # latest-row MV is a Group-TopN over an append-only source, which needs no window/watermark.
+    cols: List[str] = []
+    seen = set()
+    for field in view.entity_columns:
+        cols.append(f'"{field.name}" {_RW_TYPE.get(str(getattr(field, "dtype", "")), "VARCHAR")}')
+        seen.add(field.name)
+    for feature in view.features:
+        if feature.name not in seen:
+            cols.append(f'"{feature.name}" {_RW_TYPE.get(str(getattr(feature, "dtype", "")), "VARCHAR")}')
+            seen.add(feature.name)
+    for ts in (source.timestamp_field, getattr(source, "created_timestamp_column", None)):
+        if ts and ts not in seen:
+            cols.append(f'"{ts}" TIMESTAMP')
+            seen.add(ts)
+    return (
+        f'CREATE SOURCE IF NOT EXISTS "{name}" ({", ".join(cols)}) '
+        + _kafka_source_with(source)
     )
 
 
@@ -272,6 +344,19 @@ def _iceberg_sink_ddl(
 
 
 def _drop_ddl(project: str, view) -> List[str]:
+    return [
+        f'DROP SINK IF EXISTS "{offline_sink_name(project, view.name)}"',
+        f'DROP MATERIALIZED VIEW IF EXISTS "{online_mv_name(project, view.name)}"',
+        f'DROP SOURCE IF EXISTS "{source_name(project, view.name)}"',
+    ]
+
+
+def _passthrough_drop_ddl(project: str, view) -> List[str]:
+    # Teardown for a passthrough view, dependents first: the online MV name is shared with the plain-stream
+    # shape, which also provisions a "{base}_offline" Iceberg sink reading that MV. So a view re-applied
+    # from an aggregating stream to a passthrough would leave that sink behind — and since the sink depends
+    # on the MV, the un-CASCADEd MV drop would fail. Drop the sink first (a no-op for a passthrough view
+    # that never had one), then the latest-row MV, then the source.
     return [
         f'DROP SINK IF EXISTS "{offline_sink_name(project, view.name)}"',
         f'DROP MATERIALIZED VIEW IF EXISTS "{online_mv_name(project, view.name)}"',
@@ -397,6 +482,36 @@ def _desired_kafka_source_opts(source: KafkaSource) -> tuple:
     )
 
 
+def _deployed_source_columns(cur, name: str) -> Optional[dict]:
+    """The ``{column: canonical SQL type}`` map of a deployed source as RisingWave reports it in
+    information_schema, or None if the source does not exist. A passthrough Kafka source declares its raw
+    feature columns with explicit types; a feature dtype change (same column name) shows in NO MV SELECT (the
+    latest-row MV projects columns by name only), so it is read back here to detect that the source schema
+    changed. information_schema reports canonical type names, so it is compared against ``_canonical_type``
+    rather than the re-rendered CREATE SOURCE form."""
+    cur.execute(
+        "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = %s", (name,)
+    )
+    rows = cur.fetchall()
+    return {name: dtype for name, dtype in rows} if rows else None
+
+
+def _desired_passthrough_columns(view) -> dict:
+    """The desired ``{column: canonical SQL type}`` a passthrough Kafka source declares — entity keys + raw
+    feature columns + the event (and created) timestamp — in the same canonical form
+    ``_deployed_source_columns`` reads back, so a feature dtype change is detected on reconcile."""
+    source = view.stream_source
+    cols: dict = {}
+    for field in view.entity_columns:
+        cols[field.name] = _canonical_type(getattr(field, "dtype", ""))
+    for feature in view.features:
+        cols.setdefault(feature.name, _canonical_type(getattr(feature, "dtype", "")))
+    for ts in (source.timestamp_field, getattr(source, "created_timestamp_column", None)):
+        if ts:
+            cols.setdefault(ts, "timestamp without time zone")
+    return cols
+
+
 def _norm_sql(sql):
     """Whitespace-normalize a SELECT for definition comparison (RW stores our SELECT verbatim modulo
     whitespace). None stays None so a missing deployed object never compares equal to a desired one."""
@@ -479,6 +594,9 @@ class RisingWaveComputeEngine(ComputeEngine):
                 if is_streaming_tile(view):
                     for stmt in _batch_drop_ddl(project, view):
                         cur.execute(stmt)
+                elif is_passthrough_view(view):
+                    for stmt in _passthrough_drop_ddl(project, view):
+                        cur.execute(stmt)
                 elif isinstance(view, StreamFeatureView):
                     for stmt in _drop_ddl(project, view):
                         cur.execute(stmt)
@@ -486,11 +604,15 @@ class RisingWaveComputeEngine(ComputeEngine):
                     for stmt in _batch_drop_ddl(project, view):
                         cur.execute(stmt)
             for view in views_to_keep:
-                # is_streaming_tile FIRST (it is also a StreamFeatureView): reconcile the tile graph to
-                # its current definition (re-materialize on a change, no-op when unchanged), the same
-                # verbatim-catalog comparison the batch tile path uses.
+                # Precedence is load-bearing: a streaming-tile AND a streaming-passthrough view are both
+                # StreamFeatureViews, so is_streaming_tile and is_passthrough_view must be checked BEFORE the
+                # generic StreamFeatureView branch — else a passthrough (no-aggregation) view would hit the
+                # windowed-agg path, which rejects an empty aggregation set. is_passthrough_view also precedes
+                # is_tile_fv, but the two are mutually exclusive (a tile view has aggregations).
                 if is_streaming_tile(view):
                     self._reconcile_streaming_tile_view(cur, project, view)
+                elif is_passthrough_view(view):
+                    self._reconcile_passthrough_view(cur, project, view)
                 elif isinstance(view, StreamFeatureView):
                     self._reconcile_stream_view(cur, project, view)
                 elif is_tile_fv(view):
@@ -507,6 +629,9 @@ class RisingWaveComputeEngine(ComputeEngine):
                 # is_streaming_tile FIRST (it is also a StreamFeatureView): tear down the tile graph.
                 if is_streaming_tile(view):
                     for stmt in _batch_drop_ddl(project, view):
+                        cur.execute(stmt)
+                elif is_passthrough_view(view):
+                    for stmt in _passthrough_drop_ddl(project, view):
                         cur.execute(stmt)
                 elif isinstance(view, StreamFeatureView):
                     for stmt in _drop_ddl(project, view):
@@ -599,6 +724,80 @@ class RisingWaveComputeEngine(ComputeEngine):
             for stmt in _drop_ddl(project, view):
                 cur.execute(stmt)
             for stmt in self._provision_ddl(project, view):
+                cur.execute(stmt)
+
+    def _passthrough_mv_select(self, project: str, view) -> str:
+        """The latest-row SELECT for a passthrough view's online MV — the ONE definition shared by
+        provisioning and reconcile so the two cannot drift."""
+        return build_latest_row_select(
+            _passthrough_column_info(view), source_name(project, view.name)
+        )
+
+    def _provision_passthrough_ddl(self, project: str, view) -> List[str]:
+        """Registry-free DDL for one passthrough (non-aggregated) feature view: a source + ONE latest-row
+        online MV (the newest row per entity, served by the same point-lookup as an aggregation MV). A
+        streaming passthrough reads a Kafka source that declares the raw feature columns; a batch passthrough
+        reads an Iceberg source that infers them. No window/tile and no watermark: the latest-row MV is a
+        Group-TopN over an append-only source. Offline training reads the raw history with an as-of cut, not
+        this MV, so the online path provisions no Iceberg sink."""
+        src = source_name(project, view.name)
+        mv = online_mv_name(project, view.name)
+        if is_passthrough_stream(view):
+            source = view.stream_source
+            if isinstance(source, PushSource):
+                raise ValueError(
+                    f"passthrough StreamFeatureView '{view.name}' uses a PushSource, which is too thin to "
+                    "compile to a RisingWave CREATE SOURCE. Use a KafkaSource."
+                )
+            if not isinstance(source, KafkaSource):
+                raise ValueError(
+                    "RisingWaveComputeEngine requires a KafkaSource-backed passthrough stream view; "
+                    f"'{view.name}' has {type(source).__name__}."
+                )
+            source_ddl = _passthrough_source_ddl(src, source, view)
+        else:
+            source_ddl = _iceberg_source_ddl(src, view.batch_source.table, self.config)
+        return [source_ddl, _materialized_view_ddl(mv, self._passthrough_mv_select(project, view))]
+
+    def _reconcile_passthrough_view(self, cur, project: str, view) -> None:
+        """Reconcile a KEPT passthrough view to its current definition (re-materialize on a change; no-op
+        when unchanged) — the passthrough analogue of ``_reconcile_stream_view``. ``CREATE ... IF NOT
+        EXISTS`` would keep the old latest-row MV, so a changed feature set would silently serve the OLD
+        definition; compare the MV's deployed SELECT (RW catalog, stored verbatim) against the desired one
+        and, on a change, drop the MV + source and re-provision.
+
+        A repointed source (a Kafka topic/bootstrap/watermark change, or an Iceberg-table repoint) lives only
+        in the CREATE SOURCE definition, not in the MV SELECT, so it is read back from the source catalog and
+        triggers the same drop+reprovision — else the MV keeps reading the stale source."""
+        mv = online_mv_name(project, view.name)
+        src = source_name(project, view.name)
+        desired = self._passthrough_mv_select(project, view)
+        mv_changed = _norm_sql(_deployed_mv_select(cur, mv)) != _norm_sql(desired)
+        if is_passthrough_stream(view):
+            # (topic, bootstrap): a passthrough source carries NO watermark (the latest-row MV is a
+            # Group-TopN, not an EOWC window), so the watermark slot is not part of its identity.
+            deployed_opts = _deployed_kafka_source_opts(cur, src)
+            opts_changed = (
+                deployed_opts is not None
+                and deployed_opts[:2] != _desired_kafka_source_opts(view.stream_source)[:2]
+            )
+            # Column schema: a passthrough Kafka source declares the raw feature columns with explicit types,
+            # so a feature dtype change (same name) must rebuild the source — it shows in no MV SELECT.
+            deployed_cols = _deployed_source_columns(cur, src)
+            schema_changed = deployed_cols is not None and any(
+                deployed_cols.get(name) != dtype
+                for name, dtype in _desired_passthrough_columns(view).items()
+            )
+            source_changed = opts_changed or schema_changed
+        else:
+            # A batch passthrough reads an Iceberg source that INFERS its schema, so a feature dtype change
+            # needs no source rebuild; only a table repoint (read from the source catalog) does.
+            deployed_table = _deployed_source_table(cur, src)
+            source_changed = deployed_table is not None and deployed_table != view.batch_source.table
+        if mv_changed or source_changed:
+            for stmt in _passthrough_drop_ddl(project, view):
+                cur.execute(stmt)
+            for stmt in self._provision_passthrough_ddl(project, view):
                 cur.execute(stmt)
 
     def _provision_batch_ddl(self, project: str, view) -> List[str]:

@@ -229,3 +229,38 @@ def tile_interval(view) -> timedelta:
     if is_streaming_tile(view):
         return view.tiling_hop_size
     return view.batch_source.aggregation_interval
+
+
+# --- passthrough-view detection (raw columns, no aggregation — the latest row per entity) ---
+
+
+def is_passthrough_fv(view) -> bool:
+    """A BATCH passthrough feature view: a (plain) feature view whose ``batch_source`` is an ``IcebergSource``
+    with feature columns but NO tile aggregation spec — its features are raw columns carried through
+    unchanged and served as the latest row per entity (no aggregation). Mirrors ``is_tile_fv`` for the
+    no-aggregation case; the two are mutually exclusive (a tile view requires aggregations)."""
+    src = getattr(view, "batch_source", None)
+    return (
+        isinstance(src, IcebergSource)
+        and not src.aggregations
+        and bool(getattr(view, "features", None))
+    )
+
+
+def is_passthrough_stream(view) -> bool:
+    """A STREAMING passthrough feature view: a stream (Kafka-sourced) view with feature columns but NO
+    aggregations — its features are raw columns served as the latest row per entity. A streaming
+    aggregation or streaming tile view has aggregations, so it is naturally excluded."""
+    return (
+        getattr(view, "stream_source", None) is not None
+        and bool(getattr(view, "features", None))
+        and not view_aggregations(view)
+    )
+
+
+def is_passthrough_view(view) -> bool:
+    """A passthrough feature view of EITHER flavor — raw feature columns served as the latest row per entity
+    (no aggregation), batch (Iceberg-sourced, ``is_passthrough_fv``) or streaming (Kafka-sourced,
+    ``is_passthrough_stream``). Both provision one latest-row materialized view served by the same
+    point-lookup as an aggregation view, differing only in the source (Iceberg vs Kafka)."""
+    return is_passthrough_fv(view) or is_passthrough_stream(view)
