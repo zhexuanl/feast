@@ -202,6 +202,19 @@ def view_aggregations(view) -> List[Aggregation]:
     return list(getattr(view, "aggregations", None) or [])
 
 
+def is_streaming_tile(view) -> bool:
+    """A STREAMING tile feature view: a ``StreamFeatureView`` with Feast's NATIVE ``enable_tiling`` set and
+    aggregations. We REUSE Feast's own ``StreamFeatureView.enable_tiling`` / ``tiling_hop_size`` (both
+    round-trip through the registry — verified) rather than inventing a carrier, so this one check works at
+    every altitude. The tiles are materialized by an EOWC TUMBLE at ``tiling_hop_size``; everything
+    downstream is the shared per-window rollup. Mutually exclusive with ``is_tile_fv`` (a stream view has
+    no IcebergSource batch source)."""
+    return bool(getattr(view, "enable_tiling", False)) and bool(getattr(view, "aggregations", None))
+
+
 def tile_interval(view) -> timedelta:
-    """The aggregation_interval (tile size) for a tile view — carried, typed, on its IcebergSource."""
+    """The aggregation_interval (tile size) for a tile view. A BATCH tile view carries it on its
+    ``IcebergSource``; a STREAMING tile view carries it on Feast's native ``StreamFeatureView.tiling_hop_size``."""
+    if is_streaming_tile(view):
+        return view.tiling_hop_size
     return view.batch_source.aggregation_interval
