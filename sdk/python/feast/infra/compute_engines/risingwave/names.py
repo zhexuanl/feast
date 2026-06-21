@@ -25,7 +25,7 @@ def online_mv_name(project: str, view_name: str) -> str:
 
 def online_window_mv_name(project: str, view_name: str, window_secs: int) -> str:
     # Per-window online rollup MV for a tile BATCH feature view. A tile FV reuses ONE tile set across
-    # many time-windows (established feature stores), but RisingWave rejects now() inside a CASE in a two-sided
+    # many time-windows, but RisingWave rejects now() inside a CASE in a two-sided
     # temporal-filter MV, so each distinct window gets its OWN now()-anchored rollup MV. The point-lookup
     # reads the per-window MV holding the requested feature's window. The engine (provisioning) and apply
     # (serving spec) derive this name from the SAME group_aggregations_by_window split, so they cannot

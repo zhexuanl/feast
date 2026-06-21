@@ -262,7 +262,7 @@ def test_approx_count_distinct_emits_native_sql_and_is_monoid():
         )
 
 
-# --- Batch tile aggregation (established feature stores tile model: partial aggregates + retrieval rollup) ---
+# --- Batch tile aggregation (tile model: partial aggregates + retrieval rollup) ---
 # Validated end-to-end live on RW v3.0.0: spike/sql/05c_batch_tiles.sql.
 
 
@@ -490,7 +490,7 @@ def test_offline_tile_pit_rejects_non_additive(function):
 
 
 def test_offline_tile_pit_does_not_apply_ttl_only_the_window_bounds():
-    # For an aggregation FV the time_window IS the lookback bound (Chronon); ttl is NOT a
+    # For an aggregation FV the time_window IS the lookback bound (windowed-aggregation semantics); ttl is NOT a
     # second bound. Pin it: exactly one tile_end lower bound (the window), no extra ttl filter.
     sql = build_offline_tile_pit_query(
         "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
@@ -505,7 +505,7 @@ def test_offline_tile_pit_does_not_apply_ttl_only_the_window_bounds():
     assert "ttl" not in sql.lower()
 
 
-# --- Multi-window from ONE tile set (Established feature stores: tiles reused across time-windows) ---
+# --- Multi-window from ONE tile set (tiles reused across time-windows) ---
 
 
 def test_batch_tile_partials_are_window_independent_and_deduped():

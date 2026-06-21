@@ -188,7 +188,7 @@ def build_windowed_agg_select(
     return select
 
 
-# --- Batch tile aggregation (established feature stores' aggregation engine, tile model) ---------------------
+# --- Batch tile aggregation (partial-aggregate tile model) --------------------------------
 # A BATCH feature view materializes PARTIAL aggregates at the aggregation_interval (tiles), then
 # rolls them up to the requested window AT RETRIEVAL, anchored to the request/label time. This is
 # distinct from the streaming TUMBLE path above: tiles are a plain batch GROUP BY over a batch
@@ -196,7 +196,7 @@ def build_windowed_agg_select(
 # request time. Verified end-to-end live on RW v3.0.0: spike/sql/05c_batch_tiles.sql.
 
 # The tile model materializes per-(entity, tile) PARTIALS that recombine additively across the tiles
-# in a window. WINDOW-INDEPENDENT (Established feature stores: one tile set reused across every time-window): a partial is
+# in a window. WINDOW-INDEPENDENT (one tile set reused across every time-window): a partial is
 # keyed by (function-family, column), NOT by window — ``sum_amount``, ``count_amount``, ``min_amount``,
 # ``max_amount``, ``sumsq_amount``. So a ``sum(amount)`` over 3d and another over 30d SHARE the one
 # ``sum_amount`` tile partial, and ``mean(amount)`` reuses the same ``sum_amount`` + ``count_amount``.
@@ -373,7 +373,7 @@ def _validate_windows(aggregations: List[Aggregation], aggregation_interval) -> 
     """Multi-window precondition for the offline PIT builder: tile-supported aggs only, distinct output
     names, and EVERY aggregation's (non-null) window a whole multiple of the interval. Returns the
     DISTINCT window seconds ascending. The aggregations may carry different windows over the ONE shared
-    tile set (Established feature stores: tiles reused across time-windows), so unlike ``_validate_window_rollup`` this does
+    tile set (tiles reused across time-windows), so unlike ``_validate_window_rollup`` this does
     NOT require a single window."""
     _assert_tile_supported(aggregations)
     _assert_distinct_output_names(aggregations)
@@ -462,8 +462,8 @@ def build_tile_rollup_select(
     aggregation_interval,
     as_of_sql: str,
 ) -> str:
-    """Roll up tiles to the requested window, ANCHORED TO THE REQUEST/LABEL time (established feature stores'
-    request-anchored sliding window over a fixed tile set). Recombine each aggregation's per-tile
+    """Roll up tiles to the requested window, ANCHORED TO THE REQUEST/LABEL time (a request-anchored
+    sliding window over a fixed tile set). Recombine each aggregation's per-tile
     partial with its rollup combiner (sum/min/max). The window is ``(end - time_window, end]`` where
     ``end = date_trunc(aggregation_interval, as_of)`` = the most-recent aggregation_interval boundary
     at or before the request/label time. ``as_of_sql`` is a SQL expression: a bind placeholder for
@@ -536,13 +536,13 @@ def build_offline_tile_pit_query(
     range-JOIN the inlined entity rows to the tiles and GROUP BY the entity row. LEFT JOIN so a row
     with no tiles in range still appears (NULL feature).
 
-    MULTI-WINDOW: the aggregations may carry DIFFERENT windows over the ONE shared tile set (Established feature stores:
-    tiles reused across time-windows). The join reads tiles up to the MAX window once; each aggregation
+    MULTI-WINDOW: the aggregations may carry DIFFERENT windows over the ONE shared tile set (tiles
+    reused across time-windows). The join reads tiles up to the MAX window once; each aggregation
     recombines only the tiles inside ITS window via a per-agg ``CASE`` on ``tile_end`` — all windows in
     one query, one pass over the tiles.
 
     TTL note: the feature view's ``ttl`` is intentionally NOT applied as a second lower bound. For an
-    aggregation feature view the ``time_window`` IS the lookback bound (Chronon semantics); a
+    aggregation feature view the ``time_window`` IS the lookback bound (windowed-aggregation semantics); a
     ttl shorter than the window would silently shrink the aggregation below what the user requested, and
     a longer ttl is a no-op. So the window is the single, authoritative bound."""
     if not aggregations:

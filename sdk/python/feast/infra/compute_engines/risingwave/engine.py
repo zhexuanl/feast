@@ -359,7 +359,7 @@ def _plan_batch_reconcile(
     tiles MV is unchanged (its partials are WINDOW-INDEPENDENT, so adding/removing a window does NOT touch
     it) and only the per-window online MVs are reconciled — drop windows that were removed or whose rollup
     definition changed, create windows that are new or redefined, and leave unchanged windows (and their
-    serving) untouched. established feature stores recreates on a materialization-affecting change; an unchanged view is a
+    serving) untouched. A materialization-affecting change re-materializes; an unchanged view is a
     no-op (no rebuild, no serving blip)."""
 
     def norm(sql):
@@ -493,7 +493,7 @@ class RisingWaveComputeEngine(ComputeEngine):
         TILES MV (``build_batch_tile_select`` — per-(entity, tile_end) partials over window-independent
         partials), and ONE ONLINE ROLLUP MV PER DISTINCT WINDOW (``build_online_rollup_select`` — the
         request-anchored ``now()`` window rollup, one row per entity). One tile set is reused across all
-        windows (established feature stores); each window gets its own now()-anchored MV because RisingWave rejects now()
+        windows; each window gets its own now()-anchored MV because RisingWave rejects now()
         inside a CASE in a two-sided temporal-filter MV. RisingWave maintains every MV incrementally as
         the Iceberg table grows (verified live), so there is no scheduler. The point-lookup reads the
         per-window MV (``online_window_mv_name``) holding the requested feature's window — the tiles MV
@@ -520,8 +520,8 @@ class RisingWaveComputeEngine(ComputeEngine):
         return ddl
 
     def _reconcile_batch_view(self, cur, project: str, view) -> None:
-        """Reconcile a KEPT tile view's physical objects to its CURRENT definition (established feature stores 'Recreate' on
-        a materialization-affecting change; a no-op when unchanged). Feast routes a same-name edited view
+        """Reconcile a KEPT tile view's physical objects to its CURRENT definition (re-materialize on a
+        materialization-affecting change; a no-op when unchanged). Feast routes a same-name edited view
         to views_to_keep without telling the engine what changed, and ``CREATE ... IF NOT EXISTS`` would
         silently keep the old MVs — so serving would diverge from the applied definition. RisingWave has
         no CREATE OR REPLACE, so we compare each object's desired definition against the one RW stores
