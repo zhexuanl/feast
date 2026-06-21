@@ -1579,6 +1579,23 @@ def test_reconcile_passthrough_batch_reprovisions_on_table_repoint():
     assert any(s.startswith("CREATE SOURCE") for s in cur.executed)
 
 
+def test_offline_get_historical_features_rejects_passthrough_clearly():
+    # A passthrough view's offline point-in-time read (an as-of cut over raw history) is not yet
+    # implemented, so get_historical_features must fail CLEARLY — not silently read the inert placeholder
+    # offline source (returning no feature values) nor assert on a non-PostgreSQL (Iceberg) batch source.
+    # The guard fires before any DB access (config/registry are unused before the raise).
+    view = _passthrough_stream_view(_kafka_source(watermark=False))
+    with pytest.raises(NotImplementedError, match="passthrough"):
+        RisingWaveOfflineStore.get_historical_features(
+            config=None,
+            feature_views=[view],
+            feature_refs=[],
+            entity_df=None,
+            registry=None,
+            project="proj",
+        )
+
+
 # --- offline materialize routing: tile views no-op (offline reads the live tiles MV directly) ---
 
 

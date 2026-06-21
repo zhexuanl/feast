@@ -20,6 +20,7 @@ import pandas as pd
 from feast.feature_view import FeatureView
 from feast.infra.compute_engines.dag.context import ColumnInfo
 from feast.infra.compute_engines.risingwave.iceberg_source import (
+    is_passthrough_view,
     is_tile_view,
     tile_interval,
     view_aggregations,
@@ -105,6 +106,19 @@ class RisingWaveOfflineStore(PostgreSQLOfflineStore):
             return _tile_historical_features(
                 config, feature_views, tile_fvs, feature_refs, entity_df,
                 registry, project, full_feature_names,
+            )
+        passthrough_fvs = [fv for fv in feature_views if is_passthrough_view(fv)]
+        if passthrough_fvs:
+            # A passthrough view's point-in-time read is an as-of cut over its RAW history (the batch
+            # source), not over the latest-row online MV — a Group-TopN that holds only the current row per
+            # entity, so it cannot answer a past label timestamp. That read is not yet implemented, so fail
+            # clearly here instead of delegating to the Postgres parent, which would silently read the inert
+            # placeholder offline source (returning no feature values) or assert on a non-PostgreSQL
+            # (Iceberg) batch source.
+            raise NotImplementedError(
+                "Offline point-in-time retrieval for a passthrough (Attribute) feature view "
+                f"{[fv.name for fv in passthrough_fvs]} is not yet implemented in the RisingWave offline "
+                "store; serve it online, or train from an aggregating / tile feature view."
             )
         # Inline a DataFrame entity_df as SQL so the parent uses its embed_query/CTE
         # path (no temp-table upload). RisingWave INSERTs are async, so an uploaded
