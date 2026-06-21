@@ -42,10 +42,12 @@ from feast.infra.compute_engines.risingwave.names import (
     offline_sink_name,
     online_mv_name,
     online_window_mv_name,
+    passthrough_history_source_name,
     source_name,
     tiles_name,
 )
 from feast.infra.compute_engines.risingwave.iceberg_source import (
+    IcebergSource,
     is_passthrough_stream,
     is_passthrough_view,
     is_streaming_tile,
@@ -181,14 +183,16 @@ def _batch_column_info(view) -> ColumnInfo:
 def _passthrough_column_info(view) -> ColumnInfo:
     # Column info for a passthrough view's latest-row MV: feature_cols are the RAW feature columns (carried
     # through unchanged, not resolved aggregation names). The source is the Kafka stream for a streaming
-    # passthrough, the Iceberg batch source otherwise. created_ts is carried when the source declares it, so
-    # the latest-row MV breaks same-event-timestamp ties the way the offline read does.
+    # passthrough, the Iceberg batch source otherwise. created_ts is intentionally NOT used: the offline
+    # as-of read is over an Iceberg history (a streaming passthrough's batch_source, or a batch
+    # passthrough's own source) and IcebergSource carries no created_timestamp_column, so to keep online ==
+    # offline both sides order by event time alone (latest-value-by-timestamp, the established feature stores attribute model).
     source = view.stream_source if is_passthrough_stream(view) else view.batch_source
     return ColumnInfo(
         join_keys=[f.name for f in view.entity_columns],
         feature_cols=[f.name for f in view.features],
         ts_col=source.timestamp_field,
-        created_ts_col=getattr(source, "created_timestamp_column", None) or None,
+        created_ts_col=None,
         field_mapping=None,
     )
 
@@ -287,9 +291,9 @@ def _source_ddl(name: str, source: KafkaSource, view) -> str:
 def _passthrough_source_ddl(name: str, source: KafkaSource, view) -> str:
     # The Kafka CREATE SOURCE for a passthrough (non-aggregated) stream view: the column list is the entity
     # keys + the RAW feature columns (typed from the declared schema, not a placeholder — a passthrough
-    # column IS a source column) + the event timestamp (+ the created timestamp when the source defines one,
-    # so the latest-row MV can break same-timestamp ties the way the offline read does). No watermark: the
-    # latest-row MV is a Group-TopN over an append-only source, which needs no window/watermark.
+    # column IS a source column) + the event timestamp. No watermark: the latest-row MV is a Group-TopN over
+    # an append-only source, which needs no window/watermark. No created-timestamp column: a passthrough
+    # orders by event time alone (see _passthrough_column_info).
     cols: List[str] = []
     seen = set()
     for field in view.entity_columns:
@@ -299,10 +303,8 @@ def _passthrough_source_ddl(name: str, source: KafkaSource, view) -> str:
         if feature.name not in seen:
             cols.append(f'"{feature.name}" {_RW_TYPE.get(str(getattr(feature, "dtype", "")), "VARCHAR")}')
             seen.add(feature.name)
-    for ts in (source.timestamp_field, getattr(source, "created_timestamp_column", None)):
-        if ts and ts not in seen:
-            cols.append(f'"{ts}" TIMESTAMP')
-            seen.add(ts)
+    if source.timestamp_field not in seen:
+        cols.append(f'"{source.timestamp_field}" TIMESTAMP')
     return (
         f'CREATE SOURCE IF NOT EXISTS "{name}" ({", ".join(cols)}) '
         + _kafka_source_with(source)
@@ -361,6 +363,9 @@ def _passthrough_drop_ddl(project: str, view) -> List[str]:
         f'DROP SINK IF EXISTS "{offline_sink_name(project, view.name)}"',
         f'DROP MATERIALIZED VIEW IF EXISTS "{online_mv_name(project, view.name)}"',
         f'DROP SOURCE IF EXISTS "{source_name(project, view.name)}"',
+        # The offline-history Iceberg source exists only for a streaming passthrough; IF EXISTS makes this
+        # a no-op for a batch passthrough (whose online source IS the history) or an online-only stream.
+        f'DROP SOURCE IF EXISTS "{passthrough_history_source_name(project, view.name)}"',
     ]
 
 
@@ -498,17 +503,15 @@ def _deployed_source_columns(cur, name: str) -> Optional[dict]:
 
 def _desired_passthrough_columns(view) -> dict:
     """The desired ``{column: canonical SQL type}`` a passthrough Kafka source declares — entity keys + raw
-    feature columns + the event (and created) timestamp — in the same canonical form
-    ``_deployed_source_columns`` reads back, so a feature dtype change is detected on reconcile."""
+    feature columns + the event timestamp — in the same canonical form ``_deployed_source_columns`` reads
+    back, so a feature dtype change is detected on reconcile."""
     source = view.stream_source
     cols: dict = {}
     for field in view.entity_columns:
         cols[field.name] = _canonical_type(getattr(field, "dtype", ""))
     for feature in view.features:
         cols.setdefault(feature.name, _canonical_type(getattr(feature, "dtype", "")))
-    for ts in (source.timestamp_field, getattr(source, "created_timestamp_column", None)):
-        if ts:
-            cols.setdefault(ts, "timestamp without time zone")
+    cols.setdefault(source.timestamp_field, "timestamp without time zone")
     return cols
 
 
@@ -738,8 +741,13 @@ class RisingWaveComputeEngine(ComputeEngine):
         online MV (the newest row per entity, served by the same point-lookup as an aggregation MV). A
         streaming passthrough reads a Kafka source that declares the raw feature columns; a batch passthrough
         reads an Iceberg source that infers them. No window/tile and no watermark: the latest-row MV is a
-        Group-TopN over an append-only source. Offline training reads the raw history with an as-of cut, not
-        this MV, so the online path provisions no Iceberg sink."""
+        Group-TopN over an append-only source. No Iceberg sink.
+
+        Offline training reads the RAW history with an as-of cut, not this MV. A batch passthrough's own
+        Iceberg source IS that history. A streaming passthrough's Kafka stream is not queryable as history,
+        so when its stream source declares an Iceberg batch_source (the historical log backing the stream)
+        we ALSO provision an Iceberg source over it for the offline read; absent one, the view is
+        online-only and offline retrieval is refused."""
         src = source_name(project, view.name)
         mv = online_mv_name(project, view.name)
         if is_passthrough_stream(view):
@@ -754,9 +762,19 @@ class RisingWaveComputeEngine(ComputeEngine):
                     "RisingWaveComputeEngine requires a KafkaSource-backed passthrough stream view; "
                     f"'{view.name}' has {type(source).__name__}."
                 )
-            source_ddl = _passthrough_source_ddl(src, source, view)
-        else:
-            source_ddl = _iceberg_source_ddl(src, view.batch_source.table, self.config)
+            ddl = [
+                _passthrough_source_ddl(src, source, view),
+                _materialized_view_ddl(mv, self._passthrough_mv_select(project, view)),
+            ]
+            history = getattr(source, "batch_source", None)
+            if isinstance(history, IcebergSource):
+                ddl.append(
+                    _iceberg_source_ddl(
+                        passthrough_history_source_name(project, view.name), history.table, self.config
+                    )
+                )
+            return ddl
+        source_ddl = _iceberg_source_ddl(src, view.batch_source.table, self.config)
         return [source_ddl, _materialized_view_ddl(mv, self._passthrough_mv_select(project, view))]
 
     def _reconcile_passthrough_view(self, cur, project: str, view) -> None:
@@ -788,7 +806,17 @@ class RisingWaveComputeEngine(ComputeEngine):
                 deployed_cols.get(name) != dtype
                 for name, dtype in _desired_passthrough_columns(view).items()
             )
-            source_changed = opts_changed or schema_changed
+            # The offline-history Iceberg source must exist and point at the stream's batch_source table:
+            # rebuild if it is MISSING (an Iceberg batch_source added to a previously online-only view) or
+            # REPOINTED (a different table) — neither shows in the MV SELECT or the Kafka opts.
+            history = getattr(view.stream_source, "batch_source", None)
+            history_changed = False
+            if isinstance(history, IcebergSource):
+                deployed_history = _deployed_source_table(
+                    cur, passthrough_history_source_name(project, view.name)
+                )
+                history_changed = deployed_history is None or deployed_history != history.table
+            source_changed = opts_changed or schema_changed or history_changed
         else:
             # A batch passthrough reads an Iceberg source that INFERS its schema, so a feature dtype change
             # needs no source rebuild; only a table repoint (read from the source catalog) does.

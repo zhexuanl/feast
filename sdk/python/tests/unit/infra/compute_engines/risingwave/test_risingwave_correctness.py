@@ -56,6 +56,7 @@ from feast.infra.compute_engines.risingwave.nodes import (
     build_latest_row_select,
     build_offline_tile_pit_query,
     build_online_rollup_select,
+    build_passthrough_pit_query,
     build_streaming_tile_select,
     build_tile_rollup_select,
     build_windowed_agg_select,
@@ -786,13 +787,14 @@ def test_provision_emits_source_mv_and_iceberg_sink():
 
 class _ReconcileCur:
     # Records executed DDL; answers the MV-definition lookup (rw_materialized_views) with deployed_def, the
-    # source lookup (rw_sources) with source_def, and the source column-schema lookup
-    # (information_schema.columns) with source_cols ([(name, data_type)]). None => the catalog row is absent.
-    def __init__(self, deployed_def, source_def=None, source_cols=None):
+    # source lookup (rw_sources) with source_def — or history_def for a "*_history" source name — and the
+    # source column-schema lookup (information_schema.columns) with source_cols. None => the row is absent.
+    def __init__(self, deployed_def, source_def=None, source_cols=None, history_def=None):
         self.executed = []
         self._deployed = deployed_def
         self._source_def = source_def
         self._source_cols = source_cols
+        self._history_def = history_def
         self._row = None
         self._cols_query = False
 
@@ -800,7 +802,11 @@ class _ReconcileCur:
         self.executed.append(sql)
         self._cols_query = "information_schema.columns" in sql
         if sql.startswith("SELECT definition"):
-            val = self._source_def if "rw_sources" in sql else self._deployed
+            if "rw_sources" in sql:
+                name = params[0] if params else ""
+                val = self._history_def if name.endswith("_history") else self._source_def
+            else:
+                val = self._deployed
             self._row = (val,) if val is not None else None
 
     def fetchone(self):
@@ -1495,6 +1501,7 @@ def test_passthrough_drop_ddl_drops_sink_mv_then_source():
         'DROP SINK IF EXISTS "proj_user_attr_offline"',
         'DROP MATERIALIZED VIEW IF EXISTS "proj_user_attr_online"',
         'DROP SOURCE IF EXISTS "proj_user_attr_src"',
+        'DROP SOURCE IF EXISTS "proj_user_attr_history"',  # the streaming offline-history Iceberg source
     ]
 
 
@@ -1524,7 +1531,8 @@ def test_reconcile_passthrough_reprovisions_on_mv_change():
     eng._reconcile_passthrough_view(cur, "proj", view)
     drops = [s for s in cur.executed if s.startswith("DROP")]
     creates = [s for s in cur.executed if s.startswith("CREATE")]
-    assert [s.split()[1] for s in drops] == ["SINK", "MATERIALIZED", "SOURCE"]  # dependents first
+    # sink, latest-row MV, online source, offline-history source (the last a no-op IF EXISTS)
+    assert [s.split()[1] for s in drops] == ["SINK", "MATERIALIZED", "SOURCE", "SOURCE"]
     assert [s.split()[1] for s in creates] == ["SOURCE", "MATERIALIZED"]  # source then MV
 
 
@@ -1579,21 +1587,108 @@ def test_reconcile_passthrough_batch_reprovisions_on_table_repoint():
     assert any(s.startswith("CREATE SOURCE") for s in cur.executed)
 
 
-def test_offline_get_historical_features_rejects_passthrough_clearly():
-    # A passthrough view's offline point-in-time read (an as-of cut over raw history) is not yet
-    # implemented, so get_historical_features must fail CLEARLY — not silently read the inert placeholder
-    # offline source (returning no feature values) nor assert on a non-PostgreSQL (Iceberg) batch source.
-    # The guard fires before any DB access (config/registry are unused before the raise).
-    view = _passthrough_stream_view(_kafka_source(watermark=False))
-    with pytest.raises(NotImplementedError, match="passthrough"):
+def _passthrough_stream_view_with_history(table="attr_hist"):
+    # A streaming passthrough whose Kafka source carries an Iceberg batch_source — the historical log
+    # backing the stream (the dual-source pattern), which the offline as-of read uses.
+    src = _kafka_source(watermark=False)
+    src.batch_source = IcebergSource(name="attr_hist", table=table, timestamp_field="event_ts")
+    return _passthrough_stream_view(src)
+
+
+def test_passthrough_pit_query_is_asof_latest_per_entity():
+    # Offline read: per entity row, the latest raw row at-or-before its label ts (within ttl), over the raw
+    # history — a LEFT JOIN + ROW_NUMBER rn=1, NOT an aggregation. This is the as-of cut that makes offline
+    # == the latest-row online MV.
+    ci = ColumnInfo(
+        join_keys=["user_id"], feature_cols=["amount"], ts_col="event_ts",
+        created_ts_col=None, field_mapping=None,
+    )
+    sql = build_passthrough_pit_query(
+        "SELECT 1", ["user_id", "label_ts"], "label_ts",
+        history_relation="hist", column_info=ci, ttl_seconds=3600,
+    )
+    assert "LEFT JOIN hist h ON" in sql
+    assert 'h."event_ts" <= e."label_ts"' in sql  # as-of: at-or-before the label
+    assert '>= e."label_ts" - INTERVAL \'3600\' SECOND' in sql  # ttl lower bound, INCLUSIVE
+    assert "ROW_NUMBER() OVER (PARTITION BY" in sql and sql.rstrip().endswith("rn = 1")
+    assert "GROUP BY" not in sql  # latest-row pick, not an aggregation
+
+
+def test_passthrough_pit_query_dedups_feature_colliding_with_an_entity_column():
+    # A feature named like a non-join-key entity_df column (e.g. the label-ts column) must be projected ONCE
+    # (from the entity side), or the inner subquery emits a duplicate/ambiguous column and the query fails.
+    ci = ColumnInfo(
+        join_keys=["user_id"], feature_cols=["event_ts", "amount"], ts_col="event_ts",
+        created_ts_col=None, field_mapping=None,
+    )
+    sql = build_passthrough_pit_query(
+        "SELECT 1", ["user_id", "event_ts"], "event_ts", history_relation="hist", column_info=ci,
+    )
+    assert 'e."user_id", e."event_ts", h."amount",' in sql  # event_ts from e only, amount from h
+    assert 'h."event_ts"' not in sql.split("ROW_NUMBER")[0]  # not double-projected on the h side
+
+
+def test_offline_passthrough_streaming_without_iceberg_history_is_rejected_clearly():
+    # A streaming passthrough whose Kafka source has no Iceberg batch_source has no offline history (the
+    # latest-row MV holds only the current row), so training fails CLEARLY rather than silently reading the
+    # inert placeholder offline source.
+    view = _passthrough_stream_view(_kafka_source(watermark=False))  # no batch_source
+    entity_df = pd.DataFrame({"user_id": ["A"], "event_timestamp": [pd.Timestamp("2026-01-01")]})
+    with pytest.raises(NotImplementedError, match="Iceberg batch source|online only"):
         RisingWaveOfflineStore.get_historical_features(
-            config=None,
-            feature_views=[view],
-            feature_refs=[],
-            entity_df=None,
-            registry=None,
-            project="proj",
+            config=None, feature_views=[view], feature_refs=[], entity_df=entity_df,
+            registry=None, project="proj",
         )
+
+
+def test_provision_passthrough_stream_with_iceberg_history_adds_history_source():
+    # When the stream's Kafka source declares an Iceberg batch_source, provisioning ALSO creates an Iceberg
+    # source over it (the offline history) — Kafka source + latest-row MV + history Iceberg source.
+    eng = _engine()
+    view = _passthrough_stream_view_with_history()
+    ddl = eng._provision_passthrough_ddl("proj", view)
+    assert len(ddl) == 3
+    assert ddl[0].startswith("CREATE SOURCE") and "connector='kafka'" in ddl[0]
+    assert ddl[1].startswith("CREATE MATERIALIZED VIEW")
+    assert ddl[2].startswith('CREATE SOURCE IF NOT EXISTS "proj_user_attr_history"')
+    assert "connector='iceberg'" in ddl[2]
+
+
+def test_reconcile_passthrough_stream_reprovisions_on_history_table_repoint():
+    # A repointed offline-history Iceberg table shows in no MV SELECT and no Kafka opt; detect it from the
+    # history source catalog and rebuild (so offline training reads the new table).
+    eng = _engine()
+    view = _passthrough_stream_view_with_history(table="attr_hist")  # desired history table
+    desired = eng._passthrough_mv_select("proj", view)
+    cur = _ReconcileCur(
+        f"CREATE MATERIALIZED VIEW proj_user_attr_online AS {desired}",
+        source_def=_rendered_kafka_source_def(),  # topic/bootstrap unchanged
+        source_cols=_passthrough_source_cols(),  # column types unchanged
+        history_def='CREATE SOURCE "proj_user_attr_history" WITH (connector = \'iceberg\', '
+        "table.name = 'OLD_TABLE')",  # deployed history points at a different table
+    )
+    eng._reconcile_passthrough_view(cur, "proj", view)
+    assert any(s.startswith("CREATE SOURCE") and "connector='iceberg'" in s for s in cur.executed)
+    assert 'DROP SOURCE IF EXISTS "proj_user_attr_history"' in cur.executed
+
+
+def test_reconcile_passthrough_stream_provisions_missing_history_source():
+    # An Iceberg batch_source ADDED to a previously online-only streaming passthrough: the history source
+    # does not exist yet (deployed_history is None), so reconcile must rebuild and create it — else offline
+    # training would read a non-existent relation.
+    eng = _engine()
+    view = _passthrough_stream_view_with_history(table="attr_hist")
+    desired = eng._passthrough_mv_select("proj", view)
+    cur = _ReconcileCur(
+        f"CREATE MATERIALIZED VIEW proj_user_attr_online AS {desired}",
+        source_def=_rendered_kafka_source_def(),  # topic/bootstrap unchanged
+        source_cols=_passthrough_source_cols(),  # column types unchanged
+        history_def=None,  # the offline-history Iceberg source is not yet provisioned
+    )
+    eng._reconcile_passthrough_view(cur, "proj", view)
+    assert any(
+        s.startswith('CREATE SOURCE IF NOT EXISTS "proj_user_attr_history"') for s in cur.executed
+    )
 
 
 # --- offline materialize routing: tile views no-op (offline reads the live tiles MV directly) ---

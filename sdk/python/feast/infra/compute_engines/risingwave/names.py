@@ -46,3 +46,11 @@ def offline_sink_name(project: str, view_name: str) -> str:
 
 def offline_staging_name(project: str, view_name: str) -> str:
     return f"{base_name(project, view_name)}_offline_staging"
+
+
+def passthrough_history_source_name(project: str, view_name: str) -> str:
+    # The Iceberg source over a STREAMING passthrough's batch_source (the historical log backing the
+    # stream): online serves from the latest-row MV over the Kafka source, but offline point-in-time
+    # training reads the raw history here. A BATCH passthrough has no separate history source — its online
+    # source (source_name, an Iceberg source over the batch table) IS the history.
+    return f"{base_name(project, view_name)}_history"

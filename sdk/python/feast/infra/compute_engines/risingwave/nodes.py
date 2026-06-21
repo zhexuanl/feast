@@ -225,6 +225,48 @@ def build_latest_row_select(column_info: ColumnInfo, relation: str) -> str:
     )
 
 
+def build_passthrough_pit_query(
+    entity_df_sql: str,
+    entity_columns: List[str],
+    label_ts_column: str,
+    *,
+    history_relation: str,
+    column_info: ColumnInfo,
+    ttl_seconds: Optional[int] = None,
+) -> str:
+    """Offline point-in-time training read for a passthrough feature view: for EACH entity row, the latest
+    raw feature row at-or-before that row's label timestamp — the as-of cut that makes offline == the
+    latest-row online MV serves. Reads the raw history relation (the view's batch source), LEFT JOIN so an
+    entity row with no match still appears (NULL features), ROW_NUMBER per entity row ordered by event (then
+    created) timestamp DESC, keeping rn = 1. ``ttl_seconds`` bounds the lookback (the value is valid only
+    within ttl of the label; older => NULL); unset => no lower bound. Identical entity rows collapse to one
+    output row (PARTITION BY the entity columns), matching the tile PIT's GROUP BY behavior."""
+    keys = column_info.join_keys_columns
+    # A feature column may coincide with a non-join-key entity_df column (e.g. the label-timestamp column);
+    # take such a column from the entity side only, so the inner subquery emits each name once (a duplicate
+    # would make the outer reference ambiguous). Mirrors build_latest_row_select's dedup.
+    feature_cols = [f for f in column_info.feature_cols if f not in entity_columns]
+    ts = column_info.timestamp_column
+    created = column_info.created_timestamp_column
+    e_cols = ", ".join(f'e."{c}"' for c in entity_columns)
+    h_feats = ", ".join(f'h."{c}"' for c in feature_cols)
+    join_on = " AND ".join(f'h."{k}" = e."{k}"' for k in keys)
+    asof = f'h."{ts}" <= e."{label_ts_column}"'
+    if ttl_seconds is not None:
+        # Inclusive lower bound (a row exactly ttl before the label is still valid), matching Feast's PIT
+        # template and the engine's other PIT filters.
+        asof += f' AND h."{ts}" >= e."{label_ts_column}" - INTERVAL \'{ttl_seconds}\' SECOND'
+    order_by = ", ".join(f'h."{c}" DESC' for c in (ts, created) if c)
+    partition = ", ".join(f'e."{c}"' for c in entity_columns)
+    out_cols = ", ".join(f'"{c}"' for c in [*entity_columns, *feature_cols])
+    return (
+        f"SELECT {out_cols} FROM (SELECT {e_cols}, {h_feats}, "
+        f"ROW_NUMBER() OVER (PARTITION BY {partition} ORDER BY {order_by}) AS rn "
+        f"FROM ({entity_df_sql}) e LEFT JOIN {history_relation} h ON {join_on} AND {asof}) AS _pit "
+        f"WHERE rn = 1"
+    )
+
+
 # --- Batch tile aggregation (partial-aggregate tile model) --------------------------------
 # A BATCH feature view materializes PARTIAL aggregates at the aggregation_interval (tiles), then
 # rolls them up to the requested window AT RETRIEVAL, anchored to the request/label time. This is

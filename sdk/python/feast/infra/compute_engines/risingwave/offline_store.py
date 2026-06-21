@@ -20,13 +20,22 @@ import pandas as pd
 from feast.feature_view import FeatureView
 from feast.infra.compute_engines.dag.context import ColumnInfo
 from feast.infra.compute_engines.risingwave.iceberg_source import (
+    IcebergSource,
+    is_passthrough_stream,
     is_passthrough_view,
     is_tile_view,
     tile_interval,
     view_aggregations,
 )
-from feast.infra.compute_engines.risingwave.names import tiles_name
-from feast.infra.compute_engines.risingwave.nodes import build_offline_tile_pit_query
+from feast.infra.compute_engines.risingwave.names import (
+    passthrough_history_source_name,
+    source_name,
+    tiles_name,
+)
+from feast.infra.compute_engines.risingwave.nodes import (
+    build_offline_tile_pit_query,
+    build_passthrough_pit_query,
+)
 from feast.infra.offline_stores import offline_utils
 from feast.infra.offline_stores.contrib.postgres_offline_store.postgres import (
     EntitySelectMode,
@@ -111,14 +120,18 @@ class RisingWaveOfflineStore(PostgreSQLOfflineStore):
         if passthrough_fvs:
             # A passthrough view's point-in-time read is an as-of cut over its RAW history (the batch
             # source), not over the latest-row online MV — a Group-TopN that holds only the current row per
-            # entity, so it cannot answer a past label timestamp. That read is not yet implemented, so fail
-            # clearly here instead of delegating to the Postgres parent, which would silently read the inert
-            # placeholder offline source (returning no feature values) or assert on a non-PostgreSQL
-            # (Iceberg) batch source.
-            raise NotImplementedError(
-                "Offline point-in-time retrieval for a passthrough (Attribute) feature view "
-                f"{[fv.name for fv in passthrough_fvs]} is not yet implemented in the RisingWave offline "
-                "store; serve it online, or train from an aggregating / tile feature view."
+            # entity, so it cannot answer a past label timestamp. Routed to a custom read; the Postgres
+            # parent would silently read the inert placeholder offline source or assert on an Iceberg source.
+            if len(feature_views) != 1:
+                raise NotImplementedError(
+                    "RisingWave passthrough offline retrieval currently supports exactly one feature view "
+                    f"per retrieval; got {len(feature_views)} ({len(passthrough_fvs)} passthrough). Mixing "
+                    "a passthrough view with other views in one get_historical_features call is not yet "
+                    "supported."
+                )
+            return _passthrough_historical_features(
+                config, passthrough_fvs[0], feature_refs, entity_df, registry, project,
+                full_feature_names,
             )
         # Inline a DataFrame entity_df as SQL so the parent uses its embed_query/CTE
         # path (no temp-table upload). RisingWave INSERTs are async, so an uploaded
@@ -189,6 +202,70 @@ def _tile_historical_features(
         column_info=column_info,
         aggregations=aggregations,
         aggregation_interval=tile_interval(fv),
+    )
+    return PostgreSQLRetrievalJob(
+        query=query,
+        config=config,
+        full_feature_names=full_feature_names,
+        on_demand_feature_views=OnDemandFeatureView.get_requested_odfvs(
+            feature_refs, project, registry
+        ),
+    )
+
+
+def _passthrough_historical_features(
+    config, fv, feature_refs, entity_df, registry, project, full_feature_names,
+) -> RetrievalJob:
+    # Point-in-time training for a passthrough view: for each entity row, the latest RAW feature row
+    # at-or-before its label timestamp (within ttl) — the as-of cut that makes offline == the latest-row
+    # online MV. Reads the raw history relation, not the latest-row MV (a Group-TopN holding only the
+    # current row). A batch passthrough's own Iceberg source IS the history; a streaming passthrough reads
+    # the Iceberg source provisioned over its stream batch_source (the historical log backing the stream).
+    if entity_df is None:
+        raise NotImplementedError(
+            "RisingWave passthrough offline retrieval requires an entity dataframe (the per-label PIT "
+            "anchor); entity-less retrieval is not supported."
+        )
+    if not isinstance(entity_df, pd.DataFrame):
+        raise NotImplementedError(
+            "RisingWave passthrough offline retrieval currently requires a DataFrame entity_df (it is "
+            "inlined as SQL); a SQL-string entity_df is not yet supported."
+        )
+    entity_columns = list(entity_df.columns)
+    label_ts_column = offline_utils.infer_event_timestamp_from_entity_df(dict(entity_df.dtypes))
+    entity_df_sql = _entity_df_to_sql(entity_df)
+
+    if is_passthrough_stream(fv):
+        history = getattr(fv.stream_source, "batch_source", None)
+        if not isinstance(history, IcebergSource):
+            raise NotImplementedError(
+                f"passthrough stream view '{fv.name}' has no Iceberg batch source (the historical log "
+                "backing the stream), so offline point-in-time training is not available; declare a "
+                "batch_source on the stream's KafkaSource, or serve the view online only."
+            )
+        history_relation = passthrough_history_source_name(project, fv.name)
+        ts_col = history.timestamp_field
+    else:
+        history_relation = source_name(project, fv.name)
+        ts_col = fv.batch_source.timestamp_field
+
+    # created_ts is intentionally omitted: the online latest-row MV and this read both order by event time
+    # alone (the Iceberg history carries no created_timestamp_column), so online == offline on ties.
+    column_info = ColumnInfo(
+        join_keys=[f.name for f in fv.entity_columns],
+        feature_cols=[f.name for f in fv.features],
+        ts_col=ts_col,
+        created_ts_col=None,
+        field_mapping=None,
+    )
+    ttl = getattr(fv, "ttl", None)
+    query = build_passthrough_pit_query(
+        entity_df_sql,
+        entity_columns,
+        label_ts_column,
+        history_relation=history_relation,
+        column_info=column_info,
+        ttl_seconds=int(ttl.total_seconds()) if ttl else None,
     )
     return PostgreSQLRetrievalJob(
         query=query,
