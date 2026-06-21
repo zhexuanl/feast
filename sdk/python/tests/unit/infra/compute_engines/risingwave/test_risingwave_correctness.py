@@ -1094,6 +1094,105 @@ def test_is_tile_view_unions_batch_and_streaming_tile():
     assert not is_tile_view(_stream_view(_kafka_source(watermark=True), [_agg("sum", 259200)]))  # plain stream
 
 
+# --- S6: STREAMING tile reconcile (verbatim-catalog comparison drives re-materialize) ---
+
+
+class _TileReconcileCur:
+    """Fake cursor for the tile reconcile: answers ``pg_matviews`` (the existing online MV names, for
+    ``_existing_online_window_secs``) and the ``rw_catalog`` MV-definition lookup (for
+    ``_deployed_mv_select``), and records executed DDL. ``deployed`` maps an MV name -> the
+    ``CREATE MATERIALIZED VIEW <name> AS <select>`` definition RisingWave stores verbatim; an absent name
+    => the MV does not exist."""
+
+    def __init__(self, deployed):
+        self.executed = []
+        self._deployed = deployed
+        self._name = None
+
+    def execute(self, sql, params=None):
+        self.executed.append(sql)
+        if sql.startswith("SELECT definition"):
+            self._name = params[0]
+
+    def fetchall(self):
+        return [(name,) for name in self._deployed]  # all deployed MV names (tiles + per-window online)
+
+    def fetchone(self):
+        defn = self._deployed.get(self._name)
+        return (defn,) if defn is not None else None
+
+
+def _deployed_from_provision_ddl(ddl):
+    # Turn the engine's provision DDL into the {name: stored-definition} the catalog would hold: RW stores
+    # each 'CREATE MATERIALIZED VIEW IF NOT EXISTS "<name>" AS <select>' as 'CREATE MATERIALIZED VIEW
+    # <name> AS <select>' (verbatim modulo whitespace — verified v3.0.0). The MV-name ' AS ' precedes any
+    # in-SELECT ' AS ', so split(" AS ", 1) lands on it.
+    deployed = {}
+    for stmt in ddl:
+        if not stmt.startswith("CREATE MATERIALIZED VIEW"):
+            continue  # skip the CREATE SOURCE
+        head, select = stmt.split(" AS ", 1)
+        name = head.split('"')[1]
+        deployed[name] = f"CREATE MATERIALIZED VIEW {name} AS {select}"
+    return deployed
+
+
+def _reconcilable_streaming_tile_view():
+    return _stream_tile_view(
+        _kafka_source(watermark=True), [_agg("sum", 259200), _agg("sum", 2592000)], interval_secs=86400
+    )
+
+
+def test_reconcile_streaming_tile_noop_when_unchanged():
+    # A kept streaming-tile view whose deployed tiles + per-window MVs match the desired SELECTs must NOT
+    # be touched (no rebuild, no serving blip) — the verbatim-catalog comparison sees no change. This is
+    # the load-bearing check that RW stores the EOWC TUMBLE tiles MV the way we generate it.
+    eng = _engine()
+    view = _reconcilable_streaming_tile_view()
+    deployed = _deployed_from_provision_ddl(eng._provision_streaming_tile_ddl("proj", view))
+    cur = _TileReconcileCur(deployed)
+    eng._reconcile_streaming_tile_view(cur, "proj", view)
+    assert not any(s.startswith(("DROP", "CREATE")) for s in cur.executed)  # only catalog SELECTs ran
+
+
+def test_reconcile_streaming_tile_full_rebuild_when_tiles_changed():
+    # A changed per-tile partial => the deployed tiles SELECT differs => drop the online MVs + the tiles
+    # MV + the SOURCE, then re-provision the whole graph. The source is dropped (unlike the batch
+    # reconcile) because a streaming source lists its agg-input columns explicitly, so a new aggregation
+    # input column changes the source schema — CREATE SOURCE IF NOT EXISTS alone would keep the old cols.
+    eng = _engine()
+    view = _reconcilable_streaming_tile_view()
+    deployed = _deployed_from_provision_ddl(eng._provision_streaming_tile_ddl("proj", view))
+    deployed["proj_user_txn_tiles"] = "CREATE MATERIALIZED VIEW proj_user_txn_tiles AS SELECT stale"
+    cur = _TileReconcileCur(deployed)
+    eng._reconcile_streaming_tile_view(cur, "proj", view)
+    assert 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_tiles"' in cur.executed
+    assert 'DROP SOURCE IF EXISTS "proj_user_txn_src"' in cur.executed  # so CREATE SOURCE picks up new cols
+    # the tiles MV is dropped BEFORE the source it reads (dependency order)
+    assert cur.executed.index('DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_tiles"') < cur.executed.index(
+        'DROP SOURCE IF EXISTS "proj_user_txn_src"'
+    )
+    creates = [s for s in cur.executed if s.startswith("CREATE MATERIALIZED VIEW")]
+    assert len(creates) == 3  # tiles + both per-window online MVs re-created
+    assert sum(1 for s in creates if "tumble(" in s) == 1  # the EOWC tiles MV is rebuilt
+    assert any(s.startswith("CREATE SOURCE") for s in cur.executed)  # the source is re-created
+
+
+def test_reconcile_streaming_tile_adds_only_the_new_window_mv():
+    # A widened window set (tiles unchanged — partials are window-independent) creates ONLY the new
+    # window's online MV; the tiles MV and the existing window MV keep running untouched.
+    eng = _engine()
+    view = _reconcilable_streaming_tile_view()
+    deployed = _deployed_from_provision_ddl(eng._provision_streaming_tile_ddl("proj", view))
+    del deployed["proj_user_txn_online_2592000s"]  # the 30d window MV isn't deployed yet
+    cur = _TileReconcileCur(deployed)
+    eng._reconcile_streaming_tile_view(cur, "proj", view)
+    creates = [s for s in cur.executed if s.startswith("CREATE MATERIALIZED VIEW")]
+    assert len(creates) == 1 and "proj_user_txn_online_2592000s" in creates[0]  # only the new window
+    assert "tumble(" not in creates[0]  # NOT a tiles rebuild
+    assert not any(s.startswith("DROP") for s in cur.executed)  # nothing removed
+
+
 def test_multi_window_streaming_tile_would_fail_the_plain_stream_path():
     # Routing-precedence rationale + intermediate-state fail-safe: a streaming-tile view is BOTH a
     # StreamFeatureView AND tile-like, so update()/teardown check is_streaming_tile FIRST. The plain

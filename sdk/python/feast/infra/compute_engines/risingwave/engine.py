@@ -442,12 +442,11 @@ class RisingWaveComputeEngine(ComputeEngine):
                     for stmt in _batch_drop_ddl(project, view):
                         cur.execute(stmt)
             for view in views_to_keep:
-                # is_streaming_tile FIRST (it is also a StreamFeatureView): provision the tile graph.
-                # CREATE ... IF NOT EXISTS makes the first apply provision and a re-apply a no-op;
-                # definition-change reconcile for kept streaming-tile views is a later increment.
+                # is_streaming_tile FIRST (it is also a StreamFeatureView): reconcile the tile graph to
+                # its current definition (re-materialize on a change, no-op when unchanged), the same
+                # verbatim-catalog comparison the batch tile path uses.
                 if is_streaming_tile(view):
-                    for stmt in self._provision_streaming_tile_ddl(project, view):
-                        cur.execute(stmt)
+                    self._reconcile_streaming_tile_view(cur, project, view)
                 elif isinstance(view, StreamFeatureView):
                     self._reconcile_stream_view(cur, project, view)
                 elif is_tile_fv(view):
@@ -689,6 +688,68 @@ class RisingWaveComputeEngine(ComputeEngine):
             if source_changed:
                 cur.execute(f'DROP SOURCE IF EXISTS "{src}"')  # so CREATE SOURCE picks up the new table
             for stmt in self._provision_batch_ddl(project, view):
+                cur.execute(stmt)
+        else:
+            for name, select in creates:
+                cur.execute(f'CREATE MATERIALIZED VIEW IF NOT EXISTS "{name}" AS {select}')
+
+    def _reconcile_streaming_tile_view(self, cur, project: str, view) -> None:
+        """Reconcile a KEPT streaming-tile view to its CURRENT definition — the streaming analogue of
+        ``_reconcile_batch_view`` (and the tile analogue of ``_reconcile_stream_view``). Feast routes a
+        same-name edited view to views_to_keep without saying what changed, and ``CREATE ... IF NOT
+        EXISTS`` would keep the old MVs, so serving/training would diverge from the applied definition.
+        RisingWave has no CREATE OR REPLACE, so compare each object's desired definition against the one
+        RW stores verbatim in its catalog and drop+recreate only what differs — the SAME pure planner
+        (``_plan_batch_reconcile``) the batch tile path uses, since the tile graph is identical (one tiles
+        MV + N per-window online MVs); only the tiles MV's source/SELECT differs.
+
+        EOWC tiles MV changed (different per-tile partials) -> full re-materialize (drop the online MVs,
+        the tiles MV, re-provision). Tiles MV unchanged (window-independent partials, so adding/removing a
+        window does not touch it) -> reconcile only the per-window online MVs.
+
+        Kafka-source-change follow-up (deferred — same gap as ``_reconcile_stream_view``): a repointed
+        topic/bootstrap does not show in any MV definition (the tiles MV reads the source by its stable
+        name), so it is not detected here. The batch path detects an Iceberg-table repoint via the source
+        catalog; the Kafka analogue (reading topic/bootstrap from rw_sources) is a later increment."""
+        interval = tile_interval(view)
+        column_info = _registry_free_column_info(view)
+        aggs = view_aggregations(view)
+        src = source_name(project, view.name)
+        tiles = tiles_name(project, view.name)
+        desired_tiles = build_streaming_tile_select(
+            column_info, aggs, src, aggregation_interval=interval
+        )
+        desired_online = {
+            online_window_mv_name(project, view.name, w): build_online_rollup_select(
+                column_info, wa, tiles, aggregation_interval=interval
+            )
+            for w, wa in group_aggregations_by_window(aggs)
+        }
+        deployed_online = {
+            online_window_mv_name(project, view.name, secs): _deployed_mv_select(
+                cur, online_window_mv_name(project, view.name, secs)
+            )
+            for secs in _existing_online_window_secs(cur, project, view.name)
+        }
+        full_rebuild, drops, creates = _plan_batch_reconcile(
+            desired_tiles=desired_tiles,
+            desired_online=desired_online,
+            deployed_tiles=_deployed_mv_select(cur, tiles),
+            deployed_online=deployed_online,
+        )
+        for name in drops:  # online MVs (dependents) first
+            cur.execute(f'DROP MATERIALIZED VIEW IF EXISTS "{name}"')
+        if full_rebuild:
+            cur.execute(f'DROP MATERIALIZED VIEW IF EXISTS "{tiles}"')
+            # Drop the source too (unlike the batch reconcile): a streaming source declares its agg-input
+            # columns EXPLICITLY (_source_ddl), so a partials change that adds an aggregation over a NEW
+            # input column also changes the source schema — and CREATE SOURCE IF NOT EXISTS would keep the
+            # old columns, so the rebuilt tiles MV would reference a column the source lacks. Dropping it
+            # (the source is dependency-free once the tiles MV is gone) lets CREATE SOURCE pick up the new
+            # columns. The batch reconcile needs no analogue: an Iceberg source infers its schema, so a new
+            # column is read without re-creating the source.
+            cur.execute(f'DROP SOURCE IF EXISTS "{src}"')
+            for stmt in self._provision_streaming_tile_ddl(project, view):
                 cur.execute(stmt)
         else:
             for name, select in creates:
