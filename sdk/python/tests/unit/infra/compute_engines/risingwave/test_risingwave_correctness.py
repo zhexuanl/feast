@@ -22,10 +22,13 @@ from feast.data_source import KafkaSource, PushSource
 from feast.infra.compute_engines.risingwave.engine import (
     RisingWaveComputeEngine,
     _batch_drop_ddl,
+    _deployed_mv_select,
+    _deployed_source_table,
     _existing_online_window_secs,
     _iceberg_sink_ddl,
     _iceberg_source_ddl,
     _iceberg_storage_opts,
+    _plan_batch_reconcile,
 )
 from feast.infra.compute_engines.risingwave.iceberg_source import IcebergSource
 from feast.infra.compute_engines.risingwave.offline_store import (
@@ -802,50 +805,104 @@ def test_existing_online_window_secs_parses_only_this_views_per_window_mvs():
     assert _existing_online_window_secs(_Cur(), "proj", "v") == {259200, 2592000}
 
 
-def test_update_drops_orphaned_per_window_mv_on_window_shrink(monkeypatch):
-    # A re-apply that drops the 7d window must DROP that window's online MV (Feast routes a same-name
-    # edit to views_to_keep, and CREATE...IF NOT EXISTS never removes it). Capture the executed DDL.
-    eng = _engine()
-    view = _batch_view([_agg("sum", 259200), _agg("sum", 2592000)])  # desired: 3d + 30d
-    executed = []
-
+def test_deployed_mv_select_strips_create_prefix_and_handles_absent():
+    # RW stores the MV definition VERBATIM as 'CREATE MATERIALIZED VIEW <name> AS <select>'; the
+    # reconcile compares the <select> against the freshly-built one. Pin the prefix-strip + absent case.
     class _Cur:
-        def execute(self, sql):
-            executed.append(sql)
-            if sql.startswith("SELECT matviewname"):
-                self._rows = [
-                    ("proj_user_txn_daily_online_259200s",),
-                    ("proj_user_txn_daily_online_604800s",),   # the orphaned 7d MV from a prior apply
-                    ("proj_user_txn_daily_online_2592000s",),
-                ]
+        def __init__(self, row):
+            self._row = row
 
-        def fetchall(self):
-            return self._rows
+        def execute(self, _sql, _params):
+            pass
 
-        def __enter__(self):
-            return self
+        def fetchone(self):
+            return self._row
 
-        def __exit__(self, *a):
-            return False
-
-    class _Conn:
-        def cursor(self):
-            return _Cur()
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-    monkeypatch.setattr(
-        "feast.infra.compute_engines.risingwave.engine._connect", lambda config: _Conn()
+    deployed = _deployed_mv_select(
+        _Cur(("CREATE MATERIALIZED VIEW v_online_3s AS SELECT a, sum(x) AS s FROM t",)), "v_online_3s"
     )
-    eng.update("proj", [], [view], [], [])
-    drops = [s for s in executed if s.startswith("DROP MATERIALIZED VIEW") and "604800s" in s]
-    assert drops == ['DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_online_604800s"']
-    # the surviving windows are NOT dropped (only re-created via IF NOT EXISTS)
-    assert not any('online_259200s"' in s and s.startswith("DROP") for s in executed)
+    assert deployed == "SELECT a, sum(x) AS s FROM t"  # keeps the inner ' AS ' aliases
+    assert _deployed_mv_select(_Cur(None), "missing") is None
+
+
+def test_deployed_source_table_extracts_iceberg_table_name():
+    # A repointed Iceberg table only shows in the CREATE SOURCE ... table.name='...' definition; pin the
+    # extraction (incl. the doubled-single-quote un-escaping) against the engine's own DDL format.
+    class _Cur:
+        def __init__(self, row):
+            self._row = row
+
+        def execute(self, _sql, _params):
+            pass
+
+        def fetchone(self):
+            return self._row
+
+    ddl = (
+        "CREATE SOURCE proj_v_src WITH (connector='iceberg', catalog.name='feast', "
+        "catalog.type='storage', warehouse.path='s3a://feast/wh', database.name='feast', "
+        "table.name='o''brien_txn')"  # embedded quote, doubled in the DDL
+    )
+    assert _deployed_source_table(_Cur((ddl,)), "proj_v_src") == "o'brien_txn"
+    assert _deployed_source_table(_Cur(None), "missing") is None  # absent source
+
+
+def test_plan_batch_reconcile_noop_when_nothing_changed():
+    full, drops, creates = _plan_batch_reconcile(
+        desired_tiles="SELECT tiles", desired_online={"v_online_3s": "A"},
+        deployed_tiles="SELECT tiles", deployed_online={"v_online_3s": "A"},
+    )
+    assert (full, drops, creates) == (False, [], [])  # no rebuild, no drop, no create -> no serving blip
+
+
+def test_plan_batch_reconcile_adds_new_window_without_touching_tiles():
+    # add a 30d window: tiles (window-independent) unchanged -> only CREATE the new online MV.
+    full, drops, creates = _plan_batch_reconcile(
+        desired_tiles="T", desired_online={"v_online_3s": "A", "v_online_30s": "B"},
+        deployed_tiles="T", deployed_online={"v_online_3s": "A"},
+    )
+    assert full is False and drops == [] and creates == [("v_online_30s", "B")]
+
+
+def test_plan_batch_reconcile_drops_removed_window():
+    full, drops, creates = _plan_batch_reconcile(
+        desired_tiles="T", desired_online={"v_online_3s": "A"},
+        deployed_tiles="T", deployed_online={"v_online_3s": "A", "v_online_30s": "B"},
+    )
+    assert full is False and drops == ["v_online_30s"] and creates == []
+
+
+def test_plan_batch_reconcile_replaces_redefined_window():
+    full, drops, creates = _plan_batch_reconcile(
+        desired_tiles="T", desired_online={"v_online_3s": "A2"},
+        deployed_tiles="T", deployed_online={"v_online_3s": "A1"},
+    )
+    assert full is False and drops == ["v_online_3s"] and creates == [("v_online_3s", "A2")]
+
+
+def test_plan_batch_reconcile_full_rebuild_when_tiles_partials_changed():
+    # changing an aggregation function/column changes the tiles MV -> drop every online MV + rebuild.
+    full, drops, creates = _plan_batch_reconcile(
+        desired_tiles="SELECT max(x) AS max_x", desired_online={"v_online_3s": "A"},
+        deployed_tiles="SELECT sum(x) AS sum_x", deployed_online={"v_online_3s": "A", "v_online_30s": "B"},
+    )
+    assert full is True and set(drops) == {"v_online_3s", "v_online_30s"} and creates == []
+
+
+def test_plan_batch_reconcile_full_rebuild_on_first_provision():
+    full, drops, creates = _plan_batch_reconcile(
+        desired_tiles="T", desired_online={"v_online_3s": "A"},
+        deployed_tiles=None, deployed_online={},  # nothing deployed yet
+    )
+    assert full is True and drops == []
+
+
+def test_plan_batch_reconcile_ignores_whitespace_only_differences():
+    full, drops, creates = _plan_batch_reconcile(
+        desired_tiles="SELECT  a,   b", desired_online={"v_online_3s": "SELECT x"},
+        deployed_tiles="SELECT a, b", deployed_online={"v_online_3s": "SELECT  x"},
+    )
+    assert (full, drops, creates) == (False, [], [])  # normalized comparison -> no spurious rebuild
 
 
 def test_batch_drop_ddl_drops_every_per_window_mv():

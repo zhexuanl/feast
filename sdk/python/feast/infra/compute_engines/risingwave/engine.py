@@ -14,6 +14,7 @@ inline ``UNVERIFIED`` markers).
 """
 
 import logging
+import re
 from typing import List, Literal, Optional, Sequence, Union
 
 from feast import (
@@ -291,12 +292,12 @@ def _batch_drop_ddl(project: str, view) -> List[str]:
 
 
 def _existing_online_window_secs(cur, project: str, view_name: str) -> set:
-    """The window-seconds of the per-window online MVs that physically EXIST for a tile view, read
-    from RisingWave's pg-compatible catalog. update() diffs this against the DESIRED window set to drop
-    MVs orphaned when a view's window set shrinks/changes on re-apply: Feast routes a same-name edited
-    view to ``views_to_keep`` (not ``views_to_delete``) and ``CREATE ... IF NOT EXISTS`` never removes a
-    no-longer-provisioned window's MV, so its now()-anchored MV would otherwise run forever, unreachable
-    by any future provision/teardown (which only name the current window set)."""
+    """The window-seconds of the per-window online MVs that physically EXIST for a tile view, read from
+    RisingWave's pg-compatible catalog. The reconcile diffs this against the DESIRED window set so a
+    re-apply that shrinks/changes a view's windows drops the now-removed windows' MVs: Feast routes a
+    same-name edited view to ``views_to_keep`` (not ``views_to_delete``) and ``CREATE ... IF NOT EXISTS``
+    never removes a no-longer-provisioned window's MV, so it would otherwise run forever, unreachable by
+    any future provision/teardown (which only name the current window set)."""
     prefix = f"{base_name(project, view_name)}_online_"
     cur.execute("SELECT matviewname FROM pg_matviews")
     found = set()
@@ -306,6 +307,77 @@ def _existing_online_window_secs(cur, project: str, view_name: str) -> set:
             if secs.isdigit():
                 found.add(int(secs))
     return found
+
+
+def _deployed_mv_select(cur, name: str) -> Optional[str]:
+    """The SELECT of a deployed materialized view as RisingWave stores it (verbatim — verified on
+    RW v3.0.0: RW persists ``CREATE MATERIALIZED VIEW <name> AS <select>`` with our SELECT unchanged),
+    or None if the MV does not exist. This stored SELECT is an exact definition fingerprint used to
+    detect that a kept view's definition changed — the only way to do so, since RW has no CREATE OR
+    REPLACE / ALTER ... AS / COMMENT ON, and Feast never tells the engine which kept views changed.
+
+    Assumption: RW round-trips our generated SELECT unchanged (modulo whitespace, which the reconcile
+    normalizes). If a future RW version re-rendered the stored definition differently from what we
+    generate, the comparison would conservatively see every apply as "changed" and re-materialize each
+    time — wasteful, never wrong. If that ever happens, switch to a stored definition hash (a sidecar)
+    rather than comparing against RW's rendering."""
+    cur.execute(
+        "SELECT definition FROM rw_catalog.rw_materialized_views WHERE name = %s", (name,)
+    )
+    row = cur.fetchone()
+    if not row:
+        return None
+    definition = row[0]
+    marker = " AS "  # the MV name precedes the first ' AS '; everything after it is the SELECT
+    idx = definition.find(marker)
+    return definition[idx + len(marker) :] if idx != -1 else definition
+
+
+def _deployed_source_table(cur, name: str) -> Optional[str]:
+    """The Iceberg ``table.name`` of a deployed source as RisingWave stores it, or None if the source
+    does not exist. A tile view's tiles MV reads its source by the (stable) source NAME, so the
+    underlying Iceberg table only appears in the ``CREATE SOURCE ... table.name='...'`` definition —
+    this is the only way to detect that a kept view was repointed at a different table (which the MV
+    definitions cannot reveal). Single quotes in the table are doubled in the DDL; we un-double them."""
+    cur.execute("SELECT definition FROM rw_catalog.rw_sources WHERE name = %s", (name,))
+    row = cur.fetchone()
+    if not row:
+        return None
+    m = re.search(r"(?:^|[\s,(])table\.name\s*=\s*'((?:[^']|'')*)'", row[0])
+    return m.group(1).replace("''", "'") if m else None
+
+
+def _plan_batch_reconcile(
+    *, desired_tiles: str, desired_online: dict, deployed_tiles, deployed_online: dict
+):
+    """Pure reconcile planner: compare a tile view's DESIRED definitions against the DEPLOYED ones (read
+    from RisingWave's catalog) and return ``(full_rebuild, online_drops, online_creates)``.
+
+    ``full_rebuild`` is True when the tiles MV changed (the per-tile PARTIALS changed — a different
+    aggregation function/column) or the view is unprovisioned: the caller drops every deployed online MV
+    (returned in ``online_drops``) and the tiles MV, then re-provisions the whole graph. Otherwise the
+    tiles MV is unchanged (its partials are WINDOW-INDEPENDENT, so adding/removing a window does NOT touch
+    it) and only the per-window online MVs are reconciled — drop windows that were removed or whose rollup
+    definition changed, create windows that are new or redefined, and leave unchanged windows (and their
+    serving) untouched. established feature stores recreates on a materialization-affecting change; an unchanged view is a
+    no-op (no rebuild, no serving blip)."""
+
+    def norm(sql):
+        return None if sql is None else " ".join(sql.split())
+
+    if norm(deployed_tiles) != norm(desired_tiles):
+        return True, list(deployed_online), []
+    drops = [
+        name
+        for name, dep in deployed_online.items()
+        if name not in desired_online or norm(dep) != norm(desired_online[name])
+    ]
+    creates = [
+        (name, sql)
+        for name, sql in desired_online.items()
+        if name not in deployed_online or norm(deployed_online[name]) != norm(sql)
+    ]
+    return False, drops, creates
 
 
 class RisingWaveComputeEngine(ComputeEngine):
@@ -358,16 +430,7 @@ class RisingWaveComputeEngine(ComputeEngine):
                     for stmt in self._provision_ddl(project, view):
                         cur.execute(stmt)
                 elif is_tile_fv(view):
-                    # Reconcile the window set: drop per-window online MVs for windows this re-apply no
-                    # longer provisions (a same-name edit lands here, not in views_to_delete), then
-                    # (re)create the current set. Without this, a removed window's MV is orphaned.
-                    desired = {w for w, _ in group_aggregations_by_window(view_aggregations(view))}
-                    for secs in _existing_online_window_secs(cur, project, view.name) - desired:
-                        cur.execute(
-                            f'DROP MATERIALIZED VIEW IF EXISTS "{online_window_mv_name(project, view.name, secs)}"'
-                        )
-                    for stmt in self._provision_batch_ddl(project, view):
-                        cur.execute(stmt)
+                    self._reconcile_batch_view(cur, project, view)
 
     def teardown_infra(
         self,
@@ -455,6 +518,64 @@ class RisingWaveComputeEngine(ComputeEngine):
             mv = online_window_mv_name(project, view.name, window_secs)
             ddl.append(_materialized_view_ddl(mv, rollup_select))
         return ddl
+
+    def _reconcile_batch_view(self, cur, project: str, view) -> None:
+        """Reconcile a KEPT tile view's physical objects to its CURRENT definition (established feature stores 'Recreate' on
+        a materialization-affecting change; a no-op when unchanged). Feast routes a same-name edited view
+        to views_to_keep without telling the engine what changed, and ``CREATE ... IF NOT EXISTS`` would
+        silently keep the old MVs — so serving would diverge from the applied definition. RisingWave has
+        no CREATE OR REPLACE, so we compare each object's desired definition against the one RW stores
+        verbatim in its catalog and drop+recreate only what differs.
+
+        Tiles MV changed (the per-tile partials — a different aggregation function/column) -> full
+        re-materialize (drop the online MVs that depend on it, drop the tiles MV, re-provision). Tiles MV
+        unchanged (window-independent partials, so adding/removing a window does not touch it) -> reconcile
+        only the per-window online MVs: drop removed/redefined windows, create new/redefined ones, leave
+        unchanged windows (and their serving) running untouched."""
+        interval = tile_interval(view)
+        column_info = _batch_column_info(view)
+        aggs = view_aggregations(view)
+        src = source_name(project, view.name)
+        tiles = tiles_name(project, view.name)
+        desired_tiles = build_batch_tile_select(
+            column_info, aggs, src, aggregation_interval=interval
+        )
+        desired_online = {
+            online_window_mv_name(project, view.name, w): build_online_rollup_select(
+                column_info, wa, tiles, aggregation_interval=interval
+            )
+            for w, wa in group_aggregations_by_window(aggs)
+        }
+        deployed_online = {
+            online_window_mv_name(project, view.name, secs): _deployed_mv_select(
+                cur, online_window_mv_name(project, view.name, secs)
+            )
+            for secs in _existing_online_window_secs(cur, project, view.name)
+        }
+        full_rebuild, drops, creates = _plan_batch_reconcile(
+            desired_tiles=desired_tiles,
+            desired_online=desired_online,
+            deployed_tiles=_deployed_mv_select(cur, tiles),
+            deployed_online=deployed_online,
+        )
+        # A repointed Iceberg table doesn't show in any MV definition (they read the source by its
+        # stable name), so detect it from the source catalog and force a full re-materialize that also
+        # drops+recreates the source — else serving would keep reading the OLD table.
+        deployed_table = _deployed_source_table(cur, src)
+        source_changed = deployed_table is not None and deployed_table != view.batch_source.table
+        if source_changed:
+            full_rebuild, drops, creates = True, list(deployed_online), []
+        for name in drops:  # online MVs (dependents) first
+            cur.execute(f'DROP MATERIALIZED VIEW IF EXISTS "{name}"')
+        if full_rebuild:
+            cur.execute(f'DROP MATERIALIZED VIEW IF EXISTS "{tiles}"')
+            if source_changed:
+                cur.execute(f'DROP SOURCE IF EXISTS "{src}"')  # so CREATE SOURCE picks up the new table
+            for stmt in self._provision_batch_ddl(project, view):
+                cur.execute(stmt)
+        else:
+            for name, select in creates:
+                cur.execute(f'CREATE MATERIALIZED VIEW IF NOT EXISTS "{name}" AS {select}')
 
     def _materialize_one(
         self, registry: BaseRegistry, task: MaterializationTask, **kwargs
