@@ -16,7 +16,8 @@ instance. Anything not yet validated end-to-end is marked ``UNVERIFIED`` and lis
 the unvalidated surfaces in ``README.md``.
 """
 
-from typing import List, Optional, Tuple
+import json
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
@@ -48,11 +49,18 @@ from feast.infra.compute_engines.utils import (
 #     but monoids without an inverse (see MONOID_FUNCTIONS). NOTE: RisingWave has a known
 #     crash-RECOVERY state bug for updatable approx_count_distinct — harmless for our
 #     append-only EOWC model (the source never retracts), but flagged.
+#   - approx_percentile: parameterized by the quantile, emitted as
+#     approx_percentile(<p>) WITHIN GROUP (ORDER BY <col>). The quantile has no home on
+#     feast.Aggregation (which carries no parameter field), so it rides out-of-band in the
+#     ``agg_params`` map (keyed by the aggregation's resolved_name) the builders take. A monoid
+#     with no inverse, so plain (windowed/EOWC) only — never tile-decomposed (no additive merge).
+#   - first(n) / last(n) / first_distinct(n) / last_distinct(n) (sequence features): Array-valued —
+#     the n earliest/most-recent values per key+window, ordered. Emitted as
+#     (array_agg(<col> ORDER BY <ts> ASC|DESC))[1:n], wrapped in array_distinct for the _distinct
+#     variants (RisingWave rejects array_agg(DISTINCT ... ORDER BY <other column>)). n rides the
+#     same ``agg_params`` carrier. Monoids (no inverse), plain (windowed/EOWC) only for now — the
+#     bounded tile recombine (top-n per tile, re-merged at rollup) is a later delivery.
 # Deliberately EXCLUDED — rejected at apply with a reason, not silently:
-#   - first(n) / last(n) / first_distinct / last_distinct (sequence features): RisingWave has
-#     no bare first()/last() aggregate; they need ordered-set / Array outputs, which are not yet supported.
-#   - approx_percentile: parameterized (takes the percentile) — needs a parameter field on
-#     feast.Aggregation, which has none today, so it is not yet supported.
 #   - aggregation_secondary_key: produces a per-secondary-key breakdown = an Array/Map output
 #     that the scalar engine and the ServingSpec wire do not carry yet, so it is not yet supported.
 SUPPORTED_AGG_FUNCTIONS = frozenset(
@@ -64,6 +72,11 @@ SUPPORTED_AGG_FUNCTIONS = frozenset(
         "max",
         "count_distinct",
         "approx_count_distinct",
+        "approx_percentile",
+        "first",
+        "last",
+        "first_distinct",
+        "last_distinct",
         "stddev_pop",
         "stddev_samp",
         "var_pop",
@@ -71,12 +84,34 @@ SUPPORTED_AGG_FUNCTIONS = frozenset(
     }
 )
 
+# Sequence (Array-valued) aggregates -> the ORDER BY direction of their array_agg: last* keep the
+# n MOST-RECENT (event-time DESC), first* the n EARLIEST (ASC). The _distinct variants wrap
+# array_distinct (which preserves first occurrence, so most-recent/earliest distinct is kept).
+_SEQUENCE_ORDER = {
+    "last": "DESC",
+    "last_distinct": "DESC",
+    "first": "ASC",
+    "first_distinct": "ASC",
+}
+
 # The non-retractable members of SUPPORTED_AGG_FUNCTIONS: monoids with no inverse, so
 # RisingWave cannot incrementally *retract* them over an upsert/retractable source without a
 # full per-window recompute. Mirrors Chronon's deletable (Abelian group) vs non-deletable
 # (monoid) split. sum/count/mean and stddev/variance are Abelian-group
 # (or decompose into sum/count), so they are retractable-safe and are NOT listed here.
-MONOID_FUNCTIONS = frozenset({"min", "max", "count_distinct", "approx_count_distinct"})
+MONOID_FUNCTIONS = frozenset(
+    {
+        "min",
+        "max",
+        "count_distinct",
+        "approx_count_distinct",
+        "approx_percentile",
+        "first",
+        "last",
+        "first_distinct",
+        "last_distinct",
+    }
+)
 
 # Feast Aggregation.function -> RisingWave SQL function (only names that differ).
 _SQL_FUNCTION = {"mean": "avg"}
@@ -84,13 +119,96 @@ _SQL_FUNCTION = {"mean": "avg"}
 DEDUP_ROW_NUMBER = "_feast_row_number"
 
 
-def _agg_expr(agg: Aggregation) -> str:
+# Per-aggregation numeric parameters that feast.Aggregation cannot carry (it has no parameter
+# field): the quantile of approx_percentile, the N of a sequence aggregate. They ride on the feature
+# view's tags under this engine-owned key, as a JSON map keyed by each aggregation's resolved_name ->
+# ordered params. The carrier is owned by this engine (its only reader): an authoring layer populates
+# it via ``encode_agg_params`` and the builders read it via ``view_agg_params``, so a re-applied /
+# registry-rehydrated view reproduces byte-identical SQL (the verbatim-catalog reconcile keys on the
+# rendered SELECT). The key is deliberately engine-namespaced — no upstream-layer name is baked in.
+AGG_PARAMS_TAG = "feast_rw_agg_params"
+
+
+def encode_agg_params(
+    params_by_resolved_name: Dict[str, Sequence[float]],
+) -> Dict[str, str]:
+    """The view-tags fragment carrying per-aggregation numeric parameters, keyed by resolved_name.
+    Drops empty entries and returns ``{}`` when there is nothing to carry, so a parameter-free view's
+    tags are left untouched. The inverse of ``view_agg_params``."""
+    cleaned = {
+        name: [float(p) for p in params]
+        for name, params in params_by_resolved_name.items()
+        if params
+    }
+    return {AGG_PARAMS_TAG: json.dumps(cleaned)} if cleaned else {}
+
+
+def view_agg_params(view) -> Dict[str, List[float]]:
+    """The per-aggregation numeric parameters a view carries in its tags, keyed by resolved_name.
+    Absent => {} (the common case: every aggregation is parameter-free). The inverse of
+    ``encode_agg_params``."""
+    raw = (getattr(view, "tags", None) or {}).get(AGG_PARAMS_TAG)
+    if not raw:
+        return {}
+    return {name: list(params) for name, params in json.loads(raw).items()}
+
+
+def _fmt_param(value: float) -> str:
+    # Render a numeric aggregate parameter for SQL: an integer-valued float as an int literal
+    # (5.0 -> "5"), otherwise its plain decimal form (0.95 -> "0.95"). Keeps the emitted SQL
+    # free of "5.0" / scientific notation.
+    return str(int(value)) if float(value).is_integer() else repr(float(value))
+
+
+def _agg_expr(
+    agg: Aggregation,
+    agg_params: Optional[Dict[str, List[float]]] = None,
+    ts_col: Optional[str] = None,
+) -> str:
     # Output column == resolved_name(time_window) so the online MV and the offline
     # sink emit byte-identical column names — no online/offline column-name skew
     # (aggregation/__init__.py:106-118).
     out = agg.resolved_name(agg.time_window)
     if agg.function == "count_distinct":
         return f"count(distinct {agg.column}) AS {out}"
+    if agg.function in _SEQUENCE_ORDER:
+        # Array-valued: the n earliest/most-recent values, ordered by event time. n rides in
+        # agg_params keyed by resolved_name. CAVEAT: array_agg materializes the WHOLE window's
+        # values per key before the [1:n] slice, so MV state grows with the window's event count
+        # (unbounded for high-cardinality windows) — the bounded tile recombine is a later delivery.
+        params = (agg_params or {}).get(out)
+        if not params:
+            raise ValueError(
+                f"{agg.function} on {agg.column!r} needs an n parameter (the number of values to "
+                f"keep); none was provided. n rides in agg_params keyed by the aggregation's "
+                f"resolved name ({out!r})."
+            )
+        n = int(params[0])
+        ordered = (
+            f"array_agg({agg.column} ORDER BY {ts_col} {_SEQUENCE_ORDER[agg.function]})"
+        )
+        if agg.function.endswith("_distinct"):
+            ordered = f"array_distinct({ordered})"
+        return f"({ordered})[1:{n}] AS {out}"
+    if agg.function == "approx_percentile":
+        # Parameterized by the quantile (params[0]) and an optional precision (params[1]); neither
+        # has a field on feast.Aggregation, so they ride in agg_params keyed by this aggregation's
+        # resolved_name. RisingWave's approx_percentile takes the quantile plus an optional
+        # relative-error bound, so a precision maps to relative_error = 1 / precision (higher
+        # precision => tighter error; precision 100 => 0.01, RisingWave's own default).
+        params = (agg_params or {}).get(out)
+        if not params:
+            raise ValueError(
+                f"approx_percentile on {agg.column!r} needs a quantile parameter (a number in "
+                f"(0, 1)); none was provided. The quantile rides in agg_params keyed by the "
+                f"aggregation's resolved name ({out!r})."
+            )
+        args = _fmt_param(params[0])
+        if len(params) > 1 and params[1]:
+            args += f", {_fmt_param(1.0 / params[1])}"
+        return (
+            f"approx_percentile({args}) WITHIN GROUP (ORDER BY {agg.column}) AS {out}"
+        )
     fn = _SQL_FUNCTION.get(agg.function, agg.function)
     return f"{fn}({agg.column}) AS {out}"
 
@@ -127,6 +245,7 @@ def build_windowed_agg_select(
     *,
     source_is_retractable: bool,
     emit_on_close: bool,
+    agg_params: Optional[Dict[str, List[float]]] = None,
 ) -> str:
     """Windowed-aggregation SELECT shared by BOTH the online MV (``engine.update``)
     and the offline backfill, so the two definitions cannot drift apart.
@@ -149,10 +268,15 @@ def build_windowed_agg_select(
     if unsupported:
         raise ValueError(
             f"Unsupported aggregation function(s) {unsupported}. The RisingWave engine "
-            f"supports {sorted(SUPPORTED_AGG_FUNCTIONS)}. Sequence aggregations "
-            f"(first/last), approx_percentile (parameterized), and aggregation_secondary_key "
-            f"(Array output) are not yet supported."
+            f"supports {sorted(SUPPORTED_AGG_FUNCTIONS)}. aggregation_secondary_key "
+            f"(per-key Array/Map output) is not yet supported."
         )
+
+    # Two aggregations that resolve to the same output column would emit `... AS feat, ... AS feat`
+    # (a duplicate column RisingWave rejects) and, for a parameterized agg, collide on the
+    # resolved_name-keyed param carrier. The tile builders already guard this; the plain/EOWC path
+    # needs it too — it is the only path the parameterized/monoid aggregates run on.
+    _assert_distinct_output_names(aggregations)
 
     if source_is_retractable:
         monoids = sorted({a.function for a in aggregations} & MONOID_FUNCTIONS)
@@ -165,7 +289,9 @@ def build_windowed_agg_select(
             )
 
     keys = ", ".join(column_info.join_keys_columns)
-    exprs = ", ".join(_agg_expr(a) for a in aggregations)
+    exprs = ", ".join(
+        _agg_expr(a, agg_params, column_info.timestamp_column) for a in aggregations
+    )
     windowed = aggregations[0].time_window is not None
     src = _window_relation(aggregations, column_info.timestamp_column, relation)
 
@@ -312,14 +438,46 @@ def build_passthrough_pit_query(
 # sketch merge — still rejected.
 _ADDITIVE_TILE_FN = frozenset({"sum", "count", "min", "max"})
 _COMPOSITE_TILE_FN = frozenset({"mean", "var_pop", "var_samp", "stddev_pop", "stddev_samp"})
-_TILE_SUPPORTED_FN = _ADDITIVE_TILE_FN | _COMPOSITE_TILE_FN
+# SET — exact count_distinct: the per-tile partial is the tile's DISTINCT SET (an array), and the
+# rollup unions the sets (concat the per-tile arrays, dedup, count). Set union is a commutative
+# monoid with an additive partial, so it tiles correctly — unlike approx_count_distinct, whose HLL
+# sketch RisingWave does not expose as a mergeable value. CAVEAT: a high-cardinality column makes the
+# per-tile distinct array (hence the tiles MV state) large; this is the inherent cost of EXACT distinct.
+_SET_TILE_FN = frozenset({"count_distinct"})
+# SEQUENCE — bounded last/first(n): the per-tile partial is the tile's OWN top-n ordered array
+# (bounded to n), and the rollup concatenates the per-tile arrays in tile_end order (array_flatten),
+# re-slicing to n. Each tile's top-n contains every value in the global top-n for that tile's slot, so
+# the union's top-n is the window's top-n. n is per-aggregation (it shapes the partial), so it threads
+# from agg_params into the partial AND its name.
+_SEQUENCE_TILE_FN = frozenset(_SEQUENCE_ORDER)
+_TILE_SUPPORTED_FN = (
+    _ADDITIVE_TILE_FN | _COMPOSITE_TILE_FN | _SET_TILE_FN | _SEQUENCE_TILE_FN
+)
 
 
-def _partials_for(agg: Aggregation) -> List[Tuple[str, str]]:
+def _sequence_n(agg: Aggregation, agg_params: Optional[Dict[str, List[float]]]) -> int:
+    """The n (count of values to keep) for a sequence aggregate, from the out-of-band agg_params keyed
+    by resolved_name. Raises if absent — a sequence aggregate cannot tile (or render) without its n."""
+    key = agg.resolved_name(agg.time_window)
+    params = (agg_params or {}).get(key)
+    if not params:
+        raise ValueError(
+            f"{agg.function} on {agg.column!r} needs an n parameter (the number of values to keep); "
+            f"none was provided in agg_params (keyed by resolved_name {key!r})."
+        )
+    return int(params[0])
+
+
+def _partials_for(
+    agg: Aggregation,
+    ts_col: Optional[str] = None,
+    agg_params: Optional[Dict[str, List[float]]] = None,
+) -> List[Tuple[str, str]]:
     """The WINDOW-INDEPENDENT per-tile partial columns (name, SQL aggregate) one aggregation needs.
     Named by (function-family, column) so multiple windows / functions on the same column share a
     partial. Additive functions need ONE partial; composite (mean/var/stddev) need the additive
-    sub-partials that merge across tiles."""
+    sub-partials that merge across tiles; count_distinct stores the tile's distinct set; sequence
+    aggregates store the tile's bounded top-n (``ts_col`` orders it, ``n`` from agg_params)."""
     col, fn = agg.column, agg.function
     if fn == "sum":
         return [(f"sum_{col}", f"sum({col})")]
@@ -327,19 +485,40 @@ def _partials_for(agg: Aggregation) -> List[Tuple[str, str]]:
         return [(f"count_{col}", f"count({col})")]
     if fn in {"min", "max"}:
         return [(f"{fn}_{col}", f"{fn}({col})")]
+    if fn in _SEQUENCE_ORDER:
+        # The tile's OWN top-n ordered array (bounded). n is part of the partial (the slice + the
+        # name), so last(3) and last(5) on one column are distinct partials.
+        n = _sequence_n(agg, agg_params)
+        ordered = f"array_agg({col} ORDER BY {ts_col} {_SEQUENCE_ORDER[fn]})"
+        if fn.endswith("_distinct"):
+            ordered = f"array_distinct({ordered})"
+        return [(f"{fn}_{col}_{n}", f"({ordered})[1:{n}]")]
+    if fn == "count_distinct":
+        # The tile's DISTINCT SET. FILTER out NULL so the union+count matches count(distinct <col>),
+        # which excludes NULL (RisingWave's array_agg(DISTINCT) would otherwise carry a NULL element).
+        return [
+            (
+                f"distinct_{col}",
+                f"array_agg(DISTINCT {col}) FILTER (WHERE {col} IS NOT NULL)",
+            )
+        ]
     partials = [(f"sum_{col}", f"sum({col})"), (f"count_{col}", f"count({col})")]
     if fn in {"var_pop", "var_samp", "stddev_pop", "stddev_samp"}:
         partials.append((f"sumsq_{col}", f"sum({col} * {col})"))
     return partials
 
 
-def _view_partials(aggregations: List[Aggregation]) -> List[Tuple[str, str]]:
+def _view_partials(
+    aggregations: List[Aggregation],
+    ts_col: Optional[str] = None,
+    agg_params: Optional[Dict[str, List[float]]] = None,
+) -> List[Tuple[str, str]]:
     """The deduped union of every aggregation's window-independent partials = the tiles MV's partial
     columns. ``setdefault`` keeps one entry per partial name (the materialize-SQL is identical for a
-    given (family, column), so dedup is safe)."""
+    given partial name, so dedup is safe — a sequence partial's name carries its n + column)."""
     out: dict = {}
     for a in aggregations:
-        for name, sql in _partials_for(a):
+        for name, sql in _partials_for(a, ts_col, agg_params):
             out.setdefault(name, sql)
     return list(out.items())
 
@@ -350,6 +529,7 @@ def _tile_recombine(
     prefix: str = "",
     partial_filter: Optional[str] = None,
     output_prefix: str = "",
+    agg_params: Optional[Dict[str, List[float]]] = None,
 ) -> str:
     """The retrieval-time recombine for one aggregation: an expression over the window-independent
     tile partials aliased to the FINAL per-window ``resolved_name``. ``prefix`` qualifies the partial
@@ -375,6 +555,25 @@ def _tile_recombine(
         return f"{merged('count')} AS {out}"
     if fn in {"min", "max"}:
         return f"{merged(fn, fn)} AS {out}"
+    if fn == "count_distinct":
+        # Union the per-tile distinct sets and count: concat the tile arrays (array_flatten skips the
+        # NULL inner arrays a multi-window CASE produces), dedup, count. NULLIF(_, 0) maps an empty
+        # window (no tiles, or only NULL values) to NULL, so the offline LEFT-JOIN result matches the
+        # online MV — where such an entity is simply absent.
+        sets = merged("distinct", "array_agg")
+        return f"NULLIF(cardinality(array_distinct(array_flatten({sets}))), 0) AS {out}"
+    if fn in _SEQUENCE_ORDER:
+        # Concat the per-tile top-n arrays in tile_end order (array_flatten preserves it AND skips the
+        # NULL inner arrays a multi-window CASE produces), then slice to n. Each tile array is already
+        # ordered within the tile, so the flattened order is the global event-time order; the _distinct
+        # variants dedup again across tiles (a value may repeat in two tiles).
+        n = _sequence_n(agg, agg_params)
+        p = f"{prefix}{fn}_{col}_{n}"
+        inner = f"CASE WHEN {partial_filter} THEN {p} END" if partial_filter else p
+        flat = f"array_flatten(array_agg({inner} ORDER BY {prefix}tile_end {_SEQUENCE_ORDER[fn]}))"
+        if fn.endswith("_distinct"):
+            flat = f"array_distinct({flat})"
+        return f"({flat})[1:{n}] AS {out}"
     sm, cnt = merged("sum"), merged("count")
     if fn == "mean":
         return f"{sm} / NULLIF({cnt}, 0) AS {out}"
@@ -408,15 +607,16 @@ def _tile_unit(aggregation_interval) -> str:
 
 
 def _assert_tile_supported(aggregations: List[Aggregation]) -> None:
-    # The tile model supports any aggregation that recombines from additive partials: sum/count/min/max
-    # directly, and mean/var/stddev via composite partials (Chronon's IR). count_distinct/approx have
-    # no safe additive sketch merge across tiles (they are monoids with no inverse) — rejected.
+    # The tile model supports any aggregation that recombines from a mergeable per-tile partial:
+    # sum/count/min/max directly, mean/var/stddev via composite partials (Chronon's IR), and exact
+    # count_distinct via a per-tile distinct SET unioned at rollup. approx_count_distinct (HLL) and
+    # approx_percentile have no mergeable partial RisingWave exposes across tiles — rejected.
     unsupported = sorted({a.function for a in aggregations} - _TILE_SUPPORTED_FN)
     if unsupported:
         raise ValueError(
             f"Batch tile aggregations {unsupported} are not supported: the tile model rolls up "
-            f"additive per-tile partials, so {sorted(_TILE_SUPPORTED_FN)} work, but "
-            f"count_distinct/approx_count_distinct have no safe sketch merge across tiles."
+            f"mergeable per-tile partials, so {sorted(_TILE_SUPPORTED_FN)} work, but "
+            f"approx_count_distinct/approx_percentile have no mergeable sketch across tiles."
         )
 
 
@@ -472,7 +672,7 @@ def _assert_distinct_output_names(aggregations: List[Aggregation]) -> None:
     dupes = sorted({n for n in names if names.count(n) > 1})
     if dupes:
         raise ValueError(
-            f"tile aggregations resolve to duplicate output column name(s) {dupes}; give each "
+            f"aggregations resolve to duplicate output column name(s) {dupes}; give each "
             f"aggregation a distinct name (resolved_name uses an explicit name verbatim, ignoring the "
             f"window, so same-name aggregations on different windows still collide)."
         )
@@ -515,20 +715,32 @@ def group_aggregations_by_window(
     return [(secs, groups[secs]) for secs in sorted(groups)]
 
 
-def _tile_rollup_exprs(aggregations: List[Aggregation], prefix: str = "") -> str:
+def _tile_rollup_exprs(
+    aggregations: List[Aggregation],
+    prefix: str = "",
+    agg_params: Optional[Dict[str, List[float]]] = None,
+) -> str:
     """The per-aggregation recombine projection for the SINGLE-window rollup builders (the surrounding
     WHERE bounds the window, so no per-agg ``partial_filter``). Shared by online + floored rollups so
     they recombine per-tile partials IDENTICALLY (no-drift — one source of truth, via
     ``_tile_recombine``). ``prefix`` qualifies the partial columns for a joined relation."""
-    return ", ".join(_tile_recombine(a, prefix=prefix) for a in aggregations)
+    return ", ".join(
+        _tile_recombine(a, prefix=prefix, agg_params=agg_params) for a in aggregations
+    )
 
 
-def _tile_partials_projection(column_info: ColumnInfo, aggregations: List[Aggregation]) -> str:
+def _tile_partials_projection(
+    column_info: ColumnInfo,
+    aggregations: List[Aggregation],
+    agg_params: Optional[Dict[str, List[float]]] = None,
+) -> str:
     """The deduped window-independent partial columns as a ``{expr} AS {name}`` projection — the ONE
     source of the tile partial set, shared by the batch and streaming tile builders so they cannot drift.
     Includes the partial-name vs join-key clash guard (a bare ``{family}_{col}`` partial that equals an
     entity column would make the tiles MV have two identically-named columns, which RisingWave rejects)."""
-    view_partials = _view_partials(aggregations)
+    view_partials = _view_partials(
+        aggregations, column_info.timestamp_column, agg_params
+    )
     key_clash = sorted(set(column_info.join_keys_columns) & {name for (name, _) in view_partials})
     if key_clash:
         raise ValueError(
@@ -544,6 +756,7 @@ def build_batch_tile_select(
     relation: str,
     *,
     aggregation_interval,
+    agg_params: Optional[Dict[str, List[float]]] = None,
 ) -> str:
     """Tile materialization for a BATCH feature view: one PARTIAL aggregate per (entity, tile),
     where a tile spans ``[tile_start, tile_start + aggregation_interval)`` and is stamped by
@@ -557,7 +770,7 @@ def build_batch_tile_select(
     unit = _tile_unit(aggregation_interval)
     keys = ", ".join(column_info.join_keys_columns)
     bucket = f"date_trunc('{unit}', {column_info.timestamp_column})"
-    partials = _tile_partials_projection(column_info, aggregations)
+    partials = _tile_partials_projection(column_info, aggregations, agg_params)
     return (
         f"SELECT {keys}, {bucket} + INTERVAL '1 {unit}' AS tile_end, {partials} "
         f"FROM {relation} GROUP BY {keys}, {bucket}"
@@ -578,6 +791,7 @@ def build_streaming_tile_select(
     relation: str,
     *,
     aggregation_interval,
+    agg_params: Optional[Dict[str, List[float]]] = None,
 ) -> str:
     """Tile materialization for a STREAMING feature view — the streaming twin of ``build_batch_tile_select``.
     Emits the SAME per-(entity, tile_end) window-independent partials, but materialized by an EOWC TUMBLE at
@@ -602,7 +816,7 @@ def build_streaming_tile_select(
         )
     keys = ", ".join(column_info.join_keys_columns)
     ts = column_info.timestamp_column
-    partials = _tile_partials_projection(column_info, aggregations)
+    partials = _tile_partials_projection(column_info, aggregations, agg_params)
     return (
         f"SELECT {keys}, window_end AS tile_end, {partials} "
         f"FROM tumble({relation}, {ts}, INTERVAL '{secs}' SECOND) "
@@ -617,6 +831,7 @@ def build_tile_rollup_select(
     *,
     aggregation_interval,
     as_of_sql: str,
+    agg_params: Optional[Dict[str, List[float]]] = None,
 ) -> str:
     """Roll up tiles to the requested window, ANCHORED TO THE REQUEST/LABEL time (a request-anchored
     sliding window over a fixed tile set). Recombine each aggregation's per-tile
@@ -630,7 +845,7 @@ def build_tile_rollup_select(
     window_secs = _validate_window_rollup(aggregations, aggregation_interval)
     unit = _tile_unit(aggregation_interval)
     keys = ", ".join(column_info.join_keys_columns)
-    rollups = _tile_rollup_exprs(aggregations)
+    rollups = _tile_rollup_exprs(aggregations, agg_params=agg_params)
     end = f"date_trunc('{unit}', {as_of_sql})"
     return (
         f"SELECT {keys}, {rollups} FROM {tile_relation} "
@@ -645,6 +860,7 @@ def build_online_rollup_select(
     tile_relation: str,
     *,
     aggregation_interval,
+    agg_params: Optional[Dict[str, List[float]]] = None,
 ) -> str:
     """Online rollup MV over the tiles: a CONTINUOUS RisingWave materialized view that maintains the
     request-anchored window rollup for ``as_of = now()`` (wall-clock), so the ONLINE READ stays an
@@ -664,7 +880,7 @@ def build_online_rollup_select(
         raise ValueError("build_online_rollup_select requires at least one aggregation")
     window_secs = _validate_window_rollup(aggregations, aggregation_interval)
     keys = ", ".join(column_info.join_keys_columns)
-    rollups = _tile_rollup_exprs(aggregations)
+    rollups = _tile_rollup_exprs(aggregations, agg_params=agg_params)
     return (
         f"SELECT {keys}, {rollups}, max(tile_end) AS window_end FROM {tile_relation} "
         f"WHERE tile_end > now() - INTERVAL '{window_secs}' SECOND AND tile_end <= now() "
@@ -683,6 +899,7 @@ def build_offline_tile_pit_query(
     aggregation_interval,
     full_feature_names: bool = False,
     view_name: Optional[str] = None,
+    agg_params: Optional[Dict[str, List[float]]] = None,
 ) -> str:
     """Offline point-in-time training rollup for a tile BatchFeatureView. For EACH entity row, rolls
     the tiles up in the request-anchored window ``(end - W, end]`` where ``end = floor(label_ts,
@@ -725,6 +942,7 @@ def build_offline_tile_pit_query(
                 f"t.tile_end > {end} - INTERVAL '{int(a.time_window.total_seconds())}' SECOND"
             ),
             output_prefix=output_prefix,
+            agg_params=agg_params,
         )
         for a in aggregations
     )
@@ -1095,6 +1313,7 @@ class RWAggregationNode(_RWNode):
             input_value.data,
             source_is_retractable=self.source_is_retractable,
             emit_on_close=self.emit_on_close,
+            agg_params=view_agg_params(self.view),
         )
         columns = _agg_output_columns(self.column_info, aggregations)
         # After windowed aggregation the raw event-timestamp column is gone; window_end

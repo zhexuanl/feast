@@ -52,6 +52,7 @@ from feast.infra.compute_engines.risingwave.offline_store import (
 from feast.infra.compute_engines.risingwave.nodes import (
     RWFilterNode,
     RWJoinNode,
+    _assert_tile_supported,
     build_batch_tile_select,
     build_latest_row_select,
     build_offline_tile_pit_query,
@@ -60,6 +61,7 @@ from feast.infra.compute_engines.risingwave.nodes import (
     build_streaming_tile_select,
     build_tile_rollup_select,
     build_windowed_agg_select,
+    encode_agg_params,
     group_aggregations_by_window,
 )
 from feast.infra.compute_engines.dag.context import ColumnInfo, ExecutionContext
@@ -300,7 +302,7 @@ def test_emit_on_window_close_is_appended_only_when_requested():
 # --- Aggregation breadth: allow-list + streaming-safe stddev/variance + approx_count_distinct ---
 
 
-@pytest.mark.parametrize("function", ["median", "foobar", "approx_percentile", "first", "last"])
+@pytest.mark.parametrize("function", ["median", "foobar"])
 def test_unsupported_aggregation_function_is_rejected_at_apply(function):
     # Unknown / unsupported functions must fail at apply with a clear message, not reach
     # RisingWave as raw SQL and fail at parse time.
@@ -343,6 +345,118 @@ def test_approx_count_distinct_emits_native_sql_and_is_monoid():
             _column_info(), [_agg("approx_count_distinct")], "src",
             source_is_retractable=True, emit_on_close=False,
         )
+
+
+def test_approx_percentile_emits_within_group_ordered_sql():
+    # approx_percentile is parameterized (quantile + precision). Both ride out-of-band in agg_params
+    # keyed by the aggregation's resolved_name (feast.Aggregation carries no param field). RisingWave's
+    # form is approx_percentile(<p>, <relative_error>) WITHIN GROUP (ORDER BY <col>), where the
+    # precision maps to relative_error = 1 / precision (precision 100 => 0.01, RisingWave's default).
+    agg = _agg("approx_percentile")
+    out = agg.resolved_name(agg.time_window)
+    sql = build_windowed_agg_select(
+        _column_info(), [agg], "src",
+        source_is_retractable=False, emit_on_close=True,
+        agg_params={out: [0.95, 100]},
+    )
+    assert f"approx_percentile(0.95, 0.01) WITHIN GROUP (ORDER BY amount) AS {out}" in sql
+    # higher precision -> tighter relative_error
+    sql2 = build_windowed_agg_select(
+        _column_info(), [agg], "src",
+        source_is_retractable=False, emit_on_close=True,
+        agg_params={out: [0.95, 500]},
+    )
+    assert "approx_percentile(0.95, 0.002) WITHIN GROUP (ORDER BY amount)" in sql2
+
+
+def test_approx_percentile_without_quantile_param_is_rejected():
+    # approx_percentile cannot be emitted without its quantile; an aggregation that reaches the
+    # builder with no agg_params entry must fail fast, not produce invalid SQL.
+    with pytest.raises(ValueError, match="quantile"):
+        build_windowed_agg_select(
+            _column_info(), [_agg("approx_percentile")], "src",
+            source_is_retractable=False, emit_on_close=True,
+        )
+
+
+def test_approx_percentile_is_monoid_and_tile_rejected():
+    # No inverse -> monoid -> rejected over a retractable source; and no additive partial -> not
+    # tile-decomposable, so it stays rejected by the tile model (plain/EOWC path only).
+    with pytest.raises(ValueError, match="monoid"):
+        build_windowed_agg_select(
+            _column_info(), [_agg("approx_percentile")], "src",
+            source_is_retractable=True, emit_on_close=True,
+            agg_params={_agg("approx_percentile").resolved_name(timedelta(seconds=3600)): [0.5]},
+        )
+    with pytest.raises(ValueError, match="not supported"):
+        _assert_tile_supported([_agg("approx_percentile")])
+
+
+@pytest.mark.parametrize(
+    "function,order,distinct",
+    [
+        ("last", "DESC", False),
+        ("first", "ASC", False),
+        ("last_distinct", "DESC", True),
+        ("first_distinct", "ASC", True),
+    ],
+)
+def test_sequence_aggregates_emit_ordered_array_agg_slice(function, order, distinct):
+    # Sequence aggregates are Array-valued: the n most-recent (last*) / earliest (first*) values,
+    # ordered. n rides the same agg_params carrier as approx_percentile's quantile. The _distinct
+    # variants wrap array_distinct (RisingWave rejects array_agg(DISTINCT ... ORDER BY <other col>)).
+    agg = _agg(function)
+    out = agg.resolved_name(agg.time_window)
+    sql = build_windowed_agg_select(
+        _column_info(), [agg], "src",
+        source_is_retractable=False, emit_on_close=True,
+        agg_params={out: [3]},
+    )
+    inner = f"array_agg(amount ORDER BY event_ts {order})"
+    if distinct:
+        inner = f"array_distinct({inner})"
+    assert f"({inner})[1:3] AS {out}" in sql
+
+
+def test_sequence_aggregate_without_n_param_is_rejected():
+    with pytest.raises(ValueError, match="needs an n"):
+        build_windowed_agg_select(
+            _column_info(), [_agg("last")], "src",
+            source_is_retractable=False, emit_on_close=True,
+        )
+
+
+def test_sequence_aggregate_is_tile_supported():
+    # Sequence aggregates now tile via a bounded top-n-per-tile partial re-merged at rollup (the
+    # per-tile array is bounded to n). No raise.
+    _assert_tile_supported([_agg("last")])
+
+
+def test_windowed_path_rejects_duplicate_resolved_output_names():
+    # Two aggregations resolving to the SAME output column collide on one AS alias (and, for a
+    # parameterized agg, the resolved_name-keyed param carrier clobbers one of the params). The
+    # plain/EOWC path is the ONLY path approx_percentile runs on, so the guard must live in the
+    # shared builder — rejecting clearly at apply for BOTH the online MV and the offline backfill,
+    # not as an opaque CREATE MATERIALIZED VIEW failure.
+    agg = _agg("approx_percentile")
+    out = agg.resolved_name(agg.time_window)
+    with pytest.raises(ValueError, match="duplicate output column"):
+        build_windowed_agg_select(
+            _column_info(), [agg, _agg("approx_percentile")], "src",
+            source_is_retractable=False, emit_on_close=True,
+            agg_params={out: [0.5, 100]},
+        )
+
+
+def test_stream_mv_select_threads_approx_percentile_quantile_from_view_tags():
+    # The quantile rides in the view's ourfs_agg_params tag; the engine decodes it and renders the
+    # parameterized SQL, so a re-applied / registry-rehydrated view reproduces the same MV SELECT.
+    agg = _agg("approx_percentile")
+    out = agg.resolved_name(agg.time_window)
+    view = _stream_view(_kafka_source(watermark=True), [agg])
+    view.tags = encode_agg_params({out: [0.9, 100]})
+    sql = _engine()._stream_mv_select("proj", view)
+    assert f"approx_percentile(0.9, 0.01) WITHIN GROUP (ORDER BY amount) AS {out}" in sql
 
 
 # --- Batch tile aggregation (tile model: partial aggregates + retrieval rollup) ---
@@ -402,13 +516,63 @@ def test_batch_tile_min_max_roll_up_with_min_max():
     assert "max(max_amount) AS max_amount_2592000s" in roll
 
 
-@pytest.mark.parametrize("function", ["count_distinct", "approx_count_distinct"])
+@pytest.mark.parametrize("function", ["approx_count_distinct"])
 def test_batch_tile_rejects_unmergeable_aggregation(function):
-    # count_distinct/approx have no safe additive sketch merge across tiles — rejected clearly.
+    # approx_count_distinct (HLL) has no mergeable sketch across tiles — rejected clearly. (Exact
+    # count_distinct DOES tile, via a per-tile distinct set; see the count_distinct tile tests below.)
     with pytest.raises(ValueError, match="not supported"):
         build_batch_tile_select(
             _column_info(), [_agg(function, 2592000)], "src", aggregation_interval=timedelta(days=1)
         )
+
+
+@pytest.mark.parametrize(
+    "function,order,distinct",
+    [("last", "DESC", False), ("first", "ASC", False),
+     ("last_distinct", "DESC", True), ("first_distinct", "ASC", True)],
+)
+def test_sequence_tile_partial_is_bounded_topn_per_tile(function, order, distinct):
+    # The per-tile partial is the tile's OWN top-n (bounded to n), named with n so last(3) and
+    # last(5) on one column are distinct partials. n rides agg_params keyed by resolved_name.
+    agg = _agg(function, 2592000)
+    out = agg.resolved_name(agg.time_window)
+    sql = build_batch_tile_select(
+        _column_info(), [agg], "src", aggregation_interval=timedelta(days=1), agg_params={out: [3]}
+    )
+    inner = f"array_agg(amount ORDER BY event_ts {order})"
+    if distinct:
+        inner = f"array_distinct({inner})"
+    assert f"({inner})[1:3] AS {function}_amount_3" in sql
+
+
+def test_sequence_tile_rollup_flattens_topn_in_tile_order_then_slices():
+    # Rollup concatenates the per-tile top-n arrays in tile_end order (array_flatten preserves it),
+    # then slices to n — the n most-recent across the window, bounded.
+    agg = _agg("last", 2592000)
+    out = agg.resolved_name(agg.time_window)
+    sql = build_online_rollup_select(
+        _column_info(), [agg], "tiles", aggregation_interval=timedelta(days=1), agg_params={out: [3]}
+    )
+    assert f"(array_flatten(array_agg(last_amount_3 ORDER BY tile_end DESC)))[1:3] AS {out}" in sql
+
+
+def test_count_distinct_tile_partial_is_nullsafe_distinct_set():
+    # The per-tile partial is the tile's DISTINCT SET (an array), NULL-filtered so the union+count
+    # matches count(distinct <col>) which excludes NULL.
+    sql = build_batch_tile_select(
+        _column_info(), [_agg("count_distinct", 2592000)], "src", aggregation_interval=timedelta(days=1)
+    )
+    assert "array_agg(DISTINCT amount) FILTER (WHERE amount IS NOT NULL) AS distinct_amount" in sql
+
+
+def test_count_distinct_tile_rollup_unions_sets_then_counts():
+    # Rollup unions the per-tile distinct arrays (array_flatten) and counts distinct elements; an empty
+    # window -> NULL (NULLIF) so the offline LEFT-JOIN matches the online MV's absent-entity NULL.
+    out = "count_distinct_amount_2592000s"
+    online = build_online_rollup_select(
+        _column_info(), [_agg("count_distinct", 2592000)], "tiles", aggregation_interval=timedelta(days=1)
+    )
+    assert f"NULLIF(cardinality(array_distinct(array_flatten(array_agg(distinct_amount)))), 0) AS {out}" in online
 
 
 def test_batch_tile_mean_emits_sum_and_count_partials():
@@ -493,7 +657,7 @@ def test_online_rollup_count_combiner_is_sum():
     assert "sum(count_amount) AS count_amount_2592000s" in sql
 
 
-@pytest.mark.parametrize("function", ["count_distinct", "approx_count_distinct"])
+@pytest.mark.parametrize("function", ["approx_count_distinct"])
 def test_online_rollup_rejects_non_additive_aggregation(function):
     with pytest.raises(ValueError, match="not supported"):
         build_online_rollup_select(
@@ -563,7 +727,7 @@ def test_offline_tile_pit_count_combiner_is_sum():
     assert "THEN t.count_amount END) AS count_amount_259200s" in sql
 
 
-@pytest.mark.parametrize("function", ["count_distinct", "approx_count_distinct"])
+@pytest.mark.parametrize("function", ["approx_count_distinct"])
 def test_offline_tile_pit_rejects_non_additive(function):
     with pytest.raises(ValueError, match="not supported"):
         build_offline_tile_pit_query(
@@ -618,7 +782,7 @@ def test_streaming_tile_select_rejects_non_hour_day_interval(secs):
 def test_streaming_tile_select_rejects_unsupported_and_empty():
     with pytest.raises(ValueError, match="not supported"):  # same tile-supported contract as batch
         build_streaming_tile_select(
-            _column_info(), [_agg("count_distinct", 259200)], "src", aggregation_interval=timedelta(hours=1)
+            _column_info(), [_agg("approx_count_distinct", 259200)], "src", aggregation_interval=timedelta(hours=1)
         )
     with pytest.raises(ValueError, match="at least one aggregation"):
         build_streaming_tile_select(_column_info(), [], "src", aggregation_interval=timedelta(hours=1))
@@ -1028,7 +1192,7 @@ def test_iceberg_opts_escape_explicit_dev_credentials():
     assert "s3.secret.key='sup3r''s3cret'" in opts  # escaped, not broken/injectable
 
 
-@pytest.mark.parametrize("function", ["count_distinct", "approx_count_distinct"])
+@pytest.mark.parametrize("function", ["approx_count_distinct"])
 def test_provision_batch_rejects_non_additive_aggregation(function):
     view = _batch_view([_agg(function)])
     with pytest.raises(ValueError, match="not supported"):

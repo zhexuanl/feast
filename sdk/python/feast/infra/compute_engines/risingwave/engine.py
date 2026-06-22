@@ -63,6 +63,7 @@ from feast.infra.compute_engines.risingwave.nodes import (
     build_streaming_tile_select,
     build_windowed_agg_select,
     group_aggregations_by_window,
+    view_agg_params,
 )
 from feast.infra.compute_engines.dag.context import ColumnInfo
 from feast.infra.offline_stores.offline_store import OfflineStore
@@ -686,6 +687,7 @@ class RisingWaveComputeEngine(ComputeEngine):
             source_name(project, view.name),
             source_is_retractable=_source_is_retractable(view.stream_source),
             emit_on_close=bool(self.config.emit_on_window_close),
+            agg_params=view_agg_params(view),
         )
 
     def _reconcile_stream_view(self, cur, project: str, view) -> None:
@@ -845,18 +847,21 @@ class RisingWaveComputeEngine(ComputeEngine):
         interval = tile_interval(view)
         column_info = _batch_column_info(view)
         aggs = view_aggregations(view)
+        params = view_agg_params(view)
         src = source_name(project, view.name)
         tiles = tiles_name(project, view.name)
         ddl = [
             _iceberg_source_ddl(src, view.batch_source.table, self.config),
             _materialized_view_ddl(
                 tiles,
-                build_batch_tile_select(column_info, aggs, src, aggregation_interval=interval),
+                build_batch_tile_select(
+                    column_info, aggs, src, aggregation_interval=interval, agg_params=params
+                ),
             ),
         ]
         for window_secs, window_aggs in group_aggregations_by_window(aggs):
             rollup_select = build_online_rollup_select(
-                column_info, window_aggs, tiles, aggregation_interval=interval
+                column_info, window_aggs, tiles, aggregation_interval=interval, agg_params=params
             )
             mv = online_window_mv_name(project, view.name, window_secs)
             ddl.append(_materialized_view_ddl(mv, rollup_select))
@@ -907,18 +912,21 @@ class RisingWaveComputeEngine(ComputeEngine):
         interval = tile_interval(view)
         column_info = _registry_free_column_info(view)
         aggs = view_aggregations(view)
+        params = view_agg_params(view)
         src = source_name(project, view.name)
         tiles = tiles_name(project, view.name)
         ddl = [
             _source_ddl(src, source, view),
             _materialized_view_ddl(
                 tiles,
-                build_streaming_tile_select(column_info, aggs, src, aggregation_interval=interval),
+                build_streaming_tile_select(
+                    column_info, aggs, src, aggregation_interval=interval, agg_params=params
+                ),
             ),
         ]
         for window_secs, window_aggs in group_aggregations_by_window(aggs):
             rollup_select = build_online_rollup_select(
-                column_info, window_aggs, tiles, aggregation_interval=interval
+                column_info, window_aggs, tiles, aggregation_interval=interval, agg_params=params
             )
             mv = online_window_mv_name(project, view.name, window_secs)
             ddl.append(_materialized_view_ddl(mv, rollup_select))
@@ -940,14 +948,15 @@ class RisingWaveComputeEngine(ComputeEngine):
         interval = tile_interval(view)
         column_info = _batch_column_info(view)
         aggs = view_aggregations(view)
+        params = view_agg_params(view)
         src = source_name(project, view.name)
         tiles = tiles_name(project, view.name)
         desired_tiles = build_batch_tile_select(
-            column_info, aggs, src, aggregation_interval=interval
+            column_info, aggs, src, aggregation_interval=interval, agg_params=params
         )
         desired_online = {
             online_window_mv_name(project, view.name, w): build_online_rollup_select(
-                column_info, wa, tiles, aggregation_interval=interval
+                column_info, wa, tiles, aggregation_interval=interval, agg_params=params
             )
             for w, wa in group_aggregations_by_window(aggs)
         }
@@ -1004,14 +1013,15 @@ class RisingWaveComputeEngine(ComputeEngine):
         interval = tile_interval(view)
         column_info = _registry_free_column_info(view)
         aggs = view_aggregations(view)
+        params = view_agg_params(view)
         src = source_name(project, view.name)
         tiles = tiles_name(project, view.name)
         desired_tiles = build_streaming_tile_select(
-            column_info, aggs, src, aggregation_interval=interval
+            column_info, aggs, src, aggregation_interval=interval, agg_params=params
         )
         desired_online = {
             online_window_mv_name(project, view.name, w): build_online_rollup_select(
-                column_info, wa, tiles, aggregation_interval=interval
+                column_info, wa, tiles, aggregation_interval=interval, agg_params=params
             )
             for w, wa in group_aggregations_by_window(aggs)
         }
