@@ -166,10 +166,14 @@ class StreamFeatureView(FeatureView):
 
         if enable_tiling and self.aggregations:
             effective_hop_size = tiling_hop_size or timedelta(minutes=5)
+            # Only a POSITIVE (finite trailing) window constrains the tiling hop. A null window is None
+            # in memory but round-trips through the proto as timedelta(0); both mean "no finite trailing
+            # window" (a lifetime aggregation, or a window-series whose geometry rides an engine carrier),
+            # so they must NOT pull the minimum to zero and reject an otherwise-valid hop.
             time_windows = [
                 agg.time_window
                 for agg in self.aggregations
-                if agg.time_window is not None
+                if agg.time_window is not None and agg.time_window > timedelta(0)
             ]
             if time_windows:
                 min_window_size = min(time_windows)

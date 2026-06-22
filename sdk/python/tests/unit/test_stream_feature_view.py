@@ -336,3 +336,32 @@ def test_stream_feature_view_org_field():
 
     sfv_other_org = StreamFeatureView(name="sfv-with-org", org="search", **common)
     assert sfv_with_org != sfv_other_org
+
+
+def test_tiling_ignores_null_window_aggregations():
+    # A tiled stream view may carry a null-window aggregation: a LifetimeWindow (all history) or a
+    # window-SERIES whose geometry rides an engine carrier. The null window is None in memory but
+    # round-trips through the proto as timedelta(0); neither is a finite trailing window, so neither
+    # must pull min(time_window) to zero and reject an otherwise-valid tiling hop.
+    source = KafkaSource(
+        name="kafka", timestamp_field="event_timestamp", kafka_bootstrap_servers="",
+        message_format=AvroFormat(""), topic="topic", batch_source=FileSource(path="some path"),
+    )
+
+    def mk(aggs):
+        return StreamFeatureView(
+            name="sfv", entities=[], source=source, timestamp_field="event_timestamp",
+            enable_tiling=True, tiling_hop_size=timedelta(days=1), aggregations=aggs,
+        )
+
+    win = Aggregation(column="amount", function="sum", time_window=timedelta(days=7))
+    null_win = Aggregation(column="amount", function="sum", time_window=None, name="lifetime_sum")
+
+    # a real 7d window alongside a null-window agg constructs AND survives the proto round-trip (the
+    # round-tripped null window is timedelta(0), which must not trip the hop < min-window check)
+    StreamFeatureView.from_proto(mk([win, null_win]).to_proto())
+    # a null-window-only tiled view round-trips too (no finite window to constrain the hop)
+    StreamFeatureView.from_proto(mk([null_win]).to_proto())
+    # but the guard still rejects a hop >= a REAL positive window
+    with pytest.raises(ValueError, match="must be smaller than"):
+        mk([Aggregation(column="amount", function="sum", time_window=timedelta(hours=1))])
