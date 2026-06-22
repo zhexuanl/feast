@@ -40,6 +40,7 @@ from feast.infra.compute_engines.risingwave.job import (
 from feast.infra.compute_engines.risingwave.names import (
     base_name,
     offline_sink_name,
+    online_lifetime_mv_name,
     online_mv_name,
     online_window_mv_name,
     passthrough_history_source_name,
@@ -59,10 +60,14 @@ from feast.infra.compute_engines.risingwave.iceberg_source import (
 from feast.infra.compute_engines.risingwave.nodes import (
     build_batch_tile_select,
     build_latest_row_select,
+    build_lifetime_rollup_select,
     build_online_rollup_select,
     build_streaming_tile_select,
     build_windowed_agg_select,
     group_aggregations_by_window_offset,
+    group_lifetime_aggregations,
+    is_lifetime_agg,
+    view_agg_lifetime,
     view_agg_offsets,
     view_agg_params,
 )
@@ -375,11 +380,16 @@ def _batch_drop_ddl(project: str, view) -> List[str]:
     # Mirror of _drop_ddl for a tile BatchFeatureView: drop the per-window online rollup MVs, then the
     # tiles MV they read, then the source. No Iceberg sink is provisioned (the MVs are read directly).
     # The (window, offset) set comes from the SAME split the engine provisioned with.
+    aggs = view_aggregations(view)
+    lifetimes = view_agg_lifetime(view)
+    windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes)]
     ddl = [
         f'DROP MATERIALIZED VIEW IF EXISTS "{online_window_mv_name(project, view.name, w, off)}"'
-        for (w, off), _ in group_aggregations_by_window_offset(
-            view_aggregations(view), view_agg_offsets(view)
-        )
+        for (w, off), _ in group_aggregations_by_window_offset(windowed_aggs, view_agg_offsets(view))
+    ]
+    ddl += [
+        f'DROP MATERIALIZED VIEW IF EXISTS "{online_lifetime_mv_name(project, view.name, floor)}"'
+        for floor, _ in group_lifetime_aggregations(aggs, lifetimes)
     ]
     ddl.append(f'DROP MATERIALIZED VIEW IF EXISTS "{tiles_name(project, view.name)}"')
     ddl.append(f'DROP SOURCE IF EXISTS "{source_name(project, view.name)}"')
@@ -394,11 +404,13 @@ def _existing_online_mv_names(cur, project: str, view_name: str) -> set:
     never removes a no-longer-provisioned MV, so it would otherwise run forever, unreachable by any future
     provision/teardown (which only name the current set).
 
-    Matches both the trailing-window form ``{base}_online_{secs}s`` and the shifted form
-    ``{base}_online_{secs}s_off{secs}s`` (``online_window_mv_name``); the anchored regex avoids matching a
-    differently-named view that merely shares this view's name as a prefix."""
+    Matches the trailing-window form ``{base}_online_{secs}s``, the shifted form
+    ``{base}_online_{secs}s_off{secs}s`` (``online_window_mv_name``), and the lifetime form
+    ``{base}_online_lifetime`` / ``..._from{secs}s`` (``online_lifetime_mv_name``); the anchored regex
+    avoids matching a differently-named view that merely shares this view's name as a prefix."""
+    base = re.escape(base_name(project, view_name))
     pattern = re.compile(
-        rf"^{re.escape(base_name(project, view_name))}_online_\d+s(?:_off\d+s)?$"
+        rf"^{base}_online_(?:\d+s(?:_off\d+s)?|lifetime(?:_from\d+s)?)$"
     )
     cur.execute("SELECT matviewname FROM pg_matviews")
     return {name for (name,) in cur.fetchall() if pattern.match(name)}
@@ -863,8 +875,10 @@ class RisingWaveComputeEngine(ComputeEngine):
             ),
         ]
         offsets = view_agg_offsets(view)
+        lifetimes = view_agg_lifetime(view)
+        windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes)]
         for (window_secs, offset_secs), window_aggs in group_aggregations_by_window_offset(
-            aggs, offsets
+            windowed_aggs, offsets
         ):
             rollup_select = build_online_rollup_select(
                 column_info, window_aggs, tiles, aggregation_interval=interval,
@@ -872,6 +886,16 @@ class RisingWaveComputeEngine(ComputeEngine):
             )
             mv = online_window_mv_name(project, view.name, window_secs, offset_secs)
             ddl.append(_materialized_view_ddl(mv, rollup_select))
+        # One all-history LIFETIME rollup MV per distinct floor (each has its own now()-anchored WHERE).
+        for floor, lifetime_aggs in group_lifetime_aggregations(aggs, lifetimes):
+            lifetime_select = build_lifetime_rollup_select(
+                column_info, lifetime_aggs, tiles, agg_params=params, lifetime_start_secs=floor
+            )
+            ddl.append(
+                _materialized_view_ddl(
+                    online_lifetime_mv_name(project, view.name, floor), lifetime_select
+                )
+            )
         return ddl
 
     def _provision_streaming_tile_ddl(self, project: str, view) -> List[str]:
@@ -932,8 +956,10 @@ class RisingWaveComputeEngine(ComputeEngine):
             ),
         ]
         offsets = view_agg_offsets(view)
+        lifetimes = view_agg_lifetime(view)
+        windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes)]
         for (window_secs, offset_secs), window_aggs in group_aggregations_by_window_offset(
-            aggs, offsets
+            windowed_aggs, offsets
         ):
             rollup_select = build_online_rollup_select(
                 column_info, window_aggs, tiles, aggregation_interval=interval,
@@ -941,6 +967,16 @@ class RisingWaveComputeEngine(ComputeEngine):
             )
             mv = online_window_mv_name(project, view.name, window_secs, offset_secs)
             ddl.append(_materialized_view_ddl(mv, rollup_select))
+        # One all-history LIFETIME rollup MV per distinct floor (each has its own now()-anchored WHERE).
+        for floor, lifetime_aggs in group_lifetime_aggregations(aggs, lifetimes):
+            lifetime_select = build_lifetime_rollup_select(
+                column_info, lifetime_aggs, tiles, agg_params=params, lifetime_start_secs=floor
+            )
+            ddl.append(
+                _materialized_view_ddl(
+                    online_lifetime_mv_name(project, view.name, floor), lifetime_select
+                )
+            )
         return ddl
 
     def _reconcile_batch_view(self, cur, project: str, view) -> None:
@@ -966,13 +1002,23 @@ class RisingWaveComputeEngine(ComputeEngine):
             column_info, aggs, src, aggregation_interval=interval, agg_params=params
         )
         offsets = view_agg_offsets(view)
+        lifetimes = view_agg_lifetime(view)
+        windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes)]
         desired_online = {
             online_window_mv_name(project, view.name, w, off): build_online_rollup_select(
                 column_info, wa, tiles, aggregation_interval=interval,
                 agg_params=params, offset_secs=off,
             )
-            for (w, off), wa in group_aggregations_by_window_offset(aggs, offsets)
+            for (w, off), wa in group_aggregations_by_window_offset(windowed_aggs, offsets)
         }
+        desired_online.update(
+            {
+                online_lifetime_mv_name(project, view.name, floor): build_lifetime_rollup_select(
+                    column_info, la, tiles, agg_params=params, lifetime_start_secs=floor
+                )
+                for floor, la in group_lifetime_aggregations(aggs, lifetimes)
+            }
+        )
         deployed_online = {
             name: _deployed_mv_select(cur, name)
             for name in _existing_online_mv_names(cur, project, view.name)
@@ -1031,13 +1077,23 @@ class RisingWaveComputeEngine(ComputeEngine):
             column_info, aggs, src, aggregation_interval=interval, agg_params=params
         )
         offsets = view_agg_offsets(view)
+        lifetimes = view_agg_lifetime(view)
+        windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes)]
         desired_online = {
             online_window_mv_name(project, view.name, w, off): build_online_rollup_select(
                 column_info, wa, tiles, aggregation_interval=interval,
                 agg_params=params, offset_secs=off,
             )
-            for (w, off), wa in group_aggregations_by_window_offset(aggs, offsets)
+            for (w, off), wa in group_aggregations_by_window_offset(windowed_aggs, offsets)
         }
+        desired_online.update(
+            {
+                online_lifetime_mv_name(project, view.name, floor): build_lifetime_rollup_select(
+                    column_info, la, tiles, agg_params=params, lifetime_start_secs=floor
+                )
+                for floor, la in group_lifetime_aggregations(aggs, lifetimes)
+            }
+        )
         deployed_online = {
             name: _deployed_mv_select(cur, name)
             for name in _existing_online_mv_names(cur, project, view.name)

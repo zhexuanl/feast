@@ -55,12 +55,15 @@ from feast.infra.compute_engines.risingwave.nodes import (
     _assert_tile_supported,
     build_batch_tile_select,
     build_latest_row_select,
+    build_lifetime_rollup_select,
     build_offline_tile_pit_query,
     build_online_rollup_select,
     build_passthrough_pit_query,
     build_streaming_tile_select,
     build_tile_rollup_select,
     build_windowed_agg_select,
+    group_lifetime_aggregations,
+    encode_agg_lifetime,
     encode_agg_offsets,
     encode_agg_params,
     group_aggregations_by_window,
@@ -462,6 +465,30 @@ def test_stream_mv_select_threads_approx_percentile_quantile_from_view_tags():
     assert f"approx_percentile(0.9, 0.01) WITHIN GROUP (ORDER BY amount) AS {out}" in sql
 
 
+def test_agg_lifetime_carrier_round_trips_with_optional_floor():
+    # The lifetime carrier marks which aggregations are lifetime (presence of the resolved_name), with an
+    # optional floor epoch (None = no floor); unlike the param/offset carriers, a None value is kept (it
+    # is a meaningful "lifetime, no floor"). is_lifetime_agg reads membership back by resolved_name.
+    from feast.infra.compute_engines.risingwave.nodes import (
+        AGG_LIFETIME_TAG,
+        is_lifetime_agg,
+        view_agg_lifetime,
+    )
+
+    assert encode_agg_lifetime({}) == {}
+    enc = encode_agg_lifetime({"sum_amount": None, "spend_since": 1767225600})
+    view = _stream_view(_kafka_source(watermark=True), [_agg("sum")])
+    view.tags = enc
+    assert view_agg_lifetime(view) == {"sum_amount": None, "spend_since": 1767225600}
+    # a lifetime aggregation carries no window; resolved_name is suffix-less, so membership resolves it
+    lifetime = Aggregation(column="amount", function="sum", time_window=None)
+    windowed = _agg("sum", 604800)
+    lifetimes = view_agg_lifetime(view)
+    assert is_lifetime_agg(lifetime, lifetimes) is True  # resolved_name 'sum_amount' in the carrier
+    assert is_lifetime_agg(windowed, lifetimes) is False  # 'sum_amount_604800s' not in the carrier
+    assert AGG_LIFETIME_TAG in enc
+
+
 def test_agg_offset_carrier_round_trips_and_drops_zero():
     # The per-aggregation window offset rides the engine-owned offset tag (parallel to the param tag),
     # keyed by resolved_name. A zero offset (the trailing window) is omitted so a non-shifted view's
@@ -816,6 +843,73 @@ def test_offline_tile_pit_offset_zero_is_byte_identical():
         aggregation_interval=timedelta(days=1), offsets={},
     )
     assert base == with_empty
+
+
+# --- lifetime window: all-history rollup, lower bound dropped --------------------------------------
+
+
+def _lifetime_agg(function="sum", column="amount"):
+    # a lifetime aggregation lowers to a feast.Aggregation with NO time_window; its resolved name is
+    # suffix-less ({fn}_{col}) and it is marked lifetime by the carrier.
+    return Aggregation(column=column, function=function, time_window=None)
+
+
+def test_lifetime_rollup_one_sided_now_bound_no_lower():
+    agg = _lifetime_agg("sum")
+    sql = build_lifetime_rollup_select(_column_info(), [agg], "tiles")
+    assert "WHERE tile_end <= now() GROUP BY user_id" in sql  # one-sided: no lower bound
+    assert "now() - INTERVAL" not in sql  # nothing trailing
+    assert "sum(sum_amount) AS sum_amount" in sql  # recombine identical to the windowed rollup
+    assert "max(tile_end) AS window_end" in sql
+
+
+def test_lifetime_rollup_with_floor_adds_lower_bound():
+    sql = build_lifetime_rollup_select(_column_info(), [_lifetime_agg("sum")], "tiles", lifetime_start_secs=1767225600)
+    assert "WHERE tile_end <= now() AND tile_end > (to_timestamp(1767225600) AT TIME ZONE 'UTC')" in sql
+
+
+def test_group_lifetime_aggregations_by_floor_none_first():
+    a = _lifetime_agg("sum")  # resolved_name sum_amount
+    b = Aggregation(column="amount", function="sum", time_window=None, name="since_jan")
+    c = Aggregation(column="amount", function="count", time_window=None, name="cnt_lifetime")
+    lifetimes = {"sum_amount": None, "since_jan": 1767225600, "cnt_lifetime": None}
+    groups = group_lifetime_aggregations([a, b, c], lifetimes)
+    assert [floor for floor, _ in groups] == [None, 1767225600]  # no-floor group first, then floored
+    by_floor = {floor: aggs for floor, aggs in groups}
+    assert by_floor[None] == [a, c]
+    assert by_floor[1767225600] == [b]
+
+
+def test_offline_pit_lifetime_drops_join_lower_bound_and_reads_all_tiles():
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(), aggregations=[_lifetime_agg("sum")],
+        aggregation_interval=timedelta(days=1), lifetimes={"sum_amount": None},
+    )
+    end = "date_trunc('day', e.\"event_timestamp\")"
+    # the join keeps only the upper bound (<= end); the lower bound is gone — lifetime reads all history
+    assert f"AND t.tile_end <= {end} GROUP BY" in sql
+    assert "t.tile_end >" not in sql.split("LEFT JOIN")[1].split("GROUP BY")[0]  # no lower bound anywhere in the join
+    # a no-floor lifetime agg recombines the raw partial (no CASE narrowing)
+    assert "sum(t.sum_amount) AS sum_amount" in sql
+
+
+def test_offline_pit_lifetime_mixed_with_windowed():
+    # a windowed 7d sum alongside a lifetime sum: windowed keeps its CASE; the join still drops its lower
+    # bound (lifetime needs all history); the lifetime floored agg gets a tile_end > floor CASE.
+    w = _agg("sum", 604800)
+    life = Aggregation(column="amount", function="sum", time_window=None, name="since_jan")
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(), aggregations=[w, life],
+        aggregation_interval=timedelta(days=1), lifetimes={"since_jan": 1767225600},
+    )
+    end = "date_trunc('day', e.\"event_timestamp\")"
+    assert f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '604800' SECOND THEN t.sum_amount END) AS sum_amount_604800s" in sql
+    assert "sum(CASE WHEN t.tile_end > (to_timestamp(1767225600) AT TIME ZONE 'UTC') THEN t.sum_amount END) AS since_jan" in sql
+    assert f"AND t.tile_end <= {end} GROUP BY" in sql  # join lower bound dropped
 
 
 # --- offline tile PIT: floor-anchored range-agg join, per entity-row label -------------------------
@@ -1340,6 +1434,8 @@ def test_existing_online_mv_names_matches_only_this_views_window_and_offset_mvs(
                 ("proj_v_online_259200s",),            # trailing-window match
                 ("proj_v_online_2592000s",),           # trailing-window match
                 ("proj_v_online_604800s_off604800s",), # shifted (offset) match
+                ("proj_v_online_lifetime",),           # lifetime (no floor) match
+                ("proj_v_online_lifetime_from1767225600s",),  # floored lifetime match
                 ("proj_v_tiles",),                     # not an online MV
                 ("proj_v_online_xs",),                 # non-numeric window -> ignore
                 ("proj_other_online_5s",),             # different view -> ignore
@@ -1352,6 +1448,8 @@ def test_existing_online_mv_names_matches_only_this_views_window_and_offset_mvs(
         "proj_v_online_259200s",
         "proj_v_online_2592000s",
         "proj_v_online_604800s_off604800s",
+        "proj_v_online_lifetime",
+        "proj_v_online_lifetime_from1767225600s",
     }
 
 

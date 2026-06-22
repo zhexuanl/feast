@@ -40,6 +40,18 @@ def online_window_mv_name(
     return name
 
 
+def online_lifetime_mv_name(
+    project: str, view_name: str, lifetime_start_secs=None
+) -> str:
+    # Per-floor LIFETIME online rollup MV for a tile feature view: the all-history rollup (one-sided
+    # now() upper bound), distinct from the per-window MVs. A floored lifetime (aggregate since a fixed
+    # start) gets its own MV per floor — its now()-anchored WHERE differs — named with the floor epoch.
+    name = f"{base_name(project, view_name)}_online_lifetime"
+    if lifetime_start_secs is not None:
+        name += f"_from{int(lifetime_start_secs)}s"
+    return name
+
+
 def tiles_name(project: str, view_name: str) -> str:
     # Internal tile MV for a BATCH feature view: holds the per-(entity, tile_end) partial
     # aggregates. The point-lookup never reads this; it reads the online rollup MV

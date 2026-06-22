@@ -181,6 +181,51 @@ def view_agg_offsets(view) -> Dict[str, int]:
     return {name: int(secs) for name, secs in json.loads(raw).items()}
 
 
+# Which aggregations are LIFETIME (aggregate over ALL of an entity's history, no trailing bound),
+# keyed by resolved_name -> the optional floor as epoch seconds (None = no floor, aggregate from the
+# beginning). A lifetime aggregation has no window length, so it cannot ride feast.Aggregation's
+# time_window; this engine-owned tag (a carrier parallel to the offset/param tags) is the marker, and
+# PRESENCE of a resolved_name here is what makes the aggregation lifetime. Unlike the offset/param tags,
+# a None value is meaningful (a lifetime with no floor), so entries are never dropped — an empty map
+# means no lifetime aggregations. Works for both tile flavors (the tag round-trips on the view), and is
+# robust to feast.Aggregation rendering the null window as None (batch) or timedelta(0) (streaming proto
+# round-trip): both resolve to the same suffix-less name, so the carrier key is stable either way.
+AGG_LIFETIME_TAG = "feast_rw_agg_lifetime"
+
+
+def encode_agg_lifetime(
+    lifetimes_by_resolved_name: Dict[str, Optional[int]],
+) -> Dict[str, str]:
+    """The view-tags fragment marking the lifetime aggregations, keyed by resolved_name -> optional floor
+    epoch seconds (None = no floor). Returns ``{}`` when there are no lifetime aggregations, so a view
+    with only windowed aggregations is left untouched. The inverse of ``view_agg_lifetime``."""
+    cleaned = {
+        name: (int(secs) if secs is not None else None)
+        for name, secs in lifetimes_by_resolved_name.items()
+    }
+    return {AGG_LIFETIME_TAG: json.dumps(cleaned)} if cleaned else {}
+
+
+def view_agg_lifetime(view) -> Dict[str, Optional[int]]:
+    """The lifetime aggregations a view carries in its tags, keyed by resolved_name -> optional floor
+    epoch seconds (None = no floor). A resolved_name present here is a lifetime aggregation. Absent => {}
+    (the common case: no lifetime aggregations). The inverse of ``encode_agg_lifetime``."""
+    raw = (getattr(view, "tags", None) or {}).get(AGG_LIFETIME_TAG)
+    if not raw:
+        return {}
+    return {
+        name: (int(secs) if secs is not None else None)
+        for name, secs in json.loads(raw).items()
+    }
+
+
+def is_lifetime_agg(agg: Aggregation, lifetimes: Optional[Dict[str, Optional[int]]]) -> bool:
+    """Whether this aggregation is a lifetime aggregation, per the lifetime carrier (membership keyed by
+    resolved_name). resolved_name is suffix-less for a lifetime aggregation whether the carried window is
+    None or timedelta(0), so the lookup is stable across the batch and streaming round-trips."""
+    return agg.resolved_name(agg.time_window) in (lifetimes or {})
+
+
 def _fmt_param(value: float) -> str:
     # Render a numeric aggregate parameter for SQL: an integer-valued float as an int literal
     # (5.0 -> "5"), otherwise its plain decimal form (0.95 -> "0.95"). Keeps the emitted SQL
@@ -721,18 +766,26 @@ def _assert_distinct_output_names(aggregations: List[Aggregation]) -> None:
         )
 
 
-def _validate_windows(aggregations: List[Aggregation], aggregation_interval) -> List[int]:
+def _validate_windows(
+    aggregations: List[Aggregation],
+    aggregation_interval,
+    lifetimes: Optional[Dict[str, Optional[int]]] = None,
+) -> List[int]:
     """Multi-window precondition for the offline PIT builder: tile-supported aggs only, distinct output
-    names, and EVERY aggregation's (non-null) window a whole multiple of the interval. Returns the
+    names, and EVERY WINDOWED aggregation's window a positive whole multiple of the interval. Returns the
     DISTINCT window seconds ascending. The aggregations may carry different windows over the ONE shared
-    tile set (tiles reused across time-windows), so unlike ``_validate_window_rollup`` this does
-    NOT require a single window."""
+    tile set (tiles reused across time-windows), so unlike ``_validate_window_rollup`` this does NOT
+    require a single window.
+
+    A LIFETIME aggregation (per the lifetime carrier) carries no finite window — its lower bound is
+    dropped at the rollup, not a count of tiles — so it is excluded from the window grouping/check. A
+    null/zero window NOT in the carrier is still rejected (``group_aggregations_by_window`` raises on a
+    null window, ``_assert_window_multiple_of_interval`` on a zero one): that is the non-servable plain
+    GROUP BY, distinguished from a lifetime aggregation only by the carrier — never by the value alone."""
     _assert_tile_supported(aggregations)
     _assert_distinct_output_names(aggregations)
-    # group_aggregations_by_window owns the non-null-window check + the distinct-ascending window set
-    # (the multiple-of-interval precondition is offset-independent, so the window-only grouping is what
-    # this needs); here we only layer on the multiple-of-interval check the rollup requires.
-    windows = [secs for secs, _ in group_aggregations_by_window(aggregations)]
+    windowed = [a for a in aggregations if not is_lifetime_agg(a, lifetimes)]
+    windows = [secs for secs, _ in group_aggregations_by_window(windowed)] if windowed else []
     for secs in windows:
         _assert_window_multiple_of_interval(secs, aggregation_interval)
     return windows
@@ -783,6 +836,26 @@ def group_aggregations_by_window_offset(
         key = (int(a.time_window.total_seconds()), _agg_offset_secs(a, offsets))
         groups.setdefault(key, []).append(a)
     return [(key, groups[key]) for key in sorted(groups)]
+
+
+def group_lifetime_aggregations(
+    aggregations: List[Aggregation],
+    lifetimes: Optional[Dict[str, Optional[int]]],
+) -> List[Tuple[Optional[int], List[Aggregation]]]:
+    """Group the LIFETIME aggregations by their floor (epoch seconds, or None for no floor), ascending
+    (no-floor first). Each distinct floor becomes its own now()-anchored lifetime rollup MV — the WHERE
+    differs (``tile_end <= now()`` with an optional ``tile_end > floor``), so floors can't share an MV.
+    Non-lifetime aggregations are skipped. The engine (provisioning) and apply (serving spec) MUST group
+    identically from this one helper so the per-floor lifetime MV names cannot drift."""
+    groups: dict = {}
+    for a in aggregations:
+        if is_lifetime_agg(a, lifetimes):
+            floor = (lifetimes or {})[a.resolved_name(a.time_window)]
+            groups.setdefault(floor, []).append(a)
+    return [
+        (floor, groups[floor])
+        for floor in sorted(groups, key=lambda f: (f is not None, f or 0))
+    ]
 
 
 def _tile_rollup_exprs(
@@ -977,6 +1050,46 @@ def build_online_rollup_select(
     )
 
 
+def build_lifetime_rollup_select(
+    column_info: ColumnInfo,
+    aggregations: List[Aggregation],
+    tile_relation: str,
+    *,
+    agg_params: Optional[Dict[str, List[float]]] = None,
+    lifetime_start_secs: Optional[int] = None,
+) -> str:
+    """Online rollup MV for LIFETIME aggregations over the tiles: a continuous RisingWave materialized
+    view maintaining the ALL-HISTORY rollup for ``as_of = now()``, with the lower window bound DROPPED.
+
+    The window is one-sided — ``WHERE tile_end <= now()`` (optionally floored at
+    ``tile_end > <lifetime_start>`` when ``lifetime_start_secs`` is set). Validated on RisingWave v3.0.0:
+    a one-sided ``now()`` upper bound is accepted in a CREATE MATERIALIZED VIEW and incrementally
+    maintained (tiles admitted as ``now()`` crosses them; none ever evicted from the bottom). The recombine
+    is identical to the windowed rollup — only the WHERE differs — so the SAME per-tile partials serve both.
+
+    UNBOUNDED STATE: unlike the windowed rollup, a lifetime MV never evicts old tiles, so its per-entity
+    aggregate-of-tiles state grows with the tile COUNT (not the event count — the tile model already
+    compacts events into per-interval partials). ``max(tile_end) AS window_end`` is the point-in-time stamp
+    the online point-lookup orders by (one row per entity)."""
+    if not aggregations:
+        raise ValueError("build_lifetime_rollup_select requires at least one aggregation")
+    _assert_tile_supported(aggregations)
+    _assert_distinct_output_names(aggregations)
+    keys = ", ".join(column_info.join_keys_columns)
+    rollups = _tile_rollup_exprs(aggregations, agg_params=agg_params)
+    where = "tile_end <= now()"
+    if lifetime_start_secs is not None:
+        # The floor is an absolute instant (epoch seconds). ``AT TIME ZONE 'UTC'`` renders it as the UTC
+        # wall-clock timestamp regardless of the session timezone, so it compares against tile_end (a
+        # timestamp without time zone, bucketed from UTC event times) deterministically — the same form
+        # the offline PIT uses, so the online and offline tile sets cannot diverge on the session tz.
+        where += f" AND tile_end > (to_timestamp({int(lifetime_start_secs)}) AT TIME ZONE 'UTC')"
+    return (
+        f"SELECT {keys}, {rollups}, max(tile_end) AS window_end FROM {tile_relation} "
+        f"WHERE {where} GROUP BY {keys}"
+    )
+
+
 def build_offline_tile_pit_query(
     entity_df_sql: str,
     entity_columns: List[str],
@@ -990,6 +1103,7 @@ def build_offline_tile_pit_query(
     view_name: Optional[str] = None,
     agg_params: Optional[Dict[str, List[float]]] = None,
     offsets: Optional[Dict[str, int]] = None,
+    lifetimes: Optional[Dict[str, Optional[int]]] = None,
 ) -> str:
     """Offline point-in-time training rollup for a tile BatchFeatureView. For EACH entity row, rolls
     the tiles up in the request-anchored window ``(end - W, end]`` where ``end = floor(label_ts,
@@ -1024,9 +1138,10 @@ def build_offline_tile_pit_query(
     a longer ttl is a no-op. So the window is the single, authoritative bound."""
     if not aggregations:
         raise ValueError("build_offline_tile_pit_query requires at least one aggregation")
-    _validate_windows(aggregations, aggregation_interval)
+    _validate_windows(aggregations, aggregation_interval, lifetimes)
     for a in aggregations:
-        _assert_offset_multiple_of_interval(_agg_offset_secs(a, offsets), aggregation_interval)
+        if not is_lifetime_agg(a, lifetimes):
+            _assert_offset_multiple_of_interval(_agg_offset_secs(a, offsets), aggregation_interval)
     unit = _tile_unit(aggregation_interval)
     keys = column_info.join_keys_columns
     e_cols = ", ".join(f'e."{c}"' for c in entity_columns)
@@ -1034,7 +1149,17 @@ def build_offline_tile_pit_query(
     end = f'date_trunc(\'{unit}\', e."{label_ts_column}")'
     output_prefix = (view_name or "") if full_feature_names else ""
 
-    def _partial_filter(a: Aggregation) -> str:
+    def _partial_filter(a: Aggregation):
+        # A LIFETIME aggregation has no lower window bound: with no floor it recombines EVERY joined tile
+        # (the join's `<= end` is its only bound, so no per-agg CASE — None reuses the raw partial); with a
+        # floor it adds `tile_end > floor`. A WINDOWED aggregation keeps the (offset-aware) window CASE.
+        if is_lifetime_agg(a, lifetimes):
+            floor = (lifetimes or {})[a.resolved_name(a.time_window)]
+            return (
+                None
+                if floor is None
+                else f"t.tile_end > (to_timestamp({int(floor)}) AT TIME ZONE 'UTC')"
+            )
         w = int(a.time_window.total_seconds())
         off = abs(_agg_offset_secs(a, offsets))
         lower = f"t.tile_end > {end} - INTERVAL '{w + off}' SECOND"
@@ -1042,11 +1167,18 @@ def build_offline_tile_pit_query(
         # window's upper edge sits below `end`, so it needs its own explicit upper bound.
         return lower if off == 0 else f"{lower} AND t.tile_end <= {end} - INTERVAL '{off}' SECOND"
 
-    # The join reads back to the deepest tile any aggregation needs: max(window + |offset|).
-    max_lower = max(
-        int(a.time_window.total_seconds()) + abs(_agg_offset_secs(a, offsets))
-        for a in aggregations
-    )
+    # A lifetime aggregation reads ALL history up to `end`, so when one is present the join drops its
+    # lower bound (the per-agg CASE then narrows each windowed/floored aggregation). Otherwise the join
+    # reads back only to the deepest tile any windowed aggregation needs: max(window + |offset|).
+    has_lifetime = any(is_lifetime_agg(a, lifetimes) for a in aggregations)
+    if has_lifetime:
+        join_lower = ""
+    else:
+        max_lower = max(
+            int(a.time_window.total_seconds()) + abs(_agg_offset_secs(a, offsets))
+            for a in aggregations
+        )
+        join_lower = f"t.tile_end > {end} - INTERVAL '{max_lower}' SECOND AND "
     rollups = ", ".join(
         _tile_recombine(
             a,
@@ -1060,7 +1192,7 @@ def build_offline_tile_pit_query(
     return (
         f"SELECT {e_cols}, {rollups} FROM ({entity_df_sql}) e "
         f"LEFT JOIN {tiles_relation} t ON {join_on} "
-        f"AND t.tile_end > {end} - INTERVAL '{max_lower}' SECOND AND t.tile_end <= {end} "
+        f"AND {join_lower}t.tile_end <= {end} "
         f"GROUP BY {e_cols}"
     )
 

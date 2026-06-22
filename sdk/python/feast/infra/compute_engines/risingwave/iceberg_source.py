@@ -33,11 +33,15 @@ _CLASS_PATH = "feast.infra.compute_engines.risingwave.iceberg_source.IcebergSour
 
 def _encode_aggregations(aggregations: List[Aggregation]) -> List[dict]:
     # slide_interval is intentionally not carried: the tile model is tumbling-at-interval today.
+    # A lifetime aggregation has no window, so window_secs is null (its lifetime-ness + floor ride the
+    # separate lifetime carrier on the view tags).
     return [
         {
             "function": a.function,
             "column": a.column,
-            "window_secs": int(a.time_window.total_seconds()),
+            "window_secs": (
+                int(a.time_window.total_seconds()) if a.time_window is not None else None
+            ),
             "name": a.name or None,
         }
         for a in aggregations
@@ -49,7 +53,11 @@ def _decode_aggregations(items: List[dict]) -> List[Aggregation]:
         Aggregation(
             column=d["column"],
             function=d["function"],
-            time_window=timedelta(seconds=d["window_secs"]),
+            time_window=(
+                timedelta(seconds=d["window_secs"])
+                if d.get("window_secs") is not None
+                else None
+            ),
             name=d.get("name"),
         )
         for d in items
