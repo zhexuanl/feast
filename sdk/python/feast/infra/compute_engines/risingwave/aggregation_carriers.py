@@ -151,9 +151,10 @@ def view_secondary_key(view) -> Optional[str]:
 # not a series, so the geometry rides this engine-owned tag — a carrier parallel to the offset/param tags
 # — as a JSON map keyed by resolved_name -> ``[window_secs, step_secs, length]`` (length = the count of
 # windows, L). PRESENCE of a resolved_name here is what makes the aggregation a series (so it is excluded
-# from the per-window/lifetime rollups and assembled positionally at read time instead). First cut:
-# non-overlapping (window_secs == step_secs) and step_secs == the tile aggregation_interval, so each array
-# element is exactly one tile's value. Works for both tile flavors (the tag round-trips on the view).
+# from the per-window/lifetime rollups and read by the single-scan series query instead — one range-scan
+# of the tiles plus an ARRAY of per-step recombines). step_secs and window_secs are each whole multiples
+# of the tile aggregation_interval; window_secs may exceed step_secs (overlapping windows). Works for both
+# tile flavors (the tag round-trips on the view).
 AGG_SERIES_TAG = "feast_rw_agg_series"
 
 

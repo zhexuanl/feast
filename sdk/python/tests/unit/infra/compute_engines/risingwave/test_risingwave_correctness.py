@@ -1252,6 +1252,42 @@ def test_offline_tile_pit_series_mixes_with_a_windowed_agg():
     assert f"t.tile_end > {end} - INTERVAL '432000' SECOND AND t.tile_end <= {end}" in sql
 
 
+def test_offline_tile_pit_series_max_overlap_recombines_over_window_tiles():
+    # MAX is served by the SAME single-scan recombine as the invertible family: each OVERLAPPING element
+    # is max(CASE WHEN <its window> THEN t.max_amount END) over ALL tiles in the window — not a one-tile
+    # pick. window 2d > step 1d (overlap), L=2.
+    ser = Aggregation(column="amount", function="max", time_window=None, name="roll2d_max_2")
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(),
+        aggregations=[ser], aggregation_interval=timedelta(days=1),
+        series={"roll2d_max_2": [172800, 86400, 2]},  # window 2d, step 1d (overlap)
+    )
+    end = "date_trunc('day', e.\"event_timestamp\")"
+    oldest = f"max(CASE WHEN t.tile_end > {end} - INTERVAL '259200' SECOND AND t.tile_end <= {end} - INTERVAL '86400' SECOND THEN t.max_amount END)"  # (end-3d, end-1d]
+    newest = f"max(CASE WHEN t.tile_end > {end} - INTERVAL '172800' SECOND THEN t.max_amount END)"  # (end-2d, end]
+    assert f"ARRAY[{oldest}, {newest}] AS roll2d_max_2" in sql
+
+
+def test_offline_tile_pit_series_window_smaller_than_step_leaves_gaps():
+    # window < step is a sparse (gapped) series: each element samples a 1-day window, but consecutive
+    # windows are 2 days apart, so a day between them is covered by no element. Valid (each element is its
+    # own window); confirm the per-element bounds reflect the gaps (window 1d, step 2d, L=2).
+    ser = Aggregation(column="amount", function="sum", time_window=None, name="sparse_sum_2")
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(),
+        aggregations=[ser], aggregation_interval=timedelta(days=1),
+        series={"sparse_sum_2": [86400, 172800, 2]},  # window 1d, step 2d (gaps)
+    )
+    end = "date_trunc('day', e.\"event_timestamp\")"
+    oldest = f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '259200' SECOND AND t.tile_end <= {end} - INTERVAL '172800' SECOND THEN t.sum_amount END)"  # (end-3d, end-2d]
+    newest = f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '86400' SECOND THEN t.sum_amount END)"  # (end-1d, end]; the (end-2d,end-1d] day is sampled by NO element
+    assert f"ARRAY[{oldest}, {newest}] AS sparse_sum_2" in sql
+
+
 def test_offline_tile_pit_series_rejects_step_not_multiple_of_interval():
     # the series step must be a whole number of tiles (the same parity invariant the window obeys), so a
     # non-multiple step would make the offline floor-anchored element diverge from the online assembled one.
