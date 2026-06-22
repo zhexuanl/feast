@@ -1265,18 +1265,43 @@ def test_offline_tile_pit_series_rejects_step_not_multiple_of_interval():
         )
 
 
-def test_offline_tile_pit_series_rejects_step_coarser_than_interval():
-    # step = 2*interval is a whole multiple (passes the multiple check) but spans TWO tiles per element;
-    # the online assembler places one tile per slot, so offline must reject it too (each element is one
-    # tile in the first cut) rather than silently aggregating two — keeping online == offline.
-    bad = Aggregation(column="amount", function="sum", time_window=None, name="coarse_series")
-    with pytest.raises(ValueError, match="must equal aggregation_interval"):
-        build_offline_tile_pit_query(
-            "SELECT 1", ["user_id", "event_timestamp"], "event_timestamp",
-            tiles_relation="t", column_info=_column_info(),
-            aggregations=[bad], aggregation_interval=timedelta(days=1),
-            series={"coarse_series": [172800, 172800, 3]},  # 2-day step on a 1-day tile
-        )
+def test_offline_tile_pit_series_coarse_step_recombines_multiple_tiles_per_element():
+    # step = 2*interval (k=2): each element's window spans TWO tiles and the CASE recombine sums both —
+    # a single-scan recombine, NOT a one-tile placement. window == step here (non-overlapping coarse).
+    ser = Aggregation(column="amount", function="sum", time_window=None, name="biday_sum_2")
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(),
+        aggregations=[ser], aggregation_interval=timedelta(days=1),
+        series={"biday_sum_2": [172800, 172800, 2]},  # 2-day window == 2-day step on a 1-day tile
+    )
+    end = "date_trunc('day', e.\"event_timestamp\")"
+    # element 0 (oldest): window (end-4d, end-2d]; element 1 (newest): (end-2d, end]
+    oldest = f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '345600' SECOND AND t.tile_end <= {end} - INTERVAL '172800' SECOND THEN t.sum_amount END)"
+    newest = f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '172800' SECOND THEN t.sum_amount END)"
+    assert f"ARRAY[{oldest}, {newest}] AS biday_sum_2" in sql
+    assert f"t.tile_end > {end} - INTERVAL '345600' SECOND AND t.tile_end <= {end}" in sql  # reads back 4d
+
+
+def test_offline_tile_pit_series_overlapping_windows():
+    # OVERLAPPING: window (2d) > step (1d). Consecutive elements' windows overlap (share a tile); each
+    # element independently re-selects its own (end-2d-i*1d, end-i*1d] tile set — double-counting across
+    # elements is intended (overlap). The deepest read-back is window + (L-1)*step = 2d + 2*1d = 4d.
+    ser = Aggregation(column="amount", function="sum", time_window=None, name="roll2d_sum_3")
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(),
+        aggregations=[ser], aggregation_interval=timedelta(days=1),
+        series={"roll2d_sum_3": [172800, 86400, 3]},  # window 2d, step 1d (overlap), length 3
+    )
+    end = "date_trunc('day', e.\"event_timestamp\")"
+    oldest = f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '345600' SECOND AND t.tile_end <= {end} - INTERVAL '172800' SECOND THEN t.sum_amount END)"  # (end-4d, end-2d]
+    middle = f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '259200' SECOND AND t.tile_end <= {end} - INTERVAL '86400' SECOND THEN t.sum_amount END)"  # (end-3d, end-1d]
+    newest = f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '172800' SECOND THEN t.sum_amount END)"  # (end-2d, end]
+    assert f"ARRAY[{oldest}, {middle}, {newest}] AS roll2d_sum_3" in sql
+    assert f"t.tile_end > {end} - INTERVAL '345600' SECOND AND t.tile_end <= {end}" in sql  # reads back 4d once
 
 
 def test_offline_tile_pit_series_rejects_non_positive_length():

@@ -496,33 +496,20 @@ def _validate_windows(
     windows = [secs for secs, _ in group_aggregations_by_window(windowed)] if windowed else []
     for secs in windows:
         _assert_window_multiple_of_interval(secs, aggregation_interval)
-    # First cut: a window-series element is exactly ONE tile, so the step must EQUAL the tile interval
-    # (and the window must equal the step — non-overlapping). The online read-time assembler places one
-    # tile per step slot with no cross-tile recombine, so a coarser step (step = N*interval) would make
-    # offline aggregate N tiles per element while online places one — a divergence. Enforce step==interval
-    # here (the shared offline precondition) so offline rejects what online cannot serve, rather than
-    # silently producing a multi-tile element. The whole-multiple check runs first to keep its clear
-    # message for a sub-interval step.
-    interval_secs = int(aggregation_interval.total_seconds())
+    # A window-series element i is the recombine over the tiles in (end - W - i*step, end - i*step] — a
+    # single-scan CASE over the shared tile set, NOT a one-tile placement. So the only alignment the
+    # recombine needs is that the step AND the window are each a whole number of tiles (multiples of the
+    # aggregation_interval), so every window edge lands on a tile boundary. A coarser step (step =
+    # k*interval) and overlapping windows (window > step) are both fine: each element re-selects its own
+    # tile set, and the recombine over multiple tiles is exact for every supported function (overlap means
+    # adjacent windows intentionally share tiles). length must be positive (an empty ARRAY[] is rejected
+    # by RisingWave as an untyped array literal).
     for a in aggregations:
         if is_series_agg(a, series):
             w, s, length = series[a.resolved_name(a.time_window)]
             _assert_window_multiple_of_interval(int(s), aggregation_interval)
             _assert_window_multiple_of_interval(int(w), aggregation_interval)
-            if int(s) != interval_secs:
-                raise ValueError(
-                    f"window-series step ({int(s)}s) must equal aggregation_interval ({interval_secs}s) — "
-                    f"each series element is one tile (a coarser step needs a cross-tile recombine, which "
-                    f"the read-time assembler does not do)."
-                )
-            if int(w) != int(s):
-                raise ValueError(
-                    f"window-series window ({int(w)}s) must equal its step ({int(s)}s) — overlapping "
-                    f"windows are not yet supported."
-                )
             if int(length) < 1:
-                # a non-positive length would emit an empty ARRAY[] literal RisingWave rejects (an
-                # untyped empty array needs a cast); fail fast with a clear message instead.
                 raise ValueError(
                     f"window-series length must be a positive number of windows; got {length}."
                 )
