@@ -598,6 +598,21 @@ _TILE_SUPPORTED_FN = (
     _ADDITIVE_TILE_FN | _COMPOSITE_TILE_FN | _SET_TILE_FN | _SEQUENCE_TILE_FN
 )
 
+# INVERTIBLE — the aggregations whose windowed value can be served by 2-POINT SUBTRACTION over a
+# CUMULATIVE (running-total) tile MV: windowed = cum_at_T - cum_at_(T - window). Only functions whose
+# tile partials are additive AND have a subtractive inverse qualify: sum/count, and the composite
+# mean/var/stddev (built from the invertible sum/count/sumsq partials). min/max are additive-tile but
+# NOT invertible (you cannot un-max a value out of a running max); count_distinct (set union) and
+# sequence (top-n array) have no subtractive inverse either. Non-invertible aggregations keep the
+# interval-tile range read. This is the principled boundary of the unified v2 serving model — it is a
+# mathematical fact (existence of an inverse), not an implementation choice, so it is stable.
+_INVERTIBLE_TILE_FN = _COMPOSITE_TILE_FN | frozenset({"sum", "count"})
+
+
+def is_invertible_agg(agg: Aggregation) -> bool:
+    """True if ``agg`` can be served by cumulative 2-point subtraction (see ``_INVERTIBLE_TILE_FN``)."""
+    return agg.function in _INVERTIBLE_TILE_FN
+
 
 def _sequence_n(agg: Aggregation, agg_params: Optional[Dict[str, List[float]]]) -> int:
     """The n (count of values to keep) for a sequence aggregate, from the out-of-band agg_params keyed
@@ -748,6 +763,70 @@ def _recombine_expr(
     denom = f"NULLIF({cnt} - 1, 0)" if fn.endswith("_samp") else f"NULLIF({cnt}, 0)"
     var = f"{centered} / {denom}"
     return f"sqrt({var})" if fn.startswith("stddev") else var
+
+
+def _cumulative_recombine_expr(
+    agg: Aggregation,
+    *,
+    hi: str = "hi",
+    lo: Optional[str] = "lo",
+) -> str:
+    """The windowed recombine for an INVERTIBLE aggregation by 2-POINT SUBTRACTION over the cumulative-tile
+    MV, from two cumulative rows: ``hi`` = cumulative at the latest tile_end <= window END, ``lo`` =
+    cumulative at the latest tile_end <= window END - window_size (``lo=None`` for a lifetime /
+    cumulative-to-end read — no lower bound). The windowed IR is Δ = hi.cum_X - lo.cum_X, recombined
+    EXACTLY as ``_recombine_expr`` recombines the per-tile partials — because Δ(running total) over
+    (end-W, end] equals the sum of the per-tile partials in (end-W, end], value-for-value. Emits NULL when
+    the window holds no tiles (Δ cum_ntiles == 0), matching the offline PIT's empty-window NULL (the
+    decisive parity case). Go/Python serving readers MUST mirror these expressions verbatim so online ==
+    offline. Non-invertible aggregations are rejected (they keep the interval read)."""
+    if not is_invertible_agg(agg):
+        raise ValueError(
+            f"{agg.function} on {agg.column!r} is not invertible; serve it from the interval tiles, "
+            f"not by cumulative subtraction."
+        )
+    col, fn = agg.column, agg.function
+
+    def delta(kind: str) -> str:
+        # COALESCE each cumulative to 0: a boundary asof that finds NO tile (the entity's history begins
+        # inside the window, or there are no tiles at all) yields a NULL cumulative = 0 contribution.
+        hi_c = f"COALESCE({hi}.cum_{kind}_{col}, 0)"
+        return hi_c if lo is None else f"({hi_c} - COALESCE({lo}.cum_{kind}_{col}, 0))"
+
+    hi_n = f"COALESCE({hi}.cum_ntiles, 0)"
+    dntiles = hi_n if lo is None else f"({hi_n} - COALESCE({lo}.cum_ntiles, 0))"
+
+    if fn == "sum":
+        value = delta("sum")
+    elif fn == "count":
+        value = delta("count")
+    elif fn == "mean":
+        value = f"{delta('sum')} / NULLIF({delta('count')}, 0)"
+    else:  # var_pop / var_samp / stddev_pop / stddev_samp — identical algebra to _recombine_expr
+        dsum, dcnt = delta("sum"), delta("count")
+        centered = f"GREATEST({delta('sumsq')} - {dsum} * {dsum} / NULLIF({dcnt}, 0), 0)"
+        denom = f"NULLIF({dcnt} - 1, 0)" if fn.endswith("_samp") else f"NULLIF({dcnt}, 0)"
+        var = f"{centered} / {denom}"
+        value = f"sqrt({var})" if fn.startswith("stddev") else var
+    # Empty window (no tiles) -> NULL, matching the offline PIT; an in-window-but-NULL-valued edge case
+    # would diverge (cumulative gives 0/NULL by NULLIF, offline gives NULL) but does not arise for real data.
+    return f"CASE WHEN {dntiles} = 0 THEN NULL ELSE {value} END"
+
+
+def cumulative_tile_recombine(
+    agg: Aggregation,
+    *,
+    hi: str = "hi",
+    lo: Optional[str] = "lo",
+    output_prefix: str = "",
+) -> str:
+    """``_cumulative_recombine_expr`` aliased to the aggregation's per-window ``resolved_name`` (or
+    ``{output_prefix}__{resolved_name}`` for a full-feature-names offline read) — the cumulative twin of
+    ``_tile_recombine``."""
+    out = agg.resolved_name(agg.time_window)
+    if output_prefix:
+        out = f'"{output_prefix}__{out}"'
+    return f"{_cumulative_recombine_expr(agg, hi=hi, lo=lo)} AS {out}"
 
 
 def _series_recombine(
@@ -1173,6 +1252,156 @@ def build_streaming_tile_select(
         f"FROM tumble({relation}, {ts}, INTERVAL '{secs}' SECOND) "
         f"GROUP BY window_start, window_end, {keys}{sk_grp} EMIT ON WINDOW CLOSE"
     )
+
+
+def _cumulative_partials(
+    aggregations: List[Aggregation],
+    ts_col: Optional[str] = None,
+    agg_params: Optional[Dict[str, List[float]]] = None,
+) -> List[Tuple[str, str]]:
+    """The running-total columns of the cumulative-tile MV: for each INVERTIBLE aggregation's
+    window-independent partial (``sum_``/``count_``/``sumsq_``), a ``cum_{partial}`` whose value is a
+    running total of that partial COLUMN over ``tile_end``. Reuses ``_view_partials`` (so the dedup +
+    partial naming match the tiles MV exactly), filtered to invertible aggregations; non-invertible
+    aggregations contribute nothing (they keep the interval read). The SQL references the tile partial
+    column NAME (e.g. ``sum_amount``) — the cumulative MV reads the tiles MV, not the raw source."""
+    invertible = [a for a in aggregations if is_invertible_agg(a)]
+    # cum_ntiles = running count of TILE ROWS, the universal emptiness guard. A window's Δ(cum_ntiles)
+    # is the number of tiles in it; Δ == 0 means NO tiles in (end-window, end], which is exactly when the
+    # offline PIT (sum over zero in-window tiles) yields NULL. The serving recombine emits NULL when
+    # Δ(cum_ntiles) == 0 so cumulative-subtraction matches offline on the empty window — the decisive case
+    # (entity has no recent events). It needs no aggregation-specific partial, so it is always available
+    # even for a pure-sum view (which has no count partial).
+    cols: List[Tuple[str, str]] = [("cum_ntiles", "count(*)")]
+    cols += [
+        (f"cum_{name}", f"sum({name})")
+        for (name, _materialize_sql) in _view_partials(invertible, ts_col, agg_params)
+    ]
+    return cols
+
+
+def build_cumulative_tile_select(
+    column_info: ColumnInfo,
+    aggregations: List[Aggregation],
+    tile_relation: str,
+    *,
+    agg_params: Optional[Dict[str, List[float]]] = None,
+) -> str:
+    """The CUMULATIVE-tile MV: per ``(entity, tile_end)``, the RUNNING TOTAL of each invertible partial
+    over all tiles up to and including ``tile_end`` — ``sum(partial) OVER (PARTITION BY keys ORDER BY
+    tile_end)``. ONE now()-free, window-agnostic MV from which the serving layer derives EVERY invertible
+    window by 2-point asof subtraction: ``windowed = cum_at_T - cum_at_(T - window)``, ``lifetime =
+    cum_at_T``, ``offset`` = shifted asof points, ``series`` = L points. It REPLACES the N per-(window,
+    offset) + M per-floor lifetime now()-anchored rollup MVs for invertible aggregations (sum/count/mean/
+    var/stddev), collapsing them to one MV.
+
+    Reads the tiles MV (``build_*_tile_select`` output: bare per-(entity, tile_end) partials), so it is
+    source-agnostic (batch or streaming tiles). now() is deliberately ABSENT — request-time anchoring
+    happens in the READ query's asof bounds (``tile_end <= now()`` / ``<= now() - window``), which is why
+    a single window-agnostic MV serves all windows AND sidesteps RisingWave's restriction that now() may
+    appear only in a streaming MV's WHERE/HAVING. ``tile_end`` is unique per entity in the tiles MV (one
+    row per (entity, tile_end)), so the default ORDER BY frame is an exact prefix cumulative sum. The
+    running-total form ``sum(_) OVER (PARTITION BY _ ORDER BY tile_end)`` is validated as incrementally
+    maintained under out-of-order tiles on RisingWave (see spike/verify_cumulative_maintenance.py)."""
+    invertible = [a for a in aggregations if is_invertible_agg(a)]
+    if not invertible:
+        raise ValueError(
+            "build_cumulative_tile_select requires at least one invertible aggregation "
+            "(sum/count/mean/var/stddev); min/max/count_distinct/sequence keep the interval read."
+        )
+    keys = ", ".join(column_info.join_keys_columns)
+    cum_cols = _cumulative_partials(aggregations, column_info.timestamp_column, agg_params)
+    win = f"(PARTITION BY {keys} ORDER BY tile_end)"
+    proj = ", ".join(f"{sql} OVER {win} AS {name}" for (name, sql) in cum_cols)
+    return f"SELECT {keys}, tile_end, {proj} FROM {tile_relation}"
+
+
+def build_cumulative_read_query(
+    entity_df_sql: str,
+    entity_columns: List[str],
+    label_ts_column: str,
+    *,
+    cumulative_relation: str,
+    column_info: ColumnInfo,
+    aggregations: List[Aggregation],
+    aggregation_interval,
+    full_feature_names: bool = False,
+    view_name: Optional[str] = None,
+    agg_params: Optional[Dict[str, List[float]]] = None,
+    offsets: Optional[Dict[str, int]] = None,
+    lifetimes: Optional[Dict[str, Optional[int]]] = None,
+    series: Optional[Dict[str, Sequence[int]]] = None,
+) -> str:
+    """Read INVERTIBLE windowed features from the CUMULATIVE-tile MV by 2-point asof subtraction. For each
+    entity-spine row it anchors ``end = date_trunc(aggregation_interval, label_ts)`` and derives every
+    window by subtracting two cumulative rows fetched by an asof LATERAL (the latest ``tile_end <= bound``).
+    Window-type -> asof bounds, IDENTICAL to ``build_offline_tile_pit_query`` (so cumulative == offline):
+    trailing ``(end-W, end]``; offset ``(end-off-W, end-off]``; lifetime ``(floor, end]`` or ``(-inf, end]``;
+    series = ``length`` offset-windows ``(end-W-i*step, end-i*step]`` oldest-first. ``label_ts`` is the
+    spine's as-of column — ``now()`` for online serving, the label timestamp for an offline parity check —
+    so ONE builder serves both. The Go feature server and Python client emit this SAME SQL shape (parity).
+
+    Only invertible aggregations (sum/count/mean/var/stddev) belong here; non-invertible aggregations
+    (min/max/count_distinct/sequence) are served from the interval tiles, not by subtraction."""
+    if not aggregations:
+        raise ValueError("build_cumulative_read_query requires at least one aggregation")
+    for a in aggregations:
+        if not is_invertible_agg(a):
+            raise ValueError(
+                f"{a.function} on {a.column!r} is not invertible; it cannot be read from the cumulative "
+                f"MV by subtraction — serve it from the interval tiles."
+            )
+    unit = _tile_unit(aggregation_interval)
+    keys = column_info.join_keys_columns
+    e_cols = [f'e."{c}"' for c in entity_columns]
+    match = " AND ".join(f'c."{k}" = e."{k}"' for k in keys)
+    end = f'date_trunc(\'{unit}\', e."{label_ts_column}")'
+    cum_cols = ", ".join(
+        name for (name, _sql) in _cumulative_partials(aggregations, column_info.timestamp_column, agg_params)
+    )
+    output_prefix = (view_name or "") if full_feature_names else ""
+
+    # Dedupe the asof LATERAL joins by their bound expression: a trailing 7d and a series step that land on
+    # the same boundary share one join. Each distinct bound becomes one ``aN`` LATERAL (latest tile <= bound).
+    joins: dict = {}
+
+    def asof(bound_sql: str) -> str:
+        return joins.setdefault(bound_sql, f"a{len(joins)}")
+
+    def back(secs: int) -> str:
+        return end if int(secs) == 0 else f"{end} - INTERVAL '{int(secs)}' SECOND"
+
+    def floor_bound(floor: int) -> str:
+        return f"(to_timestamp({int(floor)}) AT TIME ZONE 'UTC')"
+
+    projs = list(e_cols)
+    for a in aggregations:
+        name = a.resolved_name(a.time_window)
+        out = f'"{output_prefix}__{name}"' if output_prefix else name
+        if series and name in series:
+            w, s, length = (int(x) for x in series[name])
+            elems = [
+                _cumulative_recombine_expr(a, hi=asof(back(i * s)), lo=asof(back(i * s + w)))
+                for i in range(length - 1, -1, -1)  # oldest window first
+            ]
+            projs.append(f"ARRAY[{', '.join(elems)}] AS {out}")
+        elif lifetimes and name in lifetimes:
+            floor = lifetimes[name]
+            lo = None if floor is None else asof(floor_bound(floor))
+            projs.append(f"{_cumulative_recombine_expr(a, hi=asof(back(0)), lo=lo)} AS {out}")
+        else:
+            w = int(a.time_window.total_seconds())
+            off = abs(_agg_offset_secs(a, offsets))
+            projs.append(
+                f"{_cumulative_recombine_expr(a, hi=asof(back(off)), lo=asof(back(off + w)))} AS {out}"
+            )
+
+    laterals = " ".join(
+        f"LEFT JOIN LATERAL (SELECT {cum_cols} FROM {cumulative_relation} c WHERE {match} "
+        f"AND c.tile_end <= {bound} ORDER BY c.tile_end DESC LIMIT 1) {alias} ON true"
+        for bound, alias in joins.items()
+    )
+    return f"SELECT {', '.join(projs)} FROM ({entity_df_sql}) e {laterals}"
 
 
 def build_tile_rollup_select(

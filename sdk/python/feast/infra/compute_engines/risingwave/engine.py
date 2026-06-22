@@ -40,6 +40,7 @@ from feast.infra.compute_engines.risingwave.job import (
 from feast.infra.compute_engines.risingwave.names import (
     base_name,
     offline_sink_name,
+    online_cumulative_mv_name,
     online_lifetime_mv_name,
     online_mv_name,
     online_window_mv_name,
@@ -59,6 +60,7 @@ from feast.infra.compute_engines.risingwave.iceberg_source import (
 )
 from feast.infra.compute_engines.risingwave.nodes import (
     build_batch_tile_select,
+    build_cumulative_tile_select,
     build_latest_row_select,
     build_lifetime_rollup_select,
     build_online_rollup_select,
@@ -66,6 +68,7 @@ from feast.infra.compute_engines.risingwave.nodes import (
     build_windowed_agg_select,
     group_aggregations_by_window_offset,
     group_lifetime_aggregations,
+    is_invertible_agg,
     is_lifetime_agg,
     is_series_agg,
     view_agg_lifetime,
@@ -404,6 +407,9 @@ def _batch_drop_ddl(project: str, view) -> List[str]:
         f'DROP MATERIALIZED VIEW IF EXISTS "{online_lifetime_mv_name(project, view.name, floor)}"'
         for floor, _ in group_lifetime_aggregations(aggs, lifetimes)
     ]
+    # the cumulative MV (v2 invertible serving) reads the tiles MV, so drop it before the tiles MV; a
+    # bare DROP IF EXISTS is a no-op for a view that never provisioned one (secondary-key / non-invertible).
+    ddl.append(f'DROP MATERIALIZED VIEW IF EXISTS "{online_cumulative_mv_name(project, view.name)}"')
     ddl.append(f'DROP MATERIALIZED VIEW IF EXISTS "{tiles_name(project, view.name)}"')
     ddl.append(f'DROP SOURCE IF EXISTS "{source_name(project, view.name)}"')
     return ddl
@@ -423,7 +429,7 @@ def _existing_online_mv_names(cur, project: str, view_name: str) -> set:
     avoids matching a differently-named view that merely shares this view's name as a prefix."""
     base = re.escape(base_name(project, view_name))
     pattern = re.compile(
-        rf"^{base}_online_(?:\d+s(?:_off\d+s)?|lifetime(?:_from\d+s)?)$"
+        rf"^{base}_online_(?:\d+s(?:_off\d+s)?|lifetime(?:_from\d+s)?|cum)$"
     )
     cur.execute("SELECT matviewname FROM pg_matviews")
     return {name for (name,) in cur.fetchall() if pattern.match(name)}
@@ -579,6 +585,61 @@ def _plan_batch_reconcile(
         if name not in deployed_online or norm(deployed_online[name]) != norm(sql)
     ]
     return False, drops, creates
+
+
+def _desired_online_mvs(
+    project: str,
+    view_name: str,
+    column_info: ColumnInfo,
+    aggs: list,
+    tiles: str,
+    *,
+    aggregation_interval,
+    agg_params,
+    secondary_key,
+    offsets,
+    lifetimes,
+    series,
+) -> dict:
+    """The desired ``{mv_name: SELECT}`` for a tile view's online rollup MVs — the ONE place the v2
+    serving split lives, shared by provisioning AND reconcile so they cannot drift.
+
+    INVERTIBLE aggregations (sum/count/mean/var/stddev) are served from ONE cumulative-tile MV
+    (``build_cumulative_tile_select``) by read-time 2-point asof subtraction; every window/offset/lifetime/
+    series shape is derived from that single MV at read time, so they get NO per-window MV. NON-INVERTIBLE
+    aggregations (min/max/count_distinct/sequence) keep a now()-anchored rollup MV per (window, offset) and
+    per lifetime floor (a series of them reads the tiles directly at request time).
+
+    SECONDARY-KEY views are excluded from the cumulative path: the cumulative MV carries no per-key Map
+    dimension, and a jsonb-map subtraction is not supported — so a secondary-key view keeps the full v1
+    now()-MV rollup for EVERY aggregation, invertible or not. A window-series aggregation never gets its
+    own MV (it is read at request time), so it is excluded from the per-window/lifetime rollup like a
+    lifetime aggregation is."""
+    out: dict = {}
+    cumulative_ok = secondary_key is None
+    invertible = [a for a in aggs if cumulative_ok and is_invertible_agg(a)]
+    if invertible:
+        out[online_cumulative_mv_name(project, view_name)] = build_cumulative_tile_select(
+            column_info, invertible, tiles, agg_params=agg_params
+        )
+
+    def _interval_served(a) -> bool:
+        # served by a per-window / lifetime now()-MV: not invertible-via-cumulative, and not a series.
+        return not (cumulative_ok and is_invertible_agg(a)) and not is_series_agg(a, series)
+
+    windowed = [a for a in aggs if _interval_served(a) and not is_lifetime_agg(a, lifetimes)]
+    for (w, off), wa in group_aggregations_by_window_offset(windowed, offsets):
+        out[online_window_mv_name(project, view_name, w, off)] = build_online_rollup_select(
+            column_info, wa, tiles, aggregation_interval=aggregation_interval,
+            agg_params=agg_params, offset_secs=off, secondary_key=secondary_key,
+        )
+    lifetime = [a for a in aggs if _interval_served(a) and is_lifetime_agg(a, lifetimes)]
+    for floor, la in group_lifetime_aggregations(lifetime, lifetimes):
+        out[online_lifetime_mv_name(project, view_name, floor)] = build_lifetime_rollup_select(
+            column_info, la, tiles, agg_params=agg_params, lifetime_start_secs=floor,
+            secondary_key=secondary_key,
+        )
+    return out
 
 
 class RisingWaveComputeEngine(ComputeEngine):
@@ -889,33 +950,17 @@ class RisingWaveComputeEngine(ComputeEngine):
                 ),
             ),
         ]
-        offsets = view_agg_offsets(view)
-        lifetimes = view_agg_lifetime(view)
-        series = view_agg_series(view)
-        # A window-series aggregation reuses the tiles MV (assembled at read time) — it has no own rollup
-        # MV, so it is excluded from the per-(window, offset) rollup like a lifetime aggregation is. Its
-        # partials still ride the tiles MV (it stays in `aggs`).
-        windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes) and not is_series_agg(a, series)]
-        for (window_secs, offset_secs), window_aggs in group_aggregations_by_window_offset(
-            windowed_aggs, offsets
-        ):
-            rollup_select = build_online_rollup_select(
-                column_info, window_aggs, tiles, aggregation_interval=interval,
-                agg_params=params, offset_secs=offset_secs, secondary_key=secondary_key,
-            )
-            mv = online_window_mv_name(project, view.name, window_secs, offset_secs)
-            ddl.append(_materialized_view_ddl(mv, rollup_select))
-        # One all-history LIFETIME rollup MV per distinct floor (each has its own now()-anchored WHERE).
-        for floor, lifetime_aggs in group_lifetime_aggregations(aggs, lifetimes):
-            lifetime_select = build_lifetime_rollup_select(
-                column_info, lifetime_aggs, tiles, agg_params=params, lifetime_start_secs=floor,
-                secondary_key=secondary_key,
-            )
-            ddl.append(
-                _materialized_view_ddl(
-                    online_lifetime_mv_name(project, view.name, floor), lifetime_select
-                )
-            )
+        # The online rollup MVs: ONE cumulative MV for the invertible aggregations (read by 2-point
+        # subtraction) + a now()-anchored per-(window, offset)/lifetime MV for each non-invertible one.
+        # _desired_online_mvs is the single home of that split, shared with the reconcile so they cannot
+        # drift; a series reuses the tiles MV / cumulative MV at read time, so it gets no MV here.
+        for name, select in _desired_online_mvs(
+            project, view.name, column_info, aggs, tiles,
+            aggregation_interval=interval, agg_params=params, secondary_key=secondary_key,
+            offsets=view_agg_offsets(view), lifetimes=view_agg_lifetime(view),
+            series=view_agg_series(view),
+        ).items():
+            ddl.append(_materialized_view_ddl(name, select))
         return ddl
 
     def _provision_streaming_tile_ddl(self, project: str, view) -> List[str]:
@@ -977,33 +1022,16 @@ class RisingWaveComputeEngine(ComputeEngine):
                 ),
             ),
         ]
-        offsets = view_agg_offsets(view)
-        lifetimes = view_agg_lifetime(view)
-        series = view_agg_series(view)
-        # A window-series aggregation reuses the tiles MV (assembled at read time) — it has no own rollup
-        # MV, so it is excluded from the per-(window, offset) rollup like a lifetime aggregation is. Its
-        # partials still ride the tiles MV (it stays in `aggs`).
-        windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes) and not is_series_agg(a, series)]
-        for (window_secs, offset_secs), window_aggs in group_aggregations_by_window_offset(
-            windowed_aggs, offsets
-        ):
-            rollup_select = build_online_rollup_select(
-                column_info, window_aggs, tiles, aggregation_interval=interval,
-                agg_params=params, offset_secs=offset_secs, secondary_key=secondary_key,
-            )
-            mv = online_window_mv_name(project, view.name, window_secs, offset_secs)
-            ddl.append(_materialized_view_ddl(mv, rollup_select))
-        # One all-history LIFETIME rollup MV per distinct floor (each has its own now()-anchored WHERE).
-        for floor, lifetime_aggs in group_lifetime_aggregations(aggs, lifetimes):
-            lifetime_select = build_lifetime_rollup_select(
-                column_info, lifetime_aggs, tiles, agg_params=params, lifetime_start_secs=floor,
-                secondary_key=secondary_key,
-            )
-            ddl.append(
-                _materialized_view_ddl(
-                    online_lifetime_mv_name(project, view.name, floor), lifetime_select
-                )
-            )
+        # Same online-rollup split as the batch path (byte-identical via _desired_online_mvs): ONE
+        # cumulative MV for the invertible aggregations + a now()-anchored MV per non-invertible
+        # (window, offset)/lifetime. Shared with the reconcile so provisioning and reconcile cannot drift.
+        for name, select in _desired_online_mvs(
+            project, view.name, column_info, aggs, tiles,
+            aggregation_interval=interval, agg_params=params, secondary_key=secondary_key,
+            offsets=view_agg_offsets(view), lifetimes=view_agg_lifetime(view),
+            series=view_agg_series(view),
+        ).items():
+            ddl.append(_materialized_view_ddl(name, select))
         return ddl
 
     def _reconcile_batch_view(self, cur, project: str, view) -> None:
@@ -1030,28 +1058,11 @@ class RisingWaveComputeEngine(ComputeEngine):
             column_info, aggs, src, aggregation_interval=interval, agg_params=params,
             secondary_key=secondary_key,
         )
-        offsets = view_agg_offsets(view)
-        lifetimes = view_agg_lifetime(view)
-        series = view_agg_series(view)
-        # A window-series aggregation reuses the tiles MV (assembled at read time) — it has no own rollup
-        # MV, so it is excluded from the per-(window, offset) rollup like a lifetime aggregation is. Its
-        # partials still ride the tiles MV (it stays in `aggs`).
-        windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes) and not is_series_agg(a, series)]
-        desired_online = {
-            online_window_mv_name(project, view.name, w, off): build_online_rollup_select(
-                column_info, wa, tiles, aggregation_interval=interval,
-                agg_params=params, offset_secs=off, secondary_key=secondary_key,
-            )
-            for (w, off), wa in group_aggregations_by_window_offset(windowed_aggs, offsets)
-        }
-        desired_online.update(
-            {
-                online_lifetime_mv_name(project, view.name, floor): build_lifetime_rollup_select(
-                    column_info, la, tiles, agg_params=params, lifetime_start_secs=floor,
-                    secondary_key=secondary_key,
-                )
-                for floor, la in group_lifetime_aggregations(aggs, lifetimes)
-            }
+        desired_online = _desired_online_mvs(
+            project, view.name, column_info, aggs, tiles,
+            aggregation_interval=interval, agg_params=params, secondary_key=secondary_key,
+            offsets=view_agg_offsets(view), lifetimes=view_agg_lifetime(view),
+            series=view_agg_series(view),
         )
         deployed_online = {
             name: _deployed_mv_select(cur, name)
@@ -1112,28 +1123,11 @@ class RisingWaveComputeEngine(ComputeEngine):
             column_info, aggs, src, aggregation_interval=interval, agg_params=params,
             secondary_key=secondary_key,
         )
-        offsets = view_agg_offsets(view)
-        lifetimes = view_agg_lifetime(view)
-        series = view_agg_series(view)
-        # A window-series aggregation reuses the tiles MV (assembled at read time) — it has no own rollup
-        # MV, so it is excluded from the per-(window, offset) rollup like a lifetime aggregation is. Its
-        # partials still ride the tiles MV (it stays in `aggs`).
-        windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes) and not is_series_agg(a, series)]
-        desired_online = {
-            online_window_mv_name(project, view.name, w, off): build_online_rollup_select(
-                column_info, wa, tiles, aggregation_interval=interval,
-                agg_params=params, offset_secs=off, secondary_key=secondary_key,
-            )
-            for (w, off), wa in group_aggregations_by_window_offset(windowed_aggs, offsets)
-        }
-        desired_online.update(
-            {
-                online_lifetime_mv_name(project, view.name, floor): build_lifetime_rollup_select(
-                    column_info, la, tiles, agg_params=params, lifetime_start_secs=floor,
-                    secondary_key=secondary_key,
-                )
-                for floor, la in group_lifetime_aggregations(aggs, lifetimes)
-            }
+        desired_online = _desired_online_mvs(
+            project, view.name, column_info, aggs, tiles,
+            aggregation_interval=interval, agg_params=params, secondary_key=secondary_key,
+            offsets=view_agg_offsets(view), lifetimes=view_agg_lifetime(view),
+            series=view_agg_series(view),
         )
         deployed_online = {
             name: _deployed_mv_select(cur, name)

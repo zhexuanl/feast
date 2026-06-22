@@ -30,6 +30,7 @@ from feast.infra.compute_engines.risingwave.engine import (
     _deployed_mv_select,
     _deployed_source_table,
     _desired_kafka_source_opts,
+    _desired_online_mvs,
     _existing_online_mv_names,
     _iceberg_sink_ddl,
     _iceberg_source_ddl,
@@ -55,6 +56,8 @@ from feast.infra.compute_engines.risingwave.nodes import (
     _assert_tile_supported,
     _partials_for,
     build_batch_tile_select,
+    build_cumulative_read_query,
+    build_cumulative_tile_select,
     build_latest_row_select,
     build_lifetime_rollup_select,
     build_offline_tile_pit_query,
@@ -1532,8 +1535,9 @@ def _batch_view(aggs, interval_secs=86400, name="user_txn_daily"):
 
 
 def test_provision_batch_emits_source_tiles_mv_and_online_rollup_mv():
-    # daily (86400s) tiles, 3-day (259200s) window
-    agg = _agg("sum", window_seconds=259200)
+    # daily (86400s) tiles, 3-day (259200s) window. A NON-invertible aggregation (max) keeps the v1
+    # per-(window) now()-anchored online rollup MV — the cumulative path is only for invertible aggs.
+    agg = _agg("max", window_seconds=259200)
     view = _batch_view([agg])
     ddl = _engine()._provision_batch_ddl("proj", view)
     assert len(ddl) == 3  # source + tiles MV + online rollup MV; NO Iceberg sink (MVs read directly)
@@ -1550,7 +1554,7 @@ def test_provision_batch_emits_source_tiles_mv_and_online_rollup_mv():
     assert '"proj_user_txn_daily_tiles"' in tiles_sql
     assert "date_trunc('day'" in tiles_sql
     assert "tile_end" in tiles_sql
-    assert "sum(amount) AS sum_amount" in tiles_sql  # window-independent partial (not per-window)
+    assert "max(amount) AS max_amount" in tiles_sql  # window-independent partial (not per-window)
 
     # online rollup MV: the point-looked-up per-window name, plain now() window over the tiles MV
     assert rollup_sql.startswith("CREATE MATERIALIZED VIEW")
@@ -1560,12 +1564,14 @@ def test_provision_batch_emits_source_tiles_mv_and_online_rollup_mv():
     assert "tile_end <= now()" in rollup_sql
     assert "date_trunc" not in rollup_sql  # RW rejects two-sided date_trunc(now()) in an MV
     assert "max(tile_end) AS window_end" in rollup_sql  # PIT stamp for the point-lookup
-    assert f"sum(sum_amount) AS {feat}" in rollup_sql  # rolls the window-independent partial up
+    assert f"max(max_amount) AS {feat}" in rollup_sql  # rolls the window-independent partial up
 
 
 def test_provision_batch_emits_one_online_mv_per_window():
     # multi-window: ONE tiles MV (shared, deduped partials) + one now()-anchored online MV PER window.
-    aggs = [_agg("sum", 259200), _agg("sum", 2592000), _agg("mean", 604800)]
+    # NON-invertible max keeps the v1 per-(window) MV mechanics (the cumulative path is invertible-only),
+    # so this pins one MV per distinct window.
+    aggs = [_agg("max", 259200), _agg("max", 2592000), _agg("max", 604800)]
     view = _batch_view(aggs)
     ddl = _engine()._provision_batch_ddl("proj", view)
     assert len(ddl) == 1 + 1 + 3  # source + tiles + 3 per-window online MVs (3d, 7d, 30d)
@@ -1575,9 +1581,9 @@ def test_provision_batch_emits_one_online_mv_per_window():
     # one online MV per DISTINCT window, named with the window suffix
     for w in (259200, 604800, 2592000):
         assert f'"proj_user_txn_daily_online_{w}s"' in joined
-    # the 30d sum MV rolls only the 30d sum; the 7d mean MV rolls sum/count for mean@7d
-    assert "sum(sum_amount) AS sum_amount_2592000s" in joined
-    assert "sum(sum_amount) / NULLIF(sum(count_amount), 0) AS mean_amount_604800s" in joined
+    # each per-window MV rolls the ONE shared max_amount tile partial up to its own window
+    assert "max(max_amount) AS max_amount_2592000s" in joined
+    assert "max(max_amount) AS max_amount_604800s" in joined
 
 
 def test_iceberg_source_ddl_escapes_single_quotes_in_table_name():
@@ -1619,12 +1625,18 @@ def test_provision_batch_rejects_non_additive_aggregation(function):
 
 
 def test_batch_drop_ddl_drops_both_mvs_and_source_with_no_sink():
-    view = _batch_view([_agg("sum", 259200)])
+    # NON-invertible max -> the v1 per-(window) online rollup MV (no cumulative MV), so the drop set is
+    # the per-window MV, then the tiles MV, then the source.
+    view = _batch_view([_agg("max", 259200)])
     stmts = _batch_drop_ddl("proj", view)
     # drop order: per-window online rollup MV(s), then the tiles MV they read, then the source
     assert stmts[0] == 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_online_259200s"'
-    assert stmts[1] == 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_tiles"'
-    assert stmts[2].startswith("DROP SOURCE")
+    assert 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_tiles"' in stmts
+    assert any(s.startswith("DROP SOURCE") for s in stmts)
+    # the tiles MV is dropped AFTER the per-window online MV that reads it, and BEFORE the source
+    assert stmts.index('DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_online_259200s"') < stmts.index(
+        'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_tiles"'
+    )
     assert not any("SINK" in s for s in stmts)  # none provisioned, none to drop
 
 
@@ -1760,14 +1772,17 @@ def test_plan_batch_reconcile_ignores_whitespace_only_differences():
 
 
 def test_batch_drop_ddl_drops_every_per_window_mv():
-    # a multi-window FV provisions N online MVs -> teardown must drop ALL N (else orphaned MVs leak)
-    view = _batch_view([_agg("sum", 259200), _agg("sum", 2592000)])
+    # a multi-window FV provisions N online MVs -> teardown must drop ALL N (else orphaned MVs leak).
+    # NON-invertible max keeps the per-(window) MV mechanics, so every window has its own online MV.
+    view = _batch_view([_agg("max", 259200), _agg("max", 2592000)])
     stmts = _batch_drop_ddl("proj", view)
     assert 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_online_259200s"' in stmts
     assert 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_online_2592000s"' in stmts
     assert 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_tiles"' in stmts
-    # the tiles MV is dropped AFTER the online MVs that read it (dependency order)
-    assert stmts.index('DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_tiles"') == 2
+    # the tiles MV is dropped AFTER every per-window online MV that reads it (dependency order)
+    tiles_idx = stmts.index('DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_tiles"')
+    assert tiles_idx > stmts.index('DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_online_259200s"')
+    assert tiles_idx > stmts.index('DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_online_2592000s"')
 
 
 # --- STREAMING tile feature view provisioning (watermarked Kafka source -> EOWC tiles MV) ---
@@ -1788,7 +1803,8 @@ def test_provision_streaming_tile_secondary_key_declares_the_column_on_the_sourc
 def test_provision_streaming_tile_emits_watermarked_source_eowc_tiles_and_online_rollup():
     # daily (86400s) tiles, 3-day (259200s) window: a watermarked Kafka source, an EOWC TUMBLE tiles MV,
     # and the SAME now()-anchored online rollup MV as the batch path (only the tile source differs).
-    agg = _agg("sum", window_seconds=259200)
+    # NON-invertible max keeps the v1 per-(window) online rollup MV (cumulative path is invertible-only).
+    agg = _agg("max", window_seconds=259200)
     view = _stream_tile_view(_kafka_source(watermark=True), [agg], interval_secs=86400)
     ddl = _engine()._provision_streaming_tile_ddl("proj", view)
     assert len(ddl) == 3  # source + tiles MV + online rollup MV; NO Iceberg sink (MVs read directly)
@@ -1806,7 +1822,7 @@ def test_provision_streaming_tile_emits_watermarked_source_eowc_tiles_and_online
     assert "tumble(" in tiles_sql
     assert "window_end AS tile_end" in tiles_sql
     assert tiles_sql.endswith("EMIT ON WINDOW CLOSE")
-    assert "sum(amount) AS sum_amount" in tiles_sql  # window-independent partial (not per-window)
+    assert "max(amount) AS max_amount" in tiles_sql  # window-independent partial (not per-window)
 
     # online rollup MV: byte-identical shape to the batch path (reads the tiles MV, now()-anchored)
     assert rollup_sql.startswith("CREATE MATERIALIZED VIEW")
@@ -1814,7 +1830,7 @@ def test_provision_streaming_tile_emits_watermarked_source_eowc_tiles_and_online
     assert "FROM proj_user_txn_tiles" in rollup_sql
     assert "now() - INTERVAL '259200' SECOND" in rollup_sql
     assert "tile_end <= now()" in rollup_sql
-    assert f"sum(sum_amount) AS {feat}" in rollup_sql
+    assert f"max(max_amount) AS {feat}" in rollup_sql
 
     # NO Iceberg sink (the streaming tile path mirrors the batch tile path — MVs read directly)
     assert not any("CREATE SINK" in s for s in ddl)
@@ -1822,7 +1838,8 @@ def test_provision_streaming_tile_emits_watermarked_source_eowc_tiles_and_online
 
 def test_provision_streaming_tile_emits_one_online_mv_per_window():
     # multi-window: ONE shared EOWC tiles MV (window-independent partials) + one now() online MV PER window.
-    aggs = [_agg("sum", 259200), _agg("sum", 2592000), _agg("mean", 604800)]
+    # NON-invertible max keeps the per-(window) MV mechanics (the cumulative path is invertible-only).
+    aggs = [_agg("max", 259200), _agg("max", 2592000), _agg("max", 604800)]
     view = _stream_tile_view(_kafka_source(watermark=True), aggs, interval_secs=86400)
     ddl = _engine()._provision_streaming_tile_ddl("proj", view)
     assert len(ddl) == 1 + 1 + 3  # source + tiles + 3 per-window online MVs (3d, 7d, 30d)
@@ -1831,8 +1848,9 @@ def test_provision_streaming_tile_emits_one_online_mv_per_window():
     assert sum(1 for s in ddl if "tumble(" in s) == 1  # the single EOWC tiles MV
     for w in (259200, 604800, 2592000):
         assert f'"proj_user_txn_online_{w}s"' in joined
-    assert "sum(sum_amount) AS sum_amount_2592000s" in joined
-    assert "sum(sum_amount) / NULLIF(sum(count_amount), 0) AS mean_amount_604800s" in joined
+    # each per-window MV rolls the ONE shared max_amount tile partial up to its own window
+    assert "max(max_amount) AS max_amount_2592000s" in joined
+    assert "max(max_amount) AS max_amount_604800s" in joined
 
 
 @pytest.mark.parametrize("emit_on_window_close", [True, False])
@@ -1922,8 +1940,10 @@ def _deployed_from_provision_ddl(ddl):
 
 
 def _reconcilable_streaming_tile_view():
+    # NON-invertible max keeps the v1 per-(window) online rollup MV mechanics (the cumulative path is for
+    # invertible aggs only), so the reconcile add/rebuild/drop checks below stay about per-window MVs.
     return _stream_tile_view(
-        _kafka_source(watermark=True), [_agg("sum", 259200), _agg("sum", 2592000)], interval_secs=86400
+        _kafka_source(watermark=True), [_agg("max", 259200), _agg("max", 2592000)], interval_secs=86400
     )
 
 
@@ -2014,7 +2034,9 @@ def test_multi_window_streaming_tile_would_fail_the_plain_stream_path():
     # stream path (build_windowed_agg_select, one EOWC MV) REJECTS multi-window aggregations, so a
     # streaming-tile view mis-routed there fails LOUDLY (never silently mis-provisions) — and the tile
     # path is the only one that can provision it.
-    aggs = [_agg("sum", 259200), _agg("sum", 2592000)]
+    # NON-invertible max keeps the per-(window) MV mechanics, so the multi-window view provisions one
+    # online MV per window (the cumulative path is invertible-only and would collapse them to one MV).
+    aggs = [_agg("max", 259200), _agg("max", 2592000)]
     view = _stream_tile_view(_kafka_source(watermark=True), aggs, interval_secs=86400)
     with pytest.raises(ValueError):  # the plain stream path can't build multi-window
         _engine()._stream_mv_select("proj", view)
@@ -2976,3 +2998,124 @@ def test_get_historical_features_rejects_custom_plus_plain_view_mix():
             registry=_odfv_registry(),
             project="proj",
         )
+
+
+# --- v2 cumulative-subtraction serving: ONE running-total tile MV serves every invertible window ---
+# (sum/count/mean/var/stddev) by read-time 2-point asof subtraction, instead of one now()-anchored MV
+# per window. Non-invertible aggregations (min/max/count_distinct/sequence) keep the v1 per-window MVs.
+
+
+def _cum_ci():
+    # The cumulative builders take a ColumnInfo (join keys + event-time column); reuse the file's shape.
+    return ColumnInfo(
+        join_keys=["user_id"],
+        feature_cols=["sum_amount_259200s"],
+        ts_col="event_ts",
+        created_ts_col=None,
+        field_mapping=None,
+    )
+
+
+def test_cumulative_tile_select_runs_partials_OVER_tile_end():
+    # The cumulative-tile MV is ONE window-agnostic running total per partial COLUMN over tile_end — the
+    # source of every invertible window by later subtraction. mean@7d reuses the sum+count partials, so a
+    # sum@3d + mean@7d view stores cum_ntiles, cum_sum_amount, cum_count_amount (the deduped invertible set).
+    ci = _cum_ci()
+    sql = build_cumulative_tile_select(ci, [_agg("sum", 259200), _agg("mean", 604800)], "tiles")
+    assert "count(*) OVER (PARTITION BY user_id ORDER BY tile_end) AS cum_ntiles" in sql
+    assert "sum(sum_amount) OVER (PARTITION BY user_id ORDER BY tile_end) AS cum_sum_amount" in sql
+    assert "sum(count_amount) OVER (PARTITION BY user_id ORDER BY tile_end) AS cum_count_amount" in sql
+    assert sql.endswith("FROM tiles")  # reads the tiles MV (source-agnostic), no now()
+
+
+def test_cumulative_read_subtracts_two_asof_points_for_a_trailing_window():
+    # A TRAILING window = cum_at_end - cum_at_(end - window): two asof LATERAL reads (latest tile <= each
+    # bound) subtracted, with the cum_ntiles empty-window guard mapping a no-tile window to NULL (offline
+    # parity). end is the request-time floor; the lower bound is end - window.
+    ci = _cum_ci()
+    sql = build_cumulative_read_query(
+        "(SPINE)",
+        ["user_id", "event_timestamp"],
+        "event_timestamp",
+        cumulative_relation="cum",
+        column_info=ci,
+        aggregations=[_agg("sum", 259200)],
+        aggregation_interval=timedelta(days=1),
+    )
+    assert sql.count("LEFT JOIN LATERAL") == 2  # one asof point per window edge (upper + lower)
+    assert 'c.tile_end <= date_trunc(\'day\', e."event_timestamp")' in sql  # upper bound (window end)
+    assert (
+        'c.tile_end <= date_trunc(\'day\', e."event_timestamp") - INTERVAL \'259200\' SECOND' in sql
+    )  # lower bound (window end - window_size)
+    assert "CASE WHEN (COALESCE(a0.cum_ntiles, 0) - COALESCE(a1.cum_ntiles, 0)) = 0 THEN NULL" in sql
+    assert "(COALESCE(a0.cum_sum_amount, 0) - COALESCE(a1.cum_sum_amount, 0))" in sql  # the subtraction
+
+
+def test_cumulative_read_lifetime_has_no_lower_bound():
+    # A LIFETIME invertible agg is the cumulative-to-end value = cum_at_end, with NO lower bound and NO
+    # subtraction: a single asof point. (A floor would add an upper-floored asof; an unfloored lifetime has
+    # only the one.)
+    ci = _cum_ci()
+    life = Aggregation(column="amount", function="sum", time_window=None)
+    name = life.resolved_name(life.time_window)
+    sql = build_cumulative_read_query(
+        "(SPINE)",
+        ["user_id", "event_timestamp"],
+        "event_timestamp",
+        cumulative_relation="cum",
+        column_info=ci,
+        aggregations=[life],
+        aggregation_interval=timedelta(days=1),
+        lifetimes={name: None},
+    )
+    assert sql.count("LEFT JOIN LATERAL") == 1  # only ONE asof point (the cumulative-to-end value)
+    assert "INTERVAL" not in sql  # no lower-bound shift
+    assert " - COALESCE(" not in sql  # no 2-point subtraction
+    assert "CASE WHEN COALESCE(a0.cum_ntiles, 0) = 0 THEN NULL ELSE COALESCE(a0.cum_sum_amount, 0) END" in sql
+
+
+def test_desired_online_mvs_splits_invertible_to_cumulative_and_noninvertible_to_window():
+    # The v2 split lives in _desired_online_mvs: an invertible agg (sum) -> the single cumulative MV, a
+    # non-invertible agg (max) -> its own per-(window) now()-anchored MV. So a view with both gets the
+    # cumulative MV AND a per-window MV, but NO per-window MV for the invertible sum.
+    ci = _cum_ci()
+    mvs = _desired_online_mvs(
+        "proj",
+        "user_txn_daily",
+        ci,
+        [_agg("sum", 259200), _agg("max", 259200)],
+        "proj_user_txn_daily_tiles",
+        aggregation_interval=timedelta(days=1),
+        agg_params={},
+        secondary_key=None,
+        offsets={},
+        lifetimes={},
+        series={},
+    )
+    assert "proj_user_txn_daily_online_cum" in mvs  # ONE cumulative MV for the invertible sum
+    assert "proj_user_txn_daily_online_259200s" in mvs  # per-window MV for the non-invertible max
+    # the invertible sum has NO per-window MV (it is derived from the cumulative MV at read time)
+    assert "cum_sum_amount" in mvs["proj_user_txn_daily_online_cum"]
+    assert "max(max_amount) AS max_amount_259200s" in mvs["proj_user_txn_daily_online_259200s"]
+    assert "sum(sum_amount)" not in mvs["proj_user_txn_daily_online_259200s"]
+
+
+def test_desired_online_mvs_secondary_key_view_stays_v1():
+    # A SECONDARY-KEY view is excluded from the cumulative path (the cumulative MV carries no per-key Map
+    # dimension), so even an invertible sum keeps the v1 per-(window) now()-anchored MV — NO cumulative MV.
+    ci = _cum_ci()
+    mvs = _desired_online_mvs(
+        "proj",
+        "user_txn_daily",
+        ci,
+        [_agg("sum", 259200)],
+        "proj_user_txn_daily_tiles",
+        aggregation_interval=timedelta(days=1),
+        agg_params={},
+        secondary_key="ad_id",
+        offsets={},
+        lifetimes={},
+        series={},
+    )
+    assert "proj_user_txn_daily_online_cum" not in mvs  # cumulative path disabled for secondary-key views
+    assert "proj_user_txn_daily_online_259200s" in mvs  # the per-window MV is used instead

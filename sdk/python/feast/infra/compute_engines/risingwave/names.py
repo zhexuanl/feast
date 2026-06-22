@@ -52,6 +52,15 @@ def online_lifetime_mv_name(
     return name
 
 
+def online_cumulative_mv_name(project: str, view_name: str) -> str:
+    # The single CUMULATIVE-tile online MV for a tile feature view: per-(entity, tile_end) running totals
+    # of the invertible partials, from which the serving layer derives EVERY invertible window (trailing/
+    # offset/lifetime/series) by read-time 2-point asof subtraction. Replaces the N per-(window, offset) +
+    # M lifetime now()-anchored MVs for the invertible aggregations (sum/count/mean/var/stddev). The
+    # ``_online_`` infix keeps it inside the ``_existing_online_mv_names`` reconcile sweep.
+    return f"{base_name(project, view_name)}_online_cum"
+
+
 def tiles_name(project: str, view_name: str) -> str:
     # Internal tile MV for a BATCH feature view: holds the per-(entity, tile_end) partial
     # aggregates. The point-lookup never reads this; it reads the online rollup MV
