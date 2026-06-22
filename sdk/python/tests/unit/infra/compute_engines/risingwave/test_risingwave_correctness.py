@@ -3119,3 +3119,35 @@ def test_desired_online_mvs_secondary_key_view_stays_v1():
     )
     assert "proj_user_txn_daily_online_cum" not in mvs  # cumulative path disabled for secondary-key views
     assert "proj_user_txn_daily_online_259200s" in mvs  # the per-window MV is used instead
+
+
+# --- transient-DDL retry: a RisingWave cluster-state error on CREATE/DROP is retried, a real error is not ---
+
+
+class _FakeCursor:
+    def __init__(self, fail_times, exc):
+        self.calls = 0
+        self._fail_times = fail_times
+        self._exc = exc
+
+    def execute(self, sql):
+        self.calls += 1
+        if self.calls <= self._fail_times:
+            raise self._exc
+
+
+def test_execute_ddl_retries_a_transient_cluster_error_then_succeeds():
+    from feast.infra.compute_engines.risingwave.engine import _execute_ddl
+
+    cur = _FakeCursor(fail_times=2, exc=RuntimeError("Scheduler error: streaming vnode mapping not found"))
+    _execute_ddl(cur, 'CREATE MATERIALIZED VIEW "x" AS SELECT 1', backoff_ms=0)
+    assert cur.calls == 3  # two transient failures retried, third attempt succeeds
+
+
+def test_execute_ddl_reraises_a_permanent_error_without_retrying():
+    from feast.infra.compute_engines.risingwave.engine import _execute_ddl
+
+    cur = _FakeCursor(fail_times=99, exc=ValueError("syntax error near 'SELCT'"))
+    with pytest.raises(ValueError):
+        _execute_ddl(cur, "SELCT 1", backoff_ms=0)
+    assert cur.calls == 1  # a permanent (non-transient) error is raised on the first attempt, no retry

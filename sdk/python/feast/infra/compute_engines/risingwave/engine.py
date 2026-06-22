@@ -14,6 +14,7 @@ relying on them in production (see the inline ``UNVERIFIED`` markers).
 """
 
 import logging
+import time
 from typing import List, Sequence, Union
 
 from feast import (
@@ -151,6 +152,48 @@ __all__ = [
 ]
 
 
+# RisingWave occasionally fails a CREATE/DROP of a streaming object with a TRANSIENT cluster-state error:
+# the meta service is mid-reschedule (a parallel-unit / vnode mapping is not ready, or no compute worker is
+# momentarily available), which clears on a brief retry. A permanent error — a SQL or definition mistake —
+# does NOT clear, so anything not matching these signatures is re-raised immediately rather than masked.
+_TRANSIENT_DDL_ERROR_SIGNATURES = (
+    "scheduler error",
+    "no available worker",
+    "no available parallel unit",
+    "vnode mapping",
+    "not found in the cluster",
+    "service unavailable",
+    "connection refused",
+    "connection reset",
+)
+
+
+def _is_transient_ddl_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return any(sig in msg for sig in _TRANSIENT_DDL_ERROR_SIGNATURES)
+
+
+def _execute_ddl(cur, sql: str, *, attempts: int = 4, backoff_ms: int = 250) -> None:
+    """Run one CREATE/DROP DDL statement, retrying ONLY a transient RisingWave cluster-state error with a
+    short linear backoff. Streaming-object DDL can transiently fail while the meta service is rescheduling;
+    a permanent error is re-raised on the first attempt. Safe to retry because the engine connects with
+    autocommit (each statement is its own transaction, so a failed statement leaves no aborted-txn state)."""
+    for attempt in range(attempts):
+        try:
+            cur.execute(sql)
+            return
+        except Exception as exc:  # noqa: BLE001 — re-raised below unless it is a known transient
+            if attempt == attempts - 1 or not _is_transient_ddl_error(exc):
+                raise
+            logger.warning(
+                "transient RisingWave DDL error (attempt %d/%d), retrying: %s",
+                attempt + 1,
+                attempts,
+                exc,
+            )
+            time.sleep(backoff_ms * (attempt + 1) / 1000)
+
+
 class RisingWaveComputeEngine(ComputeEngine):
     def __init__(
         self,
@@ -195,16 +238,16 @@ class RisingWaveComputeEngine(ComputeEngine):
                 # tears down via _batch_drop_ddl, not _drop_ddl.
                 if is_streaming_tile(view):
                     for stmt in _batch_drop_ddl(project, view):
-                        cur.execute(stmt)
+                        _execute_ddl(cur, stmt)
                 elif is_passthrough_view(view):
                     for stmt in _passthrough_drop_ddl(project, view):
-                        cur.execute(stmt)
+                        _execute_ddl(cur, stmt)
                 elif isinstance(view, StreamFeatureView):
                     for stmt in _drop_ddl(project, view):
-                        cur.execute(stmt)
+                        _execute_ddl(cur, stmt)
                 elif is_tile_fv(view):
                     for stmt in _batch_drop_ddl(project, view):
-                        cur.execute(stmt)
+                        _execute_ddl(cur, stmt)
             for view in views_to_keep:
                 # Precedence is load-bearing: a streaming-tile AND a streaming-passthrough view are both
                 # StreamFeatureViews, so is_streaming_tile and is_passthrough_view must be checked BEFORE the
@@ -231,16 +274,16 @@ class RisingWaveComputeEngine(ComputeEngine):
                 # is_streaming_tile FIRST (it is also a StreamFeatureView): tear down the tile graph.
                 if is_streaming_tile(view):
                     for stmt in _batch_drop_ddl(project, view):
-                        cur.execute(stmt)
+                        _execute_ddl(cur, stmt)
                 elif is_passthrough_view(view):
                     for stmt in _passthrough_drop_ddl(project, view):
-                        cur.execute(stmt)
+                        _execute_ddl(cur, stmt)
                 elif isinstance(view, StreamFeatureView):
                     for stmt in _drop_ddl(project, view):
-                        cur.execute(stmt)
+                        _execute_ddl(cur, stmt)
                 elif is_tile_fv(view):
                     for stmt in _batch_drop_ddl(project, view):
-                        cur.execute(stmt)
+                        _execute_ddl(cur, stmt)
 
     def _provision_ddl(self, project: str, view) -> List[str]:
         """Registry-free DDL for one StreamFeatureView (source + MV + Iceberg sink)."""
@@ -325,9 +368,9 @@ class RisingWaveComputeEngine(ComputeEngine):
         )
         if mv_changed or source_changed:
             for stmt in _drop_ddl(project, view):
-                cur.execute(stmt)
+                _execute_ddl(cur, stmt)
             for stmt in self._provision_ddl(project, view):
-                cur.execute(stmt)
+                _execute_ddl(cur, stmt)
 
     def _passthrough_mv_select(self, project: str, view) -> str:
         """The latest-row SELECT for a passthrough view's online MV — the ONE definition shared by
@@ -427,9 +470,9 @@ class RisingWaveComputeEngine(ComputeEngine):
             source_changed = deployed_table is not None and deployed_table != view.batch_source.table
         if mv_changed or source_changed:
             for stmt in _passthrough_drop_ddl(project, view):
-                cur.execute(stmt)
+                _execute_ddl(cur, stmt)
             for stmt in self._provision_passthrough_ddl(project, view):
-                cur.execute(stmt)
+                _execute_ddl(cur, stmt)
 
     def _provision_batch_ddl(self, project: str, view) -> List[str]:
         """Registry-free DDL for one tile-aggregating BatchFeatureView: an Iceberg source, a continuous
@@ -591,16 +634,16 @@ class RisingWaveComputeEngine(ComputeEngine):
         if source_changed:
             full_rebuild, drops, creates = True, list(deployed_online), []
         for name in drops:  # online MVs (dependents) first
-            cur.execute(f'DROP MATERIALIZED VIEW IF EXISTS "{name}"')
+            _execute_ddl(cur, f'DROP MATERIALIZED VIEW IF EXISTS "{name}"')
         if full_rebuild:
-            cur.execute(f'DROP MATERIALIZED VIEW IF EXISTS "{tiles}"')
+            _execute_ddl(cur, f'DROP MATERIALIZED VIEW IF EXISTS "{tiles}"')
             if source_changed:
-                cur.execute(f'DROP SOURCE IF EXISTS "{src}"')  # so CREATE SOURCE picks up the new table
+                _execute_ddl(cur, f'DROP SOURCE IF EXISTS "{src}"')  # so CREATE SOURCE picks up the new table
             for stmt in self._provision_batch_ddl(project, view):
-                cur.execute(stmt)
+                _execute_ddl(cur, stmt)
         else:
             for name, select in creates:
-                cur.execute(f'CREATE MATERIALIZED VIEW IF NOT EXISTS "{name}" AS {select}')
+                _execute_ddl(cur, f'CREATE MATERIALIZED VIEW IF NOT EXISTS "{name}" AS {select}')
 
     def _reconcile_streaming_tile_view(self, cur, project: str, view) -> None:
         """Reconcile a KEPT streaming-tile view to its CURRENT definition — the streaming analogue of
@@ -660,9 +703,9 @@ class RisingWaveComputeEngine(ComputeEngine):
         if source_changed:
             full_rebuild, drops, creates = True, list(deployed_online), []
         for name in drops:  # online MVs (dependents) first
-            cur.execute(f'DROP MATERIALIZED VIEW IF EXISTS "{name}"')
+            _execute_ddl(cur, f'DROP MATERIALIZED VIEW IF EXISTS "{name}"')
         if full_rebuild:
-            cur.execute(f'DROP MATERIALIZED VIEW IF EXISTS "{tiles}"')
+            _execute_ddl(cur, f'DROP MATERIALIZED VIEW IF EXISTS "{tiles}"')
             # Drop the source too (unlike the batch reconcile): a streaming source declares its agg-input
             # columns EXPLICITLY (_source_ddl), so a partials change that adds an aggregation over a NEW
             # input column also changes the source schema — and CREATE SOURCE IF NOT EXISTS would keep the
@@ -670,12 +713,12 @@ class RisingWaveComputeEngine(ComputeEngine):
             # (the source is dependency-free once the tiles MV is gone) lets CREATE SOURCE pick up the new
             # columns. The batch reconcile needs no analogue: an Iceberg source infers its schema, so a new
             # column is read without re-creating the source.
-            cur.execute(f'DROP SOURCE IF EXISTS "{src}"')
+            _execute_ddl(cur, f'DROP SOURCE IF EXISTS "{src}"')
             for stmt in self._provision_streaming_tile_ddl(project, view):
-                cur.execute(stmt)
+                _execute_ddl(cur, stmt)
         else:
             for name, select in creates:
-                cur.execute(f'CREATE MATERIALIZED VIEW IF NOT EXISTS "{name}" AS {select}')
+                _execute_ddl(cur, f'CREATE MATERIALIZED VIEW IF NOT EXISTS "{name}" AS {select}')
 
     def _materialize_one(
         self, registry: BaseRegistry, task: MaterializationTask, **kwargs
