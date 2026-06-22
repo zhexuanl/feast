@@ -66,6 +66,7 @@ from feast.infra.compute_engines.risingwave.nodes import (
     encode_agg_lifetime,
     encode_agg_offsets,
     encode_agg_params,
+    encode_secondary_key,
     group_aggregations_by_window,
     group_aggregations_by_window_offset,
     view_agg_offsets,
@@ -845,6 +846,77 @@ def test_offline_tile_pit_offset_zero_is_byte_identical():
     assert base == with_empty
 
 
+# --- aggregation secondary key: a per-key Map breakdown -------------------------------------------
+
+
+def test_secondary_key_tiles_add_the_group_by_dimension():
+    batch = build_batch_tile_select(
+        _column_info(), [_agg("sum", 2592000)], "src",
+        aggregation_interval=timedelta(days=1), secondary_key="ad_id",
+    )
+    assert '"ad_id", date_trunc' in batch  # secondary key projected before tile_end
+    assert 'GROUP BY user_id, "ad_id", date_trunc' in batch
+    stream = build_streaming_tile_select(
+        _column_info(), [_agg("sum", 2592000)], "src",
+        aggregation_interval=timedelta(days=1), secondary_key="ad_id",
+    )
+    assert '"ad_id", window_end AS tile_end' in stream
+    assert 'GROUP BY window_start, window_end, user_id, "ad_id" EMIT ON WINDOW CLOSE' in stream
+
+
+def test_secondary_key_rejects_clash_with_join_key_or_output():
+    # the secondary key is a SEPARATE GROUP BY dimension; colliding it with a join key (or an aggregation
+    # output / the timestamp) would double-list the column — reject at build time, not as an opaque RW error.
+    with pytest.raises(ValueError, match="distinct raw column"):
+        build_batch_tile_select(
+            _column_info(), [_agg("sum", 2592000)], "src",
+            aggregation_interval=timedelta(days=1), secondary_key="user_id",  # == the join key
+        )
+
+
+def test_secondary_key_byte_identical_when_absent():
+    # no secondary key -> the tile/rollup SQL is unchanged (back-compat with every non-breakdown view).
+    base = build_batch_tile_select(_column_info(), [_agg("sum", 2592000)], "src", aggregation_interval=timedelta(days=1))
+    assert base == build_batch_tile_select(
+        _column_info(), [_agg("sum", 2592000)], "src", aggregation_interval=timedelta(days=1), secondary_key=None
+    )
+
+
+def test_online_rollup_secondary_key_nests_jsonb_object_agg():
+    sql = build_online_rollup_select(
+        _column_info(), [_agg("sum", 2592000)], "tiles",
+        aggregation_interval=timedelta(days=1), secondary_key="ad_id",
+    )
+    # inner: per (entity, secondary_key) recombine over the SAME now() window
+    assert 'sum(sum_amount) AS sum_amount_2592000s' in sql
+    assert "tile_end > now() - INTERVAL '2592000' SECOND AND tile_end <= now()" in sql
+    assert 'GROUP BY user_id, "ad_id"' in sql
+    # outer: collapse the secondary key into a per-aggregation Map, NULL keys filtered, empty -> NULL
+    assert (
+        'NULLIF(jsonb_object_agg("ad_id", sum_amount_2592000s) '
+        "FILTER (WHERE \"ad_id\" IS NOT NULL), '{}'::jsonb) AS sum_amount_2592000s" in sql
+    )
+    assert "GROUP BY user_id" in sql.rsplit("FROM", 1)[1]
+
+
+def test_offline_pit_secondary_key_nests_jsonb_object_agg():
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(), aggregations=[_agg("sum", 259200)],
+        aggregation_interval=timedelta(days=1), secondary_key="ad_id",
+    )
+    end = "date_trunc('day', e.\"event_timestamp\")"
+    # inner: per (entity row, secondary_key) windowed recombine via the LEFT JOIN
+    assert 't."ad_id" AS "ad_id"' in sql
+    assert f'GROUP BY e."user_id", e."event_timestamp", t."ad_id"' in sql
+    # outer: per-entity-row Map, NULL secondary key (a join miss) filtered, empty -> NULL
+    assert (
+        'NULLIF(jsonb_object_agg("ad_id", sum_amount_259200s) '
+        "FILTER (WHERE \"ad_id\" IS NOT NULL), '{}'::jsonb) AS sum_amount_259200s" in sql
+    )
+
+
 # --- lifetime window: all-history rollup, lower bound dropped --------------------------------------
 
 
@@ -1567,6 +1639,18 @@ def test_batch_drop_ddl_drops_every_per_window_mv():
 
 
 # --- STREAMING tile feature view provisioning (watermarked Kafka source -> EOWC tiles MV) ---
+
+
+def test_provision_streaming_tile_secondary_key_declares_the_column_on_the_source():
+    # A streaming-tile view with an aggregation secondary key references that raw column in the tiles MV
+    # GROUP BY, but it is neither a join key nor an aggregation input — so the CREATE SOURCE must DECLARE
+    # it, else RisingWave rejects the tiles MV with "column does not exist" at provision time.
+    agg = _agg("sum", window_seconds=259200)
+    view = _stream_tile_view(_kafka_source(watermark=True), [agg], interval_secs=86400)
+    view.tags = {**(getattr(view, "tags", None) or {}), **encode_secondary_key("ad_id")}
+    source_sql, tiles_sql, *_ = _engine()._provision_streaming_tile_ddl("proj", view)
+    assert '"ad_id" VARCHAR' in source_sql  # declared on the source so the tiles MV can bind it
+    assert 'GROUP BY window_start, window_end, user_id, "ad_id"' in tiles_sql
 
 
 def test_provision_streaming_tile_emits_watermarked_source_eowc_tiles_and_online_rollup():

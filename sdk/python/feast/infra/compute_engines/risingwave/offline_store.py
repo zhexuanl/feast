@@ -39,6 +39,7 @@ from feast.infra.compute_engines.risingwave.nodes import (
     view_agg_lifetime,
     view_agg_offsets,
     view_agg_params,
+    view_secondary_key,
 )
 from feast.infra.offline_stores import offline_utils
 from feast.infra.offline_stores.contrib.postgres_offline_store.postgres import (
@@ -275,6 +276,7 @@ def _tile_pit_query(
         agg_params=view_agg_params(fv),
         offsets=view_agg_offsets(fv),
         lifetimes=view_agg_lifetime(fv),
+        secondary_key=view_secondary_key(fv),
     )
     # The output column for each aggregation is its per-window resolved_name, prefixed with the view name
     # under full_feature_names (the alias build_offline_tile_pit_query emits) — the names the composed join

@@ -70,6 +70,7 @@ from feast.infra.compute_engines.risingwave.nodes import (
     view_agg_lifetime,
     view_agg_offsets,
     view_agg_params,
+    view_secondary_key,
 )
 from feast.infra.compute_engines.dag.context import ColumnInfo
 from feast.infra.offline_stores.offline_store import OfflineStore
@@ -193,7 +194,7 @@ def _passthrough_column_info(view) -> ColumnInfo:
     # passthrough, the Iceberg batch source otherwise. created_ts is intentionally NOT used: the offline
     # as-of read is over an Iceberg history (a streaming passthrough's batch_source, or a batch
     # passthrough's own source) and IcebergSource carries no created_timestamp_column, so to keep online ==
-    # offline both sides order by event time alone (latest-value-by-timestamp, the established feature stores attribute model).
+    # offline both sides order by event time alone (latest-value-by-timestamp).
     source = view.stream_source if is_passthrough_stream(view) else view.batch_source
     return ColumnInfo(
         join_keys=[f.name for f in view.entity_columns],
@@ -280,6 +281,13 @@ def _source_ddl(name: str, source: KafkaSource, view) -> str:
         if agg.column and agg.column not in seen:
             cols.append(f'"{agg.column}" DOUBLE PRECISION')  # placeholder type pending real source-schema types
             seen.add(agg.column)
+    # The aggregation secondary key is a raw GROUP BY column the tiles MV references but which is neither a
+    # join key nor an aggregation input, so it must be declared on the source too (placeholder type, like
+    # the agg inputs above) — else the streaming tiles MV fails to bind it.
+    sk = view_secondary_key(view)
+    if sk and sk not in seen:
+        cols.append(f'"{sk}" VARCHAR')
+        seen.add(sk)
     ts = source.timestamp_field
     cols.append(f'"{ts}" TIMESTAMP')
 
@@ -863,6 +871,7 @@ class RisingWaveComputeEngine(ComputeEngine):
         column_info = _batch_column_info(view)
         aggs = view_aggregations(view)
         params = view_agg_params(view)
+        secondary_key = view_secondary_key(view)
         src = source_name(project, view.name)
         tiles = tiles_name(project, view.name)
         ddl = [
@@ -870,7 +879,8 @@ class RisingWaveComputeEngine(ComputeEngine):
             _materialized_view_ddl(
                 tiles,
                 build_batch_tile_select(
-                    column_info, aggs, src, aggregation_interval=interval, agg_params=params
+                    column_info, aggs, src, aggregation_interval=interval, agg_params=params,
+                    secondary_key=secondary_key,
                 ),
             ),
         ]
@@ -882,14 +892,15 @@ class RisingWaveComputeEngine(ComputeEngine):
         ):
             rollup_select = build_online_rollup_select(
                 column_info, window_aggs, tiles, aggregation_interval=interval,
-                agg_params=params, offset_secs=offset_secs,
+                agg_params=params, offset_secs=offset_secs, secondary_key=secondary_key,
             )
             mv = online_window_mv_name(project, view.name, window_secs, offset_secs)
             ddl.append(_materialized_view_ddl(mv, rollup_select))
         # One all-history LIFETIME rollup MV per distinct floor (each has its own now()-anchored WHERE).
         for floor, lifetime_aggs in group_lifetime_aggregations(aggs, lifetimes):
             lifetime_select = build_lifetime_rollup_select(
-                column_info, lifetime_aggs, tiles, agg_params=params, lifetime_start_secs=floor
+                column_info, lifetime_aggs, tiles, agg_params=params, lifetime_start_secs=floor,
+                secondary_key=secondary_key,
             )
             ddl.append(
                 _materialized_view_ddl(
@@ -944,6 +955,7 @@ class RisingWaveComputeEngine(ComputeEngine):
         column_info = _registry_free_column_info(view)
         aggs = view_aggregations(view)
         params = view_agg_params(view)
+        secondary_key = view_secondary_key(view)
         src = source_name(project, view.name)
         tiles = tiles_name(project, view.name)
         ddl = [
@@ -951,7 +963,8 @@ class RisingWaveComputeEngine(ComputeEngine):
             _materialized_view_ddl(
                 tiles,
                 build_streaming_tile_select(
-                    column_info, aggs, src, aggregation_interval=interval, agg_params=params
+                    column_info, aggs, src, aggregation_interval=interval, agg_params=params,
+                    secondary_key=secondary_key,
                 ),
             ),
         ]
@@ -963,14 +976,15 @@ class RisingWaveComputeEngine(ComputeEngine):
         ):
             rollup_select = build_online_rollup_select(
                 column_info, window_aggs, tiles, aggregation_interval=interval,
-                agg_params=params, offset_secs=offset_secs,
+                agg_params=params, offset_secs=offset_secs, secondary_key=secondary_key,
             )
             mv = online_window_mv_name(project, view.name, window_secs, offset_secs)
             ddl.append(_materialized_view_ddl(mv, rollup_select))
         # One all-history LIFETIME rollup MV per distinct floor (each has its own now()-anchored WHERE).
         for floor, lifetime_aggs in group_lifetime_aggregations(aggs, lifetimes):
             lifetime_select = build_lifetime_rollup_select(
-                column_info, lifetime_aggs, tiles, agg_params=params, lifetime_start_secs=floor
+                column_info, lifetime_aggs, tiles, agg_params=params, lifetime_start_secs=floor,
+                secondary_key=secondary_key,
             )
             ddl.append(
                 _materialized_view_ddl(
@@ -996,10 +1010,12 @@ class RisingWaveComputeEngine(ComputeEngine):
         column_info = _batch_column_info(view)
         aggs = view_aggregations(view)
         params = view_agg_params(view)
+        secondary_key = view_secondary_key(view)
         src = source_name(project, view.name)
         tiles = tiles_name(project, view.name)
         desired_tiles = build_batch_tile_select(
-            column_info, aggs, src, aggregation_interval=interval, agg_params=params
+            column_info, aggs, src, aggregation_interval=interval, agg_params=params,
+            secondary_key=secondary_key,
         )
         offsets = view_agg_offsets(view)
         lifetimes = view_agg_lifetime(view)
@@ -1007,14 +1023,15 @@ class RisingWaveComputeEngine(ComputeEngine):
         desired_online = {
             online_window_mv_name(project, view.name, w, off): build_online_rollup_select(
                 column_info, wa, tiles, aggregation_interval=interval,
-                agg_params=params, offset_secs=off,
+                agg_params=params, offset_secs=off, secondary_key=secondary_key,
             )
             for (w, off), wa in group_aggregations_by_window_offset(windowed_aggs, offsets)
         }
         desired_online.update(
             {
                 online_lifetime_mv_name(project, view.name, floor): build_lifetime_rollup_select(
-                    column_info, la, tiles, agg_params=params, lifetime_start_secs=floor
+                    column_info, la, tiles, agg_params=params, lifetime_start_secs=floor,
+                    secondary_key=secondary_key,
                 )
                 for floor, la in group_lifetime_aggregations(aggs, lifetimes)
             }
@@ -1071,10 +1088,12 @@ class RisingWaveComputeEngine(ComputeEngine):
         column_info = _registry_free_column_info(view)
         aggs = view_aggregations(view)
         params = view_agg_params(view)
+        secondary_key = view_secondary_key(view)
         src = source_name(project, view.name)
         tiles = tiles_name(project, view.name)
         desired_tiles = build_streaming_tile_select(
-            column_info, aggs, src, aggregation_interval=interval, agg_params=params
+            column_info, aggs, src, aggregation_interval=interval, agg_params=params,
+            secondary_key=secondary_key,
         )
         offsets = view_agg_offsets(view)
         lifetimes = view_agg_lifetime(view)
@@ -1082,14 +1101,15 @@ class RisingWaveComputeEngine(ComputeEngine):
         desired_online = {
             online_window_mv_name(project, view.name, w, off): build_online_rollup_select(
                 column_info, wa, tiles, aggregation_interval=interval,
-                agg_params=params, offset_secs=off,
+                agg_params=params, offset_secs=off, secondary_key=secondary_key,
             )
             for (w, off), wa in group_aggregations_by_window_offset(windowed_aggs, offsets)
         }
         desired_online.update(
             {
                 online_lifetime_mv_name(project, view.name, floor): build_lifetime_rollup_select(
-                    column_info, la, tiles, agg_params=params, lifetime_start_secs=floor
+                    column_info, la, tiles, agg_params=params, lifetime_start_secs=floor,
+                    secondary_key=secondary_key,
                 )
                 for floor, la in group_lifetime_aggregations(aggs, lifetimes)
             }

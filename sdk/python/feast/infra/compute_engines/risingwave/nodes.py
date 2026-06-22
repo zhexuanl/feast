@@ -226,6 +226,30 @@ def is_lifetime_agg(agg: Aggregation, lifetimes: Optional[Dict[str, Optional[int
     return agg.resolved_name(agg.time_window) in (lifetimes or {})
 
 
+# The FEATURE-VIEW-LEVEL aggregation secondary key: a raw column naming a second GROUP BY dimension, so
+# each aggregation produces a per-secondary-key breakdown (a key -> value Map) per entity per window
+# (e.g. per user, a map of ad_id -> click count). It is one column shared by every aggregation in the
+# view (an FV-level param, not per-aggregation), so it rides a single engine-owned view tag rather than
+# the resolved_name-keyed carriers. Absent => no breakdown (the scalar output). HIGH-CARDINALITY CAVEAT:
+# the breakdown adds a GROUP BY dimension to the tiles and a per-entity Map that grows with the entity's
+# distinct-key count (and a lifetime+secondary-key MV never evicts), so a high-cardinality secondary key
+# inflates tile + MV state — the same unbounded-state class as an exact count_distinct.
+SECONDARY_KEY_TAG = "feast_rw_secondary_key"
+
+
+def encode_secondary_key(secondary_key: Optional[str]) -> Dict[str, str]:
+    """The view-tags fragment carrying the aggregation secondary key (a raw column name), or ``{}`` when
+    the view has none (so a view without a breakdown is left untouched). The inverse of
+    ``view_secondary_key``."""
+    return {SECONDARY_KEY_TAG: secondary_key} if secondary_key else {}
+
+
+def view_secondary_key(view) -> Optional[str]:
+    """The aggregation secondary key (a raw column name) a view carries in its tags, or None when there
+    is no breakdown. The inverse of ``encode_secondary_key``."""
+    return (getattr(view, "tags", None) or {}).get(SECONDARY_KEY_TAG) or None
+
+
 def _fmt_param(value: float) -> str:
     # Render a numeric aggregate parameter for SQL: an integer-valued float as an int literal
     # (5.0 -> "5"), otherwise its plain decimal form (0.95 -> "0.95"). Keeps the emitted SQL
@@ -872,6 +896,45 @@ def _tile_rollup_exprs(
     )
 
 
+def _assert_secondary_key_distinct(
+    secondary_key: Optional[str], column_info: ColumnInfo, aggregations: List[Aggregation]
+) -> None:
+    # The secondary key is a SEPARATE GROUP BY dimension, so it must not coincide with a join key, the
+    # timestamp, or an aggregation output: a collision would list the column twice in the tile GROUP BY
+    # or shadow an output column. Fail fast with a clear message rather than an opaque RisingWave error.
+    if not secondary_key:
+        return
+    clashes = set(column_info.join_keys_columns) | {column_info.timestamp_column} | {
+        a.resolved_name(a.time_window) for a in aggregations
+    }
+    if secondary_key in clashes:
+        raise ValueError(
+            f"aggregation_secondary_key '{secondary_key}' must be a distinct raw column — it cannot be a "
+            f"join key, the timestamp, or an aggregation output column."
+        )
+
+
+def _secondary_key_map_projection(
+    aggregations: List[Aggregation], secondary_key: str, output_names: List[str]
+) -> str:
+    """The OUTER projection that collapses the secondary-key dimension into a per-aggregation Map: for
+    each aggregation, ``jsonb_object_agg(secondary_key, <its scalar>)`` keyed by the secondary key,
+    aliased back to the aggregation's output name. RisingWave maintains ``jsonb_object_agg`` incrementally
+    in an MV and psycopg/pgx decode the jsonb column to a dict; ``map_agg`` is rejected, so jsonb is the
+    carrier. NULL secondary-key rows are filtered (a NULL breakdown bucket is not meaningful, and
+    jsonb_object_agg rejects a NULL key). An entity with no in-window tiles, or only NULL keys, would
+    otherwise yield an EMPTY map ``{}`` offline (the LEFT-JOIN miss / filtered rows) while the online MV
+    simply has NO row for it — a train/serve skew — so ``NULLIF(..., '{}')`` maps the empty breakdown to
+    NULL on BOTH sides, matching the online absent-entity and the scalar combiners' empty -> NULL
+    convention (cf. count_distinct ``NULLIF(cardinality(...), 0)``)."""
+    return ", ".join(
+        "NULLIF("
+        f'jsonb_object_agg("{secondary_key}", {out}) '
+        f'FILTER (WHERE "{secondary_key}" IS NOT NULL), \'{{}}\'::jsonb) AS {out}'
+        for out in output_names
+    )
+
+
 def _tile_partials_projection(
     column_info: ColumnInfo,
     aggregations: List[Aggregation],
@@ -900,6 +963,7 @@ def build_batch_tile_select(
     *,
     aggregation_interval,
     agg_params: Optional[Dict[str, List[float]]] = None,
+    secondary_key: Optional[str] = None,
 ) -> str:
     """Tile materialization for a BATCH feature view: one PARTIAL aggregate per (entity, tile),
     where a tile spans ``[tile_start, tile_start + aggregation_interval)`` and is stamped by
@@ -910,13 +974,18 @@ def build_batch_tile_select(
     if not aggregations:
         raise ValueError("build_batch_tile_select requires at least one aggregation")
     _assert_tile_supported(aggregations)
+    _assert_secondary_key_distinct(secondary_key, column_info, aggregations)
     unit = _tile_unit(aggregation_interval)
     keys = ", ".join(column_info.join_keys_columns)
     bucket = f"date_trunc('{unit}', {column_info.timestamp_column})"
     partials = _tile_partials_projection(column_info, aggregations, agg_params)
+    # A secondary key adds a second GROUP BY dimension to the tiles: tiles become per-(entity,
+    # secondary_key, tile_end), collapsed into a per-key Map at rollup.
+    sk_sel = f'"{secondary_key}", ' if secondary_key else ""
+    sk_grp = f', "{secondary_key}"' if secondary_key else ""
     return (
-        f"SELECT {keys}, {bucket} + INTERVAL '1 {unit}' AS tile_end, {partials} "
-        f"FROM {relation} GROUP BY {keys}, {bucket}"
+        f"SELECT {keys}, {sk_sel}{bucket} + INTERVAL '1 {unit}' AS tile_end, {partials} "
+        f"FROM {relation} GROUP BY {keys}{sk_grp}, {bucket}"
     )
 
 
@@ -935,6 +1004,7 @@ def build_streaming_tile_select(
     *,
     aggregation_interval,
     agg_params: Optional[Dict[str, List[float]]] = None,
+    secondary_key: Optional[str] = None,
 ) -> str:
     """Tile materialization for a STREAMING feature view — the streaming twin of ``build_batch_tile_select``.
     Emits the SAME per-(entity, tile_end) window-independent partials, but materialized by an EOWC TUMBLE at
@@ -950,6 +1020,7 @@ def build_streaming_tile_select(
     if not aggregations:
         raise ValueError("build_streaming_tile_select requires at least one aggregation")
     _assert_tile_supported(aggregations)
+    _assert_secondary_key_distinct(secondary_key, column_info, aggregations)
     secs = int(aggregation_interval.total_seconds())
     if secs not in _STREAMING_TILE_INTERVAL_SECS:
         raise ValueError(
@@ -960,10 +1031,12 @@ def build_streaming_tile_select(
     keys = ", ".join(column_info.join_keys_columns)
     ts = column_info.timestamp_column
     partials = _tile_partials_projection(column_info, aggregations, agg_params)
+    sk_sel = f'"{secondary_key}", ' if secondary_key else ""
+    sk_grp = f', "{secondary_key}"' if secondary_key else ""
     return (
-        f"SELECT {keys}, window_end AS tile_end, {partials} "
+        f"SELECT {keys}, {sk_sel}window_end AS tile_end, {partials} "
         f"FROM tumble({relation}, {ts}, INTERVAL '{secs}' SECOND) "
-        f"GROUP BY window_start, window_end, {keys} EMIT ON WINDOW CLOSE"
+        f"GROUP BY window_start, window_end, {keys}{sk_grp} EMIT ON WINDOW CLOSE"
     )
 
 
@@ -1012,6 +1085,7 @@ def build_online_rollup_select(
     aggregation_interval,
     agg_params: Optional[Dict[str, List[float]]] = None,
     offset_secs: int = 0,
+    secondary_key: Optional[str] = None,
 ) -> str:
     """Online rollup MV over the tiles: a CONTINUOUS RisingWave materialized view that maintains the
     request-anchored window rollup for ``as_of = now()`` (wall-clock), so the ONLINE READ stays an
@@ -1043,10 +1117,29 @@ def build_online_rollup_select(
     rollups = _tile_rollup_exprs(aggregations, agg_params=agg_params)
     off = abs(int(offset_secs))
     upper = "now()" if off == 0 else f"now() - INTERVAL '{off}' SECOND"
+    where = f"tile_end > now() - INTERVAL '{window_secs + off}' SECOND AND tile_end <= {upper}"
+    if secondary_key:
+        return _wrap_rollup_secondary_key(keys, secondary_key, tile_relation, rollups, where, aggregations)
     return (
         f"SELECT {keys}, {rollups}, max(tile_end) AS window_end FROM {tile_relation} "
-        f"WHERE tile_end > now() - INTERVAL '{window_secs + off}' SECOND AND tile_end <= {upper} "
-        f"GROUP BY {keys}"
+        f"WHERE {where} GROUP BY {keys}"
+    )
+
+
+def _wrap_rollup_secondary_key(keys, secondary_key, tile_relation, rollups, where, aggregations):
+    """The nested secondary-key form shared by the online + lifetime rollup MVs: an INNER rollup per
+    (entity, secondary_key) over the same WHERE, then an OUTER ``jsonb_object_agg`` per entity collapsing
+    the secondary-key dimension into a per-aggregation Map. ``max(tile_end)`` is carried through both
+    levels as the window_end PIT stamp."""
+    out_names = [a.resolved_name(a.time_window) for a in aggregations]
+    inner = (
+        f'SELECT {keys}, "{secondary_key}", {rollups}, max(tile_end) AS window_end '
+        f"FROM {tile_relation} WHERE {where} GROUP BY {keys}, \"{secondary_key}\""
+    )
+    maps = _secondary_key_map_projection(aggregations, secondary_key, out_names)
+    return (
+        f"SELECT {keys}, {maps}, max(window_end) AS window_end "
+        f"FROM ({inner}) AS _sk GROUP BY {keys}"
     )
 
 
@@ -1057,6 +1150,7 @@ def build_lifetime_rollup_select(
     *,
     agg_params: Optional[Dict[str, List[float]]] = None,
     lifetime_start_secs: Optional[int] = None,
+    secondary_key: Optional[str] = None,
 ) -> str:
     """Online rollup MV for LIFETIME aggregations over the tiles: a continuous RisingWave materialized
     view maintaining the ALL-HISTORY rollup for ``as_of = now()``, with the lower window bound DROPPED.
@@ -1084,6 +1178,8 @@ def build_lifetime_rollup_select(
         # timestamp without time zone, bucketed from UTC event times) deterministically — the same form
         # the offline PIT uses, so the online and offline tile sets cannot diverge on the session tz.
         where += f" AND tile_end > (to_timestamp({int(lifetime_start_secs)}) AT TIME ZONE 'UTC')"
+    if secondary_key:
+        return _wrap_rollup_secondary_key(keys, secondary_key, tile_relation, rollups, where, aggregations)
     return (
         f"SELECT {keys}, {rollups}, max(tile_end) AS window_end FROM {tile_relation} "
         f"WHERE {where} GROUP BY {keys}"
@@ -1104,6 +1200,7 @@ def build_offline_tile_pit_query(
     agg_params: Optional[Dict[str, List[float]]] = None,
     offsets: Optional[Dict[str, int]] = None,
     lifetimes: Optional[Dict[str, Optional[int]]] = None,
+    secondary_key: Optional[str] = None,
 ) -> str:
     """Offline point-in-time training rollup for a tile BatchFeatureView. For EACH entity row, rolls
     the tiles up in the request-anchored window ``(end - W, end]`` where ``end = floor(label_ts,
@@ -1189,12 +1286,29 @@ def build_offline_tile_pit_query(
         )
         for a in aggregations
     )
-    return (
-        f"SELECT {e_cols}, {rollups} FROM ({entity_df_sql}) e "
-        f"LEFT JOIN {tiles_relation} t ON {join_on} "
-        f"AND {join_lower}t.tile_end <= {end} "
-        f"GROUP BY {e_cols}"
+    join = (
+        f"FROM ({entity_df_sql}) e LEFT JOIN {tiles_relation} t ON {join_on} "
+        f"AND {join_lower}t.tile_end <= {end}"
     )
+    if secondary_key:
+        # Per (entity row, secondary_key) recombine, then collapse the secondary-key dimension into a
+        # per-aggregation Map per entity row. A LEFT-JOIN miss yields a NULL secondary_key the
+        # jsonb_object_agg FILTER drops; the resulting empty map is mapped to NULL (the NULLIF in
+        # _secondary_key_map_projection), matching the online absent-entity — so no train/serve skew.
+        out_entity = ", ".join(f'"{c}"' for c in entity_columns)
+        out_names = [
+            f'"{output_prefix}__{a.resolved_name(a.time_window)}"'
+            if output_prefix
+            else a.resolved_name(a.time_window)
+            for a in aggregations
+        ]
+        inner = (
+            f'SELECT {e_cols}, t."{secondary_key}" AS "{secondary_key}", {rollups} {join} '
+            f'GROUP BY {e_cols}, t."{secondary_key}"'
+        )
+        maps = _secondary_key_map_projection(aggregations, secondary_key, out_names)
+        return f"SELECT {out_entity}, {maps} FROM ({inner}) AS _sk GROUP BY {out_entity}"
+    return f"SELECT {e_cols}, {rollups} {join} GROUP BY {e_cols}"
 
 
 def compose_multi_view_pit_query(
