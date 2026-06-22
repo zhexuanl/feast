@@ -3074,6 +3074,59 @@ def test_cumulative_read_lifetime_has_no_lower_bound():
     assert "CASE WHEN COALESCE(a0.cum_ntiles, 0) = 0 THEN NULL ELSE COALESCE(a0.cum_sum_amount, 0) END" in sql
 
 
+def test_cumulative_read_series_assembles_array_of_per_step_subtractions():
+    # An invertible SERIES = L per-step 2-point subtractions over the cumulative MV, oldest window first:
+    # element i covers (end - (i+1)*step, end - i*step]. Same oldest-first ARRAY contract as the offline
+    # build_offline_tile_pit_query series, but derived by cumulative subtraction (so it scales to mean/var).
+    ci = _cum_ci()
+    ser = Aggregation(column="amount", function="sum", time_window=None, name="daily_sum_3")
+    sql = build_cumulative_read_query(
+        "(SPINE)", ["user_id", "event_timestamp"], "event_timestamp",
+        cumulative_relation="cum", column_info=ci, aggregations=[ser],
+        aggregation_interval=timedelta(days=1), series={"daily_sum_3": [86400, 86400, 3]},
+    )
+    end = "date_trunc('day', e.\"event_timestamp\")"
+    assert "ARRAY[" in sql and "AS daily_sum_3" in sql
+    # a 3-step series touches 4 distinct asof boundaries (end, end-1d, end-2d, end-3d) — deduped LATERALs
+    assert sql.count("LEFT JOIN LATERAL") == 4
+    assert f"c.tile_end <= {end} - INTERVAL '259200' SECOND" in sql  # the deepest (oldest) bound
+    assert "- COALESCE(" in sql  # each element is a 2-point subtraction of cumulative sums
+    # empty step -> NULL element (the cum_ntiles delta guard), matching offline's NULL-on-empty-step
+    assert "cum_ntiles" in sql and "THEN NULL" in sql
+
+
+def test_cumulative_read_mean_series_recombines_running_sum_and_count():
+    # A MEAN series — the case the read-time-assembly path could NOT do — is served by the cumulative path:
+    # each element = delta(cum_sum)/NULLIF(delta(cum_count), 0) over its step window. Pins that the moment
+    # recombine flows through the series ARRAY, not just sum/count.
+    ci = _cum_ci()
+    ser = Aggregation(column="amount", function="mean", time_window=None, name="hourly_mean_2")
+    sql = build_cumulative_read_query(
+        "(SPINE)", ["user_id", "event_timestamp"], "event_timestamp",
+        cumulative_relation="cum", column_info=ci, aggregations=[ser],
+        aggregation_interval=timedelta(hours=1), series={"hourly_mean_2": [3600, 3600, 2]},
+    )
+    assert "ARRAY[" in sql and "AS hourly_mean_2" in sql
+    assert "cum_sum_amount" in sql and "cum_count_amount" in sql  # mean reads both running totals
+    assert "/ NULLIF(" in sql  # mean divides the summed delta by the count delta
+
+
+def test_cumulative_read_variance_series_recombines_running_sumsq():
+    # A variance/stddev series adds the sumsq running total: each element is the centered
+    # delta(sumsq) - delta(sum)^2/delta(count), clamped non-negative — the same moment recombine the
+    # trailing-window variance uses, applied per step.
+    ci = _cum_ci()
+    ser = Aggregation(column="amount", function="var_pop", time_window=None, name="daily_var_2")
+    sql = build_cumulative_read_query(
+        "(SPINE)", ["user_id", "event_timestamp"], "event_timestamp",
+        cumulative_relation="cum", column_info=ci, aggregations=[ser],
+        aggregation_interval=timedelta(days=1), series={"daily_var_2": [86400, 86400, 2]},
+    )
+    assert "ARRAY[" in sql and "AS daily_var_2" in sql
+    assert "cum_sumsq_amount" in sql  # variance reads the running sum-of-squares
+    assert "GREATEST(" in sql  # the centered sum-of-squared-deviations is clamped non-negative
+
+
 def test_desired_online_mvs_splits_invertible_to_cumulative_and_noninvertible_to_window():
     # The v2 split lives in _desired_online_mvs: an invertible agg (sum) -> the single cumulative MV, a
     # non-invertible agg (max) -> its own per-(window) now()-anchored MV. So a view with both gets the
