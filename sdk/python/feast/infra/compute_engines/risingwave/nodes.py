@@ -679,10 +679,26 @@ def _tile_recombine(
     None the surrounding ``WHERE`` already bounds the window (the per-window online/floored rollups).
     ``output_prefix`` qualifies the OUTPUT alias as ``"{output_prefix}__{resolved_name}"`` for an offline
     read with full_feature_names; the online/materialize rollups pass none and keep the bare name."""
-    col, fn = agg.column, agg.function
     out = agg.resolved_name(agg.time_window)
     if output_prefix:
         out = f'"{output_prefix}__{out}"'
+    expr = _recombine_expr(agg, prefix=prefix, partial_filter=partial_filter, agg_params=agg_params)
+    return f"{expr} AS {out}"
+
+
+def _recombine_expr(
+    agg: Aggregation,
+    *,
+    prefix: str = "",
+    partial_filter: Optional[str] = None,
+    agg_params: Optional[Dict[str, List[float]]] = None,
+) -> str:
+    """The bare retrieval-time recombine EXPRESSION for one aggregation over the window-independent tile
+    partials — WITHOUT the output alias. The single home of the per-function recombine: ``_tile_recombine``
+    aliases it to the per-window ``resolved_name``, and ``_series_recombine`` builds an ``ARRAY[...]`` of
+    these (one per series step), so the online == offline recombine is never re-implemented per caller.
+    See ``_tile_recombine`` for the ``prefix`` / ``partial_filter`` semantics."""
+    col, fn = agg.column, agg.function
 
     def merged(kind: str, op: str = "sum") -> str:
         p = f"{prefix}{kind}_{col}"
@@ -690,18 +706,18 @@ def _tile_recombine(
         return f"{op}({inner})"
 
     if fn == "sum":
-        return f"{merged('sum')} AS {out}"
+        return merged("sum")
     if fn == "count":  # count recombines by SUMMING per-tile counts
-        return f"{merged('count')} AS {out}"
+        return merged("count")
     if fn in {"min", "max"}:
-        return f"{merged(fn, fn)} AS {out}"
+        return merged(fn, fn)
     if fn == "count_distinct":
         # Union the per-tile distinct sets and count: concat the tile arrays (array_flatten skips the
         # NULL inner arrays a multi-window CASE produces), dedup, count. NULLIF(_, 0) maps an empty
         # window (no tiles, or only NULL values) to NULL, so the offline LEFT-JOIN result matches the
         # online MV — where such an entity is simply absent.
         sets = merged("distinct", "array_agg")
-        return f"NULLIF(cardinality(array_distinct(array_flatten({sets}))), 0) AS {out}"
+        return f"NULLIF(cardinality(array_distinct(array_flatten({sets}))), 0)"
     if fn in _SEQUENCE_ORDER:
         # Concat the per-tile top-n arrays in tile_end order (array_flatten preserves it AND skips the
         # NULL inner arrays a multi-window CASE produces), then slice to n. Each tile array is already
@@ -713,10 +729,10 @@ def _tile_recombine(
         flat = f"array_flatten(array_agg({inner} ORDER BY {prefix}tile_end {_SEQUENCE_ORDER[fn]}))"
         if fn.endswith("_distinct"):
             flat = f"array_distinct({flat})"
-        return f"({flat})[1:{n}] AS {out}"
+        return f"({flat})[1:{n}]"
     sm, cnt = merged("sum"), merged("count")
     if fn == "mean":
-        return f"{sm} / NULLIF({cnt}, 0) AS {out}"
+        return f"{sm} / NULLIF({cnt}, 0)"
     # variance/stddev: (Σx² − (Σx)²/n) / n  (population) or / (n−1) (sample); stddev = sqrt(var).
     # GREATEST(..., 0) clamps the centered sum-of-squared-deviations to non-negative: the single-pass
     # computational form is catastrophic-cancellation-prone, so over large-magnitude values summed in
@@ -727,7 +743,41 @@ def _tile_recombine(
     centered = f"GREATEST({merged('sumsq')} - {sm} * {sm} / NULLIF({cnt}, 0), 0)"
     denom = f"NULLIF({cnt} - 1, 0)" if fn.endswith("_samp") else f"NULLIF({cnt}, 0)"
     var = f"{centered} / {denom}"
-    return f"sqrt({var}) AS {out}" if fn.startswith("stddev") else f"{var} AS {out}"
+    return f"sqrt({var})" if fn.startswith("stddev") else var
+
+
+def _series_recombine(
+    agg: Aggregation,
+    *,
+    end_expr: str,
+    window_secs: int,
+    step_secs: int,
+    length: int,
+    prefix: str = "",
+    output_prefix: str = "",
+    agg_params: Optional[Dict[str, List[float]]] = None,
+) -> str:
+    """The retrieval-time recombine for a window-SERIES: an ``ARRAY`` of ``length`` per-window recombines
+    over the ONE shared tile set, one element per step, ordered OLDEST window FIRST (the earliest->latest
+    array contract). Each element is the same per-window recombine ``_tile_recombine`` emits, narrowed by a
+    ``CASE`` to that step's window ``(end - W - i*step, end - i*step]`` off ``end_expr`` — i.e. the L-fold
+    copy of the offset ``CASE``. An empty step (no tiles in range) recombines to NULL (a sum over no rows,
+    or the NULLIF on count_distinct/mean), so its array element is NULL — matching the online assembled
+    array element-for-element, and established feature stores' empty-window = None."""
+    out = agg.resolved_name(agg.time_window)
+    if output_prefix:
+        out = f'"{output_prefix}__{out}"'
+    elements = []
+    for steps_back in range(length - 1, -1, -1):  # oldest window first (largest shift into the past first)
+        lo = window_secs + steps_back * step_secs
+        hi = steps_back * step_secs
+        pf = f"{prefix}tile_end > {end_expr} - INTERVAL '{lo}' SECOND"
+        # The newest step (hi == 0) needs no upper CASE bound — the join's `<= end` already caps it; every
+        # older step's upper edge sits below `end`, so it gets its own explicit upper bound.
+        if hi:
+            pf += f" AND {prefix}tile_end <= {end_expr} - INTERVAL '{hi}' SECOND"
+        elements.append(_recombine_expr(agg, prefix=prefix, partial_filter=pf, agg_params=agg_params))
+    return f"ARRAY[{', '.join(elements)}] AS {out}"
 
 # aggregation_interval (the tile size) -> RisingWave date_trunc unit. Standard units only for now
 # (date_trunc only supports these units); arbitrary intervals (e.g. 15min) need epoch-bucketing.
@@ -837,6 +887,7 @@ def _validate_windows(
     aggregations: List[Aggregation],
     aggregation_interval,
     lifetimes: Optional[Dict[str, Optional[int]]] = None,
+    series: Optional[Dict[str, Sequence[int]]] = None,
 ) -> List[int]:
     """Multi-window precondition for the offline PIT builder: tile-supported aggs only, distinct output
     names, and EVERY WINDOWED aggregation's window a positive whole multiple of the interval. Returns the
@@ -851,10 +902,30 @@ def _validate_windows(
     GROUP BY, distinguished from a lifetime aggregation only by the carrier — never by the value alone."""
     _assert_tile_supported(aggregations)
     _assert_distinct_output_names(aggregations)
-    windowed = [a for a in aggregations if not is_lifetime_agg(a, lifetimes)]
+    # A lifetime aggregation (no finite window) and a window-series (a fan of windows assembled
+    # positionally, its geometry on the series carrier) both lower to a null window, so both are excluded
+    # from the single-window grouping/check; a series instead has its step validated below.
+    windowed = [
+        a
+        for a in aggregations
+        if not is_lifetime_agg(a, lifetimes) and not is_series_agg(a, series)
+    ]
     windows = [secs for secs, _ in group_aggregations_by_window(windowed)] if windowed else []
     for secs in windows:
         _assert_window_multiple_of_interval(secs, aggregation_interval)
+    # A series step (and window) is a count of tiles, so it must be a whole multiple of the interval — the
+    # same parity invariant the window obeys, so the offline floor-anchored element equals the online one.
+    for a in aggregations:
+        if is_series_agg(a, series):
+            w, s, length = series[a.resolved_name(a.time_window)]
+            _assert_window_multiple_of_interval(int(s), aggregation_interval)
+            _assert_window_multiple_of_interval(int(w), aggregation_interval)
+            if int(length) < 1:
+                # a non-positive length would emit an empty ARRAY[] literal RisingWave rejects (an
+                # untyped empty array needs a cast); fail fast with a clear message instead.
+                raise ValueError(
+                    f"window-series length must be a positive number of windows; got {length}."
+                )
     return windows
 
 
@@ -1243,6 +1314,7 @@ def build_offline_tile_pit_query(
     agg_params: Optional[Dict[str, List[float]]] = None,
     offsets: Optional[Dict[str, int]] = None,
     lifetimes: Optional[Dict[str, Optional[int]]] = None,
+    series: Optional[Dict[str, Sequence[int]]] = None,
     secondary_key: Optional[str] = None,
 ) -> str:
     """Offline point-in-time training rollup for a tile BatchFeatureView. For EACH entity row, rolls
@@ -1278,9 +1350,9 @@ def build_offline_tile_pit_query(
     a longer ttl is a no-op. So the window is the single, authoritative bound."""
     if not aggregations:
         raise ValueError("build_offline_tile_pit_query requires at least one aggregation")
-    _validate_windows(aggregations, aggregation_interval, lifetimes)
+    _validate_windows(aggregations, aggregation_interval, lifetimes, series)
     for a in aggregations:
-        if not is_lifetime_agg(a, lifetimes):
+        if not is_lifetime_agg(a, lifetimes) and not is_series_agg(a, series):
             _assert_offset_multiple_of_interval(_agg_offset_secs(a, offsets), aggregation_interval)
     unit = _tile_unit(aggregation_interval)
     keys = column_info.join_keys_columns
@@ -1310,25 +1382,33 @@ def build_offline_tile_pit_query(
     # A lifetime aggregation reads ALL history up to `end`, so when one is present the join drops its
     # lower bound (the per-agg CASE then narrows each windowed/floored aggregation). Otherwise the join
     # reads back only to the deepest tile any windowed aggregation needs: max(window + |offset|).
+    def _join_depth(a: Aggregation) -> int:
+        # How far back the join must read for this aggregation. A series reads to its DEEPEST step:
+        # window + (length - 1) * step. A windowed aggregation reads window + |offset|.
+        if is_series_agg(a, series):
+            w, s, length = series[a.resolved_name(a.time_window)]
+            return int(w) + (int(length) - 1) * int(s)
+        return int(a.time_window.total_seconds()) + abs(_agg_offset_secs(a, offsets))
+
+    def _recombine(a: Aggregation) -> str:
+        if is_series_agg(a, series):
+            w, s, length = series[a.resolved_name(a.time_window)]
+            return _series_recombine(
+                a, end_expr=end, window_secs=int(w), step_secs=int(s), length=int(length),
+                prefix="t.", output_prefix=output_prefix, agg_params=agg_params,
+            )
+        return _tile_recombine(
+            a, prefix="t.", partial_filter=_partial_filter(a),
+            output_prefix=output_prefix, agg_params=agg_params,
+        )
+
     has_lifetime = any(is_lifetime_agg(a, lifetimes) for a in aggregations)
     if has_lifetime:
         join_lower = ""
     else:
-        max_lower = max(
-            int(a.time_window.total_seconds()) + abs(_agg_offset_secs(a, offsets))
-            for a in aggregations
-        )
+        max_lower = max(_join_depth(a) for a in aggregations)
         join_lower = f"t.tile_end > {end} - INTERVAL '{max_lower}' SECOND AND "
-    rollups = ", ".join(
-        _tile_recombine(
-            a,
-            prefix="t.",
-            partial_filter=_partial_filter(a),
-            output_prefix=output_prefix,
-            agg_params=agg_params,
-        )
-        for a in aggregations
-    )
+    rollups = ", ".join(_recombine(a) for a in aggregations)
     join = (
         f"FROM ({entity_df_sql}) e LEFT JOIN {tiles_relation} t ON {join_on} "
         f"AND {join_lower}t.tile_end <= {end}"

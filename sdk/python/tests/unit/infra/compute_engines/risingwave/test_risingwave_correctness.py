@@ -1156,6 +1156,92 @@ def test_offline_tile_pit_multi_window_still_requires_window_multiple_of_interva
         )
 
 
+def test_offline_tile_pit_series_emits_array_of_per_step_recombines_oldest_first():
+    # A window-series fans one aggregation into L windows -> ARRAY of L per-step recombines over the ONE
+    # shared tile set, ordered OLDEST window first. Each element is the per-window recombine narrowed to
+    # its step (end - W - i*step, end - i*step], the L-fold copy of the offset CASE; the join reads back
+    # to the deepest step once.
+    series_agg = Aggregation(column="amount", function="sum", time_window=None, name="daily_sum_3")
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(),
+        aggregations=[series_agg],
+        aggregation_interval=timedelta(days=1),
+        series={"daily_sum_3": [86400, 86400, 3]},
+    )
+    end = "date_trunc('day', e.\"event_timestamp\")"
+    oldest = f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '259200' SECOND AND t.tile_end <= {end} - INTERVAL '172800' SECOND THEN t.sum_amount END)"
+    middle = f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '172800' SECOND AND t.tile_end <= {end} - INTERVAL '86400' SECOND THEN t.sum_amount END)"
+    newest = f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '86400' SECOND THEN t.sum_amount END)"
+    assert f"ARRAY[{oldest}, {middle}, {newest}] AS daily_sum_3" in sql
+    # the join reads back to the deepest step once: window + (L-1)*step = 1d + 2*1d = 3d
+    assert f"t.tile_end > {end} - INTERVAL '259200' SECOND AND t.tile_end <= {end}" in sql
+
+
+def test_offline_tile_pit_series_count_combiner_is_sum_of_tile_counts():
+    # count over a step recombines by SUMMING per-tile counts; an empty step (no tiles) -> NULL element
+    # (sum over no rows), matching established feature stores' empty-window = None and the online assembled array.
+    series_agg = Aggregation(column="amount", function="count", time_window=None, name="daily_count_2")
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(),
+        aggregations=[series_agg],
+        aggregation_interval=timedelta(days=1),
+        series={"daily_count_2": [86400, 86400, 2]},
+    )
+    end = "date_trunc('day', e.\"event_timestamp\")"
+    oldest = f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '172800' SECOND AND t.tile_end <= {end} - INTERVAL '86400' SECOND THEN t.count_amount END)"
+    newest = f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '86400' SECOND THEN t.count_amount END)"
+    assert f"ARRAY[{oldest}, {newest}] AS daily_count_2" in sql
+
+
+def test_offline_tile_pit_series_mixes_with_a_windowed_agg():
+    # a series alongside a plain windowed agg: both roll up from the ONE tile set; the join reads back to
+    # the deeper of (the windowed window) and (the series depth).
+    series_agg = Aggregation(column="amount", function="sum", time_window=None, name="daily_sum_5")
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(),
+        aggregations=[_agg("sum", 86400), series_agg],
+        aggregation_interval=timedelta(days=1),
+        series={"daily_sum_5": [86400, 86400, 5]},
+    )
+    end = "date_trunc('day', e.\"event_timestamp\")"
+    assert "ARRAY[" in sql and "AS daily_sum_5" in sql
+    # the windowed 1d agg still emits its scalar recombine
+    assert f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '86400' SECOND THEN t.sum_amount END) AS sum_amount_86400s" in sql
+    # join reads back to the deepest: series depth 5d (432000) > the 1d windowed agg
+    assert f"t.tile_end > {end} - INTERVAL '432000' SECOND AND t.tile_end <= {end}" in sql
+
+
+def test_offline_tile_pit_series_rejects_step_not_multiple_of_interval():
+    # the series step must be a whole number of tiles (the same parity invariant the window obeys), so a
+    # non-multiple step would make the offline floor-anchored element diverge from the online assembled one.
+    bad = Aggregation(column="amount", function="sum", time_window=None, name="bad_series")
+    with pytest.raises(ValueError, match="multiple"):
+        build_offline_tile_pit_query(
+            "SELECT 1", ["user_id", "event_timestamp"], "event_timestamp",
+            tiles_relation="t", column_info=_column_info(),
+            aggregations=[bad], aggregation_interval=timedelta(days=1),
+            series={"bad_series": [3600, 3600, 4]},  # 1h step on a 1-day tile
+        )
+
+
+def test_offline_tile_pit_series_rejects_non_positive_length():
+    # a length-0 series would emit an empty ARRAY[] literal RisingWave rejects; fail fast at the builder.
+    bad = Aggregation(column="amount", function="sum", time_window=None, name="empty_series")
+    with pytest.raises(ValueError, match="length"):
+        build_offline_tile_pit_query(
+            "SELECT 1", ["user_id", "event_timestamp"], "event_timestamp",
+            tiles_relation="t", column_info=_column_info(),
+            aggregations=[bad], aggregation_interval=timedelta(days=1),
+            series={"empty_series": [86400, 86400, 0]},
+        )
+
+
 def test_offline_tile_pit_rejects_empty_aggregations():
     # same fail-fast guard as the other three tile builders (clear message, not a cryptic max([]) error)
     with pytest.raises(ValueError, match="at least one aggregation"):
