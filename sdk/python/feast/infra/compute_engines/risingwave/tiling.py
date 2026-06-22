@@ -269,8 +269,12 @@ def _cumulative_recombine_expr(
         denom = f"NULLIF({dcnt} - 1, 0)" if fn.endswith("_samp") else f"NULLIF({dcnt}, 0)"
         var = f"{centered} / {denom}"
         value = f"sqrt({var})" if fn.startswith("stddev") else var
-    # Empty window (no tiles) -> NULL, matching the offline PIT; an in-window-but-NULL-valued edge case
-    # would diverge (cumulative gives 0/NULL by NULLIF, offline gives NULL) but does not arise for real data.
+    # Empty window (no tiles in range) -> NULL, matching the offline PIT — the common case (an entity with
+    # no recent events). One narrow divergence remains for SUM: a window that HAS tiles but whose every
+    # aggregation-input value is NULL gives Δsum == 0 here, while the offline sum over only-NULL partials is
+    # NULL. It takes a window whose sole events all carry a NULL input value — rare, but real; count/mean/var
+    # agree in that case. Exact parity there would need a running value-count for sum-only columns to gate on;
+    # left as-is because the case is rare and 0 is a defensible sum of no (present) values.
     return f"CASE WHEN {dntiles} = 0 THEN NULL ELSE {value} END"
 
 
