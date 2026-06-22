@@ -9,7 +9,7 @@ a SELECT (that lives in ``sql_builders``). Depends only on ``feast.Aggregation``
 leaf carriers module; the SQL builders depend on it.
 """
 
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from feast.aggregation import Aggregation
 
@@ -326,6 +326,59 @@ def _series_recombine(
             pf += f" AND {prefix}tile_end <= {end_expr} - INTERVAL '{hi}' SECOND"
         elements.append(_recombine_expr(agg, prefix=prefix, partial_filter=pf, agg_params=agg_params))
     return f"ARRAY[{', '.join(elements)}] AS {out}"
+
+
+# The scalar finalizable functions a per-entity series SNAPSHOT can carry: sum/count/min/max (additive)
+# and mean/var/stddev (composite). count_distinct/sequence are array-valued (the per-tile value is itself
+# an array), so they are not snapshotted and keep the read-time single-scan.
+_SNAPSHOT_SERIES_FN = _ADDITIVE_TILE_FN | _COMPOSITE_TILE_FN
+
+
+def _tile_value_expr(
+    agg: Aggregation,
+    *,
+    prefix: str = "",
+    agg_params: Optional[Dict[str, List[float]]] = None,
+) -> str:
+    """The FINALIZED feature value of ONE tile, computed from that tile's stored partials WITHOUT an
+    aggregate wrapper — for a window-series whose step equals the tile interval, where each step is exactly
+    one tile. It is ``_recombine_expr`` with the cross-tile merge collapsed to identity (a single tile has
+    nothing to sum across), so a materialized last-L snapshot carries the SAME value the offline single-scan
+    recombines per step. Only scalar finalizable functions are covered (see ``_SNAPSHOT_SERIES_FN``);
+    count_distinct/sequence are array-valued and not snapshotted."""
+    col, fn = agg.column, agg.function
+    if fn in {"sum", "count", "min", "max"}:
+        return f"{prefix}{fn}_{col}"
+    sm, cnt = f"{prefix}sum_{col}", f"{prefix}count_{col}"
+    if fn == "mean":
+        return f"{sm} / NULLIF({cnt}, 0)"
+    # variance/stddev from this tile's {sum, sumsq, count} — identical algebra (and the GREATEST clamp) to
+    # _recombine_expr, here over a single tile so there is no cross-tile aggregate.
+    centered = f"GREATEST({prefix}sumsq_{col} - {sm} * {sm} / NULLIF({cnt}, 0), 0)"
+    denom = f"NULLIF({cnt} - 1, 0)" if fn.endswith("_samp") else f"NULLIF({cnt}, 0)"
+    var = f"{centered} / {denom}"
+    return f"sqrt({var})" if fn.startswith("stddev") else var
+
+
+def snapshot_series_aggs(
+    aggregations: List[Aggregation],
+    series: Optional[Dict[str, Sequence[int]]],
+    interval_secs: int,
+) -> List[Tuple[Aggregation, int]]:
+    """The ``(aggregation, length)`` pairs a per-entity last-L snapshot MV can serve: a window-series whose
+    window == step == the tile interval (so each element is exactly ONE tile) AND a scalar finalizable
+    function. Excluded — and kept on the read-time single-scan: a coarser step (step > interval, whose
+    step-buckets are anchored to the request frontier and so cannot be materialized frontier-agnostically),
+    an overlapping window (window > step), and array-valued aggregates (count_distinct/sequence)."""
+    out: List[Tuple[Aggregation, int]] = []
+    for a in aggregations:
+        geom = (series or {}).get(a.resolved_name(a.time_window))
+        if not geom:
+            continue
+        w, s, length = int(geom[0]), int(geom[1]), int(geom[2])
+        if w == s == int(interval_secs) and a.function in _SNAPSHOT_SERIES_FN:
+            out.append((a, length))
+    return out
 
 
 def _assert_tile_supported(aggregations: List[Aggregation]) -> None:

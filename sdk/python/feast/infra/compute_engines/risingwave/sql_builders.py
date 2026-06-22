@@ -23,6 +23,7 @@ from feast.infra.compute_engines.risingwave.aggregation_carriers import (
     is_lifetime_agg,
     is_series_agg,
 )
+from feast.infra.compute_engines.risingwave.names import SERIES_SNAPSHOT_ENDS_COL
 from feast.infra.compute_engines.risingwave.tiling import (
     _SEQUENCE_ORDER,
     _assert_tile_supported,
@@ -30,8 +31,10 @@ from feast.infra.compute_engines.risingwave.tiling import (
     _cumulative_recombine_expr,
     _series_recombine,
     _tile_recombine,
+    _tile_value_expr,
     _view_partials,
     is_invertible_agg,
+    snapshot_series_aggs,
 )
 
 # Aggregation functions this engine supports, named as the user writes them (the Feast
@@ -708,6 +711,54 @@ def build_cumulative_tile_select(
     win = f"(PARTITION BY {keys} ORDER BY tile_end)"
     proj = ", ".join(f"{sql} OVER {win} AS {name}" for (name, sql) in cum_cols)
     return f"SELECT {keys}, tile_end, {proj} FROM {tile_relation}"
+
+
+def build_series_snapshot_select(
+    column_info: ColumnInfo,
+    aggregations: List[Aggregation],
+    tile_relation: str,
+    *,
+    aggregation_interval,
+    agg_params: Optional[Dict[str, List[float]]] = None,
+    series: Optional[Dict[str, Sequence[int]]] = None,
+) -> Optional[str]:
+    """A per-entity LAST-L tile SNAPSHOT MV for the window-series whose step == the tile interval. Per
+    entity it stores the last ``depth`` tiles' end timestamps (``SERIES_SNAPSHOT_ENDS_COL``) and, for each
+    eligible series, that series' per-tile finalized value — two parallel ``array_agg(... ORDER BY tile_end
+    DESC)`` over a ``row_number() <= depth`` per-entity TopN of the tiles MV. The online read becomes a
+    single-row point lookup (vs the read-time range-scan single-scan), and the reader positions each
+    (tile_end, value) into its frontier-relative slot (``now()`` online / ``label_ts`` offline),
+    NULL-padding empty steps — index arithmetic, NOT a recombine, so the snapshot equals the offline
+    single-scan element-for-element (proven on dense/gap/stale entities). Returns None when no series is
+    snapshot-eligible.
+
+    Reads the tiles MV (``build_*_tile_select`` output), so it is source-agnostic (batch or streaming
+    tiles). now() is deliberately ABSENT — the snapshot is frontier-agnostic; anchoring happens in the
+    reader. ``array_agg`` over a per-entity TopN is incrementally maintained on RisingWave (a new tile
+    shifts the array). Snapshot-eligibility (step == interval, scalar finalizable function) is decided by
+    ``snapshot_series_aggs``; coarser steps, overlapping windows, and array-valued aggregates keep the
+    single-scan."""
+    interval_secs = int(aggregation_interval.total_seconds())
+    eligible = snapshot_series_aggs(aggregations, series, interval_secs)
+    if not eligible:
+        return None
+    keys = ", ".join(column_info.join_keys_columns)
+    depth = max(length for _a, length in eligible)
+    names = [a.resolved_name(a.time_window) for a, _ in eligible]
+    vals = ", ".join(
+        f"{_tile_value_expr(a, agg_params=agg_params)} AS {name}"
+        for (a, _), name in zip(eligible, names)
+    )
+    inner = (
+        f"SELECT {keys}, tile_end, {vals}, "
+        f"row_number() OVER (PARTITION BY {keys} ORDER BY tile_end DESC) AS __rn "
+        f"FROM {tile_relation}"
+    )
+    arrs = ", ".join(f"array_agg({name} ORDER BY tile_end DESC) AS {name}" for name in names)
+    return (
+        f"SELECT {keys}, array_agg(tile_end ORDER BY tile_end DESC) AS {SERIES_SNAPSHOT_ENDS_COL}, {arrs} "
+        f"FROM ({inner}) z WHERE __rn <= {depth} GROUP BY {keys}"
+    )
 
 
 def build_cumulative_read_query(

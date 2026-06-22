@@ -38,6 +38,11 @@ from feast.infra.compute_engines.risingwave.engine import (
     _passthrough_drop_ddl,
     _plan_batch_reconcile,
 )
+from feast.infra.compute_engines.risingwave.aggregation_carriers import encode_agg_series
+from feast.infra.compute_engines.risingwave.names import (
+    SERIES_SNAPSHOT_ENDS_COL,
+    online_series_mv_name,
+)
 from feast.infra.compute_engines.risingwave.iceberg_source import (
     IcebergSource,
     is_passthrough_fv,
@@ -63,10 +68,12 @@ from feast.infra.compute_engines.risingwave.nodes import (
     build_offline_tile_pit_query,
     build_online_rollup_select,
     build_passthrough_pit_query,
+    build_series_snapshot_select,
     build_streaming_tile_select,
     build_tile_rollup_select,
     build_windowed_agg_select,
     group_lifetime_aggregations,
+    snapshot_series_aggs,
     encode_agg_lifetime,
     encode_agg_offsets,
     encode_agg_params,
@@ -3194,6 +3201,115 @@ def test_desired_online_mvs_secondary_key_view_stays_v1():
     )
     assert "proj_user_txn_daily_online_cum" not in mvs  # cumulative path disabled for secondary-key views
     assert "proj_user_txn_daily_online_259200s" in mvs  # the per-window MV is used instead
+
+
+# --- window-series SNAPSHOT MV: a step==interval series materializes as last-L (tile_end, value) pairs ---
+
+
+def _ser(function, name, column="amount"):
+    return Aggregation(column=column, function=function, time_window=None, name=name)
+
+
+def test_series_snapshot_select_step_equals_interval_emits_last_l_pairs():
+    # A step==interval series (each element == one tile) materializes per entity as the last-`depth` tiles'
+    # ends plus each series' per-tile value, both as array_agg over a per-entity row_number()<=depth TopN.
+    # depth is the longest series (so a shorter series shares the same ends array, positioned by the reader).
+    sql = build_series_snapshot_select(
+        _column_info(), [_ser("sum", "daily_sum_3"), _ser("max", "daily_max_4")], "tiles_rel",
+        aggregation_interval=timedelta(days=1), agg_params={},
+        series={"daily_sum_3": [86400, 86400, 3], "daily_max_4": [86400, 86400, 4]},
+    )
+    assert f"array_agg(tile_end ORDER BY tile_end DESC) AS {SERIES_SNAPSHOT_ENDS_COL}" in sql
+    assert "sum_amount AS daily_sum_3" in sql  # per-tile finalize (identity for sum) in the inner TopN
+    assert "max_amount AS daily_max_4" in sql
+    assert "array_agg(daily_sum_3 ORDER BY tile_end DESC) AS daily_sum_3" in sql
+    assert "array_agg(daily_max_4 ORDER BY tile_end DESC) AS daily_max_4" in sql
+    assert "row_number() OVER (PARTITION BY user_id ORDER BY tile_end DESC) AS __rn" in sql
+    assert "WHERE __rn <= 4" in sql  # depth = max(3, 4)
+    assert sql.rstrip().endswith("GROUP BY user_id")
+
+
+def test_series_snapshot_select_finalizes_mean_per_tile():
+    # mean's per-tile value is the tile's sum/count — the SAME algebra the single-scan recombines, with the
+    # cross-tile merge collapsed to identity (one tile per element).
+    sql = build_series_snapshot_select(
+        _column_info(), [_ser("mean", "daily_mean_2")], "tiles_rel",
+        aggregation_interval=timedelta(days=1), agg_params={},
+        series={"daily_mean_2": [86400, 86400, 2]},
+    )
+    assert "sum_amount / NULLIF(count_amount, 0) AS daily_mean_2" in sql
+    assert "WHERE __rn <= 2" in sql
+
+
+def test_series_snapshot_select_none_for_ineligible_series():
+    # A coarser step (k>1, frontier-relative buckets), an overlapping window, and an array-valued aggregate
+    # are NOT snapshotted — they keep the read-time single-scan, so the builder returns None.
+    ci, day = _column_info(), timedelta(days=1)
+    assert build_series_snapshot_select(  # coarse step: step 2d > interval 1d
+        ci, [_ser("sum", "x")], "t", aggregation_interval=day, agg_params={},
+        series={"x": [172800, 172800, 2]}) is None
+    assert build_series_snapshot_select(  # overlapping: window 2d > step 1d
+        ci, [_ser("sum", "x")], "t", aggregation_interval=day, agg_params={},
+        series={"x": [172800, 86400, 2]}) is None
+    assert build_series_snapshot_select(  # array-valued: count_distinct
+        ci, [_ser("count_distinct", "x")], "t", aggregation_interval=day, agg_params={},
+        series={"x": [86400, 86400, 3]}) is None
+    assert build_series_snapshot_select(  # no series at all
+        ci, [_agg("sum", 86400)], "t", aggregation_interval=day, agg_params={}, series={}) is None
+
+
+def test_snapshot_series_aggs_keeps_only_step_equals_interval_scalar():
+    aggs = [_ser("sum", "s"), _ser("count_distinct", "cd"), _ser("max", "coarse"), _ser("sum", "overlap")]
+    eligible = snapshot_series_aggs(
+        aggs, {"s": [86400, 86400, 3], "cd": [86400, 86400, 3],
+               "coarse": [172800, 172800, 2], "overlap": [172800, 86400, 2]}, 86400)
+    assert [(a.resolved_name(a.time_window), length) for a, length in eligible] == [("s", 3)]
+
+
+def test_desired_online_mvs_emits_series_snapshot_for_step_interval_series():
+    # _desired_online_mvs gains ONE per-view snapshot MV when a step==interval series is present (named
+    # ..._online_series), and emits none for a coarse-step series (which stays on the single-scan).
+    ci = _cum_ci()
+    mvs = _desired_online_mvs(
+        "proj", "v", ci, [_ser("max", "daily_max_5")], "proj_v_tiles",
+        aggregation_interval=timedelta(days=1), agg_params={}, secondary_key=None,
+        offsets={}, lifetimes={}, series={"daily_max_5": [86400, 86400, 5]},
+    )
+    assert online_series_mv_name("proj", "v") in mvs  # == "proj_v_online_series"
+    assert "array_agg(daily_max_5 ORDER BY tile_end DESC) AS daily_max_5" in mvs[online_series_mv_name("proj", "v")]
+
+    coarse = _desired_online_mvs(
+        "proj", "v", ci, [_ser("max", "biday_max_5")], "proj_v_tiles",
+        aggregation_interval=timedelta(days=1), agg_params={}, secondary_key=None,
+        offsets={}, lifetimes={}, series={"biday_max_5": [172800, 172800, 5]},
+    )
+    assert online_series_mv_name("proj", "v") not in coarse  # coarse step: no snapshot MV
+
+
+def test_batch_drop_ddl_drops_series_snapshot_before_tiles():
+    # the snapshot MV reads the tiles MV, so teardown must drop it BEFORE the tiles MV (dependency order).
+    view = _batch_view([_ser("max", "daily_max_5")])
+    view.tags = encode_agg_series({"daily_max_5": [86400, 86400, 5]})
+    ddl = _batch_drop_ddl("proj", view)
+    series_drop = f'DROP MATERIALIZED VIEW IF EXISTS "{online_series_mv_name("proj", "user_txn_daily")}"'
+    tiles_drop = 'DROP MATERIALIZED VIEW IF EXISTS "proj_user_txn_daily_tiles"'
+    assert series_drop in ddl and tiles_drop in ddl
+    assert ddl.index(series_drop) < ddl.index(tiles_drop)
+
+
+def test_existing_online_mv_names_sweep_matches_series_snapshot():
+    # the reconcile sweep must SEE a deployed snapshot MV, else it would re-CREATE-IF-NOT-EXISTS forever and
+    # never drop a removed one. The widened regex matches ..._online_series alongside the other forms.
+    class _Cur:
+        def execute(self, sql):
+            self.rows = [("proj_v_online_series",), ("proj_v_online_cum",), ("proj_other_online_series",)]
+
+        def fetchall(self):
+            return self.rows
+
+    names = _existing_online_mv_names(_Cur(), "proj", "v")
+    assert "proj_v_online_series" in names
+    assert "proj_other_online_series" not in names  # anchored to THIS view's base name
 
 
 # --- transient-DDL retry: a RisingWave cluster-state error on CREATE/DROP is retried, a real error is not ---

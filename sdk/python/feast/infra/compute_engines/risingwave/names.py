@@ -61,6 +61,21 @@ def online_cumulative_mv_name(project: str, view_name: str) -> str:
     return f"{base_name(project, view_name)}_online_cum"
 
 
+# The reserved column the series snapshot MV stores the per-entity last-L tile end timestamps under,
+# alongside one per-series value array. The serving reader reads this column to position each value into
+# its frontier-relative slot; the leading ``__`` keeps it from colliding with a feature's resolved_name.
+SERIES_SNAPSHOT_ENDS_COL = "__series_tile_ends"
+
+
+def online_series_mv_name(project: str, view_name: str) -> str:
+    # The per-entity window-series SNAPSHOT MV for a tile feature view: one row per entity holding the last
+    # L tile end timestamps (SERIES_SNAPSHOT_ENDS_COL) plus each step==interval series' per-tile finalized
+    # values, read as a single-row point lookup (the reader positions the values against the request
+    # frontier). ONE per view — it carries every snapshot-eligible series. The ``_online_`` infix keeps it
+    # inside the ``_existing_online_mv_names`` reconcile sweep.
+    return f"{base_name(project, view_name)}_online_series"
+
+
 def tiles_name(project: str, view_name: str) -> str:
     # Internal tile MV for a BATCH feature view: holds the per-(entity, tile_end) partial
     # aggregates. The point-lookup never reads this; it reads the online rollup MV

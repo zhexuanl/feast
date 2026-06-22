@@ -32,6 +32,7 @@ from feast.infra.compute_engines.risingwave.names import (
     online_cumulative_mv_name,
     online_lifetime_mv_name,
     online_mv_name,
+    online_series_mv_name,
     online_window_mv_name,
     passthrough_history_source_name,
     source_name,
@@ -41,6 +42,7 @@ from feast.infra.compute_engines.risingwave.sql_builders import (
     build_cumulative_tile_select,
     build_lifetime_rollup_select,
     build_online_rollup_select,
+    build_series_snapshot_select,
 )
 from feast.infra.compute_engines.risingwave.tiling import is_invertible_agg
 
@@ -289,6 +291,9 @@ def _batch_drop_ddl(project: str, view) -> List[str]:
     # the cumulative MV (v2 invertible serving) reads the tiles MV, so drop it before the tiles MV; a
     # bare DROP IF EXISTS is a no-op for a view that never provisioned one (secondary-key / non-invertible).
     ddl.append(f'DROP MATERIALIZED VIEW IF EXISTS "{online_cumulative_mv_name(project, view.name)}"')
+    # the series snapshot MV (step==interval window-series) reads the tiles MV, so drop it before the tiles
+    # MV; a bare DROP IF EXISTS no-ops for a view that never provisioned one.
+    ddl.append(f'DROP MATERIALIZED VIEW IF EXISTS "{online_series_mv_name(project, view.name)}"')
     ddl.append(f'DROP MATERIALIZED VIEW IF EXISTS "{tiles_name(project, view.name)}"')
     ddl.append(f'DROP SOURCE IF EXISTS "{source_name(project, view.name)}"')
     return ddl
@@ -346,4 +351,13 @@ def _desired_online_mvs(
             column_info, la, tiles, agg_params=agg_params, lifetime_start_secs=floor,
             secondary_key=secondary_key,
         )
+    # A window-series whose step == the tile interval gets ONE per-entity last-L snapshot MV (carrying every
+    # such series of this view) so its online read is a point lookup instead of the read-time single-scan;
+    # coarser-step / overlapping / array-valued series stay on the single-scan and add no MV here.
+    snapshot = build_series_snapshot_select(
+        column_info, aggs, tiles, aggregation_interval=aggregation_interval,
+        agg_params=agg_params, series=series,
+    )
+    if snapshot is not None:
+        out[online_series_mv_name(project, view_name)] = snapshot
     return out

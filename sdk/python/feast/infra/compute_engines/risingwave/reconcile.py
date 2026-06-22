@@ -24,12 +24,14 @@ def _existing_online_mv_names(cur, project: str, view_name: str) -> set:
     provision/teardown (which only name the current set).
 
     Matches the trailing-window form ``{base}_online_{secs}s``, the shifted form
-    ``{base}_online_{secs}s_off{secs}s`` (``online_window_mv_name``), and the lifetime form
-    ``{base}_online_lifetime`` / ``..._from{secs}s`` (``online_lifetime_mv_name``); the anchored regex
-    avoids matching a differently-named view that merely shares this view's name as a prefix."""
+    ``{base}_online_{secs}s_off{secs}s`` (``online_window_mv_name``), the lifetime form
+    ``{base}_online_lifetime`` / ``..._from{secs}s`` (``online_lifetime_mv_name``), the cumulative form
+    ``{base}_online_cum`` (``online_cumulative_mv_name``), and the window-series snapshot form
+    ``{base}_online_series`` (``online_series_mv_name``); the anchored regex avoids matching a
+    differently-named view that merely shares this view's name as a prefix."""
     base = re.escape(base_name(project, view_name))
     pattern = re.compile(
-        rf"^{base}_online_(?:\d+s(?:_off\d+s)?|lifetime(?:_from\d+s)?|cum)$"
+        rf"^{base}_online_(?:\d+s(?:_off\d+s)?|lifetime(?:_from\d+s)?|cum|series)$"
     )
     cur.execute("SELECT matviewname FROM pg_matviews")
     return {name for (name,) in cur.fetchall() if pattern.match(name)}
