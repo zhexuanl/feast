@@ -53,6 +53,7 @@ from feast.infra.compute_engines.risingwave.nodes import (
     RWFilterNode,
     RWJoinNode,
     _assert_tile_supported,
+    _partials_for,
     build_batch_tile_select,
     build_latest_row_select,
     build_lifetime_rollup_select,
@@ -504,6 +505,37 @@ def test_agg_offset_carrier_round_trips_and_drops_zero():
 # --- Batch tile aggregation (tile model: partial aggregates + retrieval rollup) ---
 # The tile model (window-independent partial aggregates materialized once, then recombined per
 # window at retrieval) is validated end-to-end on RisingWave v3.0.0.
+
+
+def test_tile_partials_conform_to_feast_tiling_ir_decomposition():
+    # Feast's tiling module is the CANONICAL reference for the partial-aggregate IR algebra (which
+    # sub-aggregates each function tiles into). Pin OUR _partials_for to it for every function Feast's
+    # tiling covers, so the shared algebra cannot drift (we render to SQL; Feast's orchestrator is pandas,
+    # not reusable for pushdown — but the decomposition must agree). Feast returns ir_columns=None for an
+    # algebraic function (the value IS the partial) and a list for a composite one. Our pop/samp variants
+    # map to Feast's base name: the IR SET is identical, only the recombine denominator differs.
+    from feast.aggregation.tiling.base import get_ir_metadata_for_aggregation
+
+    feast_base = {"var_pop": "var", "var_samp": "var", "stddev_pop": "std", "stddev_samp": "std"}
+
+    def feast_ir_count(function):
+        _, meta = get_ir_metadata_for_aggregation(
+            Aggregation(column="amount", function=feast_base.get(function, function)), "amount"
+        )
+        return 1 if meta.ir_columns is None else len(meta.ir_columns)
+
+    for fn in ["sum", "count", "min", "max", "mean", "var_pop", "var_samp", "stddev_pop", "stddev_samp"]:
+        ours = len(_partials_for(Aggregation(column="amount", function=fn)))
+        assert ours == feast_ir_count(fn), f"{fn}: our {ours} partials != Feast's {feast_ir_count(fn)} IRs"
+    # the exact families, not just the counts: mean = {sum, count}; variance/stddev = {sum, count, sumsq}
+    assert {n for n, _ in _partials_for(_agg("mean"))} == {"sum_amount", "count_amount"}
+    assert {n for n, _ in _partials_for(_agg("var_pop"))} == {"sum_amount", "count_amount", "sumsq_amount"}
+
+    # Our EXTENSIONS are deliberately BEYOND Feast's tiling: it REJECTS count_distinct outright (and omits
+    # sequence), so we own those (exact set-union / bounded top-n). Assert the boundary is real — if Feast
+    # later adds count_distinct tiling, this raise-check fails and we fold it into the shared algebra.
+    with pytest.raises(ValueError, match="does not support tiling"):
+        get_ir_metadata_for_aggregation(Aggregation(column="amount", function="count_distinct"), "amount")
 
 
 def test_batch_tile_select_buckets_by_interval_and_stamps_tile_end():
@@ -1227,6 +1259,20 @@ def test_offline_tile_pit_series_rejects_step_not_multiple_of_interval():
             tiles_relation="t", column_info=_column_info(),
             aggregations=[bad], aggregation_interval=timedelta(days=1),
             series={"bad_series": [3600, 3600, 4]},  # 1h step on a 1-day tile
+        )
+
+
+def test_offline_tile_pit_series_rejects_step_coarser_than_interval():
+    # step = 2*interval is a whole multiple (passes the multiple check) but spans TWO tiles per element;
+    # the online assembler places one tile per slot, so offline must reject it too (each element is one
+    # tile in the first cut) rather than silently aggregating two — keeping online == offline.
+    bad = Aggregation(column="amount", function="sum", time_window=None, name="coarse_series")
+    with pytest.raises(ValueError, match="must equal aggregation_interval"):
+        build_offline_tile_pit_query(
+            "SELECT 1", ["user_id", "event_timestamp"], "event_timestamp",
+            tiles_relation="t", column_info=_column_info(),
+            aggregations=[bad], aggregation_interval=timedelta(days=1),
+            series={"coarse_series": [172800, 172800, 3]},  # 2-day step on a 1-day tile
         )
 
 

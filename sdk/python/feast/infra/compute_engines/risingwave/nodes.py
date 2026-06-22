@@ -567,15 +567,19 @@ def build_passthrough_pit_query(
 # keyed by (function-family, column), NOT by window — ``sum_amount``, ``count_amount``, ``min_amount``,
 # ``max_amount``, ``sumsq_amount``. So a ``sum(amount)`` over 3d and another over 30d SHARE the one
 # ``sum_amount`` tile partial, and ``mean(amount)`` reuses the same ``sum_amount`` + ``count_amount``.
-# Two families:
+# Two families — the partial-aggregate IR decomposition. This is the SAME algebra Feast's tiling defines
+# in ``feast.aggregation.tiling.base.get_ir_metadata_for_aggregation`` (the canonical reference): ADDITIVE
+# == Feast's "algebraic", COMPOSITE == Feast's "avg"/"holistic". We keep the SQL rendering here (Feast's
+# orchestrator is pure-pandas — not SQL-pushdownable), but a conformance test pins these families to
+# Feast's IR metadata so the shared algebra cannot drift (see test_tile_partials_conform_to_feast_tiling).
 #   ADDITIVE — one partial == the aggregate; recombine: sum/sum/min/max (count rolls up by SUMMING
 #     per-tile counts).
 #   COMPOSITE — the aggregate is NOT additive, but decomposes into additive partials that DO merge
-#     and a recombine formula (Chronon's IR: Average = {sum, count}; Variance via {sum, sumsq, count},
-#     var = (Σx² − (Σx)²/n)/n).
+#     and a recombine formula (mean = {sum, count}; variance via {sum, sumsq, count},
+#     var = (Σx² − (Σx)²/n)/n) — matching Feast's "avg" IR {sum,count} and "holistic" IR {sum,count,sum_sq}.
 # Each aggregation's OUTPUT column is still its per-window ``resolved_name`` (e.g. ``sum_amount_259200s``);
-# only the stored tile partials are window-independent. count_distinct/approx have no safe additive
-# sketch merge — still rejected.
+# only the stored tile partials are window-independent. count_distinct/sequence are OUR extension BEYOND
+# Feast's tiling (it rejects count_distinct and omits sequence); approx has no mergeable sketch — rejected.
 _ADDITIVE_TILE_FN = frozenset({"sum", "count", "min", "max"})
 _COMPOSITE_TILE_FN = frozenset({"mean", "var_pop", "var_samp", "stddev_pop", "stddev_samp"})
 # SET — exact count_distinct: the per-tile partial is the tile's DISTINCT SET (an array), and the
@@ -913,13 +917,30 @@ def _validate_windows(
     windows = [secs for secs, _ in group_aggregations_by_window(windowed)] if windowed else []
     for secs in windows:
         _assert_window_multiple_of_interval(secs, aggregation_interval)
-    # A series step (and window) is a count of tiles, so it must be a whole multiple of the interval — the
-    # same parity invariant the window obeys, so the offline floor-anchored element equals the online one.
+    # First cut: a window-series element is exactly ONE tile, so the step must EQUAL the tile interval
+    # (and the window must equal the step — non-overlapping). The online read-time assembler places one
+    # tile per step slot with no cross-tile recombine, so a coarser step (step = N*interval) would make
+    # offline aggregate N tiles per element while online places one — a divergence. Enforce step==interval
+    # here (the shared offline precondition) so offline rejects what online cannot serve, rather than
+    # silently producing a multi-tile element. The whole-multiple check runs first to keep its clear
+    # message for a sub-interval step.
+    interval_secs = int(aggregation_interval.total_seconds())
     for a in aggregations:
         if is_series_agg(a, series):
             w, s, length = series[a.resolved_name(a.time_window)]
             _assert_window_multiple_of_interval(int(s), aggregation_interval)
             _assert_window_multiple_of_interval(int(w), aggregation_interval)
+            if int(s) != interval_secs:
+                raise ValueError(
+                    f"window-series step ({int(s)}s) must equal aggregation_interval ({interval_secs}s) — "
+                    f"each series element is one tile (a coarser step needs a cross-tile recombine, which "
+                    f"the read-time assembler does not do)."
+                )
+            if int(w) != int(s):
+                raise ValueError(
+                    f"window-series window ({int(w)}s) must equal its step ({int(s)}s) — overlapping "
+                    f"windows are not yet supported."
+                )
             if int(length) < 1:
                 # a non-positive length would emit an empty ARRAY[] literal RisingWave rejects (an
                 # untyped empty array needs a cast); fail fast with a clear message instead.
