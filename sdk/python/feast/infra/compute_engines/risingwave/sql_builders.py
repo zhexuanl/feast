@@ -739,6 +739,15 @@ def build_cumulative_read_query(
     (min/max/count_distinct/sequence) are served from the interval tiles, not by subtraction."""
     if not aggregations:
         raise ValueError("build_cumulative_read_query requires at least one aggregation")
+    if series:
+        # A window-series is served by its own single-scan read (build_offline_tile_pit_query +
+        # _series_recombine), not by the cumulative MV: assembling L windows as L stacked asof LATERALs
+        # over the cumulative MV is an O(L)-deep correlated decorrelation that the RisingWave optimizer
+        # cannot plan at series scale. The cumulative read stays for trailing/offset/lifetime only.
+        raise ValueError(
+            "build_cumulative_read_query does not serve a window-series; use build_offline_tile_pit_query "
+            "(the single-scan series read)."
+        )
     for a in aggregations:
         if not is_invertible_agg(a):
             raise ValueError(
@@ -772,14 +781,7 @@ def build_cumulative_read_query(
     for a in aggregations:
         name = a.resolved_name(a.time_window)
         out = f'"{output_prefix}__{name}"' if output_prefix else name
-        if series and name in series:
-            w, s, length = (int(x) for x in series[name])
-            elems = [
-                _cumulative_recombine_expr(a, hi=asof(back(i * s)), lo=asof(back(i * s + w)))
-                for i in range(length - 1, -1, -1)  # oldest window first
-            ]
-            projs.append(f"ARRAY[{', '.join(elems)}] AS {out}")
-        elif lifetimes and name in lifetimes:
+        if lifetimes and name in lifetimes:
             floor = lifetimes[name]
             lo = None if floor is None else asof(floor_bound(floor))
             projs.append(f"{_cumulative_recombine_expr(a, hi=asof(back(0)), lo=lo)} AS {out}")
