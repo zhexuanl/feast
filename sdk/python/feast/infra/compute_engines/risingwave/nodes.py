@@ -250,6 +250,49 @@ def view_secondary_key(view) -> Optional[str]:
     return (getattr(view, "tags", None) or {}).get(SECONDARY_KEY_TAG) or None
 
 
+# The per-aggregation window-SERIES geometry: an aggregation fanned into a series of trailing windows,
+# emitted as one ARRAY-valued feature (e.g. 24 hourly sums). feast.Aggregation carries a single window,
+# not a series, so the geometry rides this engine-owned tag — a carrier parallel to the offset/param tags
+# — as a JSON map keyed by resolved_name -> ``[window_secs, step_secs, length]`` (length = the count of
+# windows, L). PRESENCE of a resolved_name here is what makes the aggregation a series (so it is excluded
+# from the per-window/lifetime rollups and assembled positionally at read time instead). First cut:
+# non-overlapping (window_secs == step_secs) and step_secs == the tile aggregation_interval, so each array
+# element is exactly one tile's value. Works for both tile flavors (the tag round-trips on the view).
+AGG_SERIES_TAG = "feast_rw_agg_series"
+
+
+def encode_agg_series(
+    series_by_resolved_name: Dict[str, Sequence[int]],
+) -> Dict[str, str]:
+    """The view-tags fragment carrying per-aggregation window-series geometry, keyed by resolved_name ->
+    ``[window_secs, step_secs, length]`` (whole seconds + window count). Drops empty entries and returns
+    ``{}`` when there is no series aggregation, so a series-free view's tags are left untouched. The
+    inverse of ``view_agg_series``."""
+    cleaned = {
+        name: [int(v) for v in geometry]
+        for name, geometry in series_by_resolved_name.items()
+        if geometry
+    }
+    return {AGG_SERIES_TAG: json.dumps(cleaned)} if cleaned else {}
+
+
+def view_agg_series(view) -> Dict[str, List[int]]:
+    """The window-series geometry a view carries in its tags, keyed by resolved_name ->
+    ``[window_secs, step_secs, length]``. A resolved_name present here is a series aggregation. Absent =>
+    {} (the common case: no series aggregations). The inverse of ``encode_agg_series``."""
+    raw = (getattr(view, "tags", None) or {}).get(AGG_SERIES_TAG)
+    if not raw:
+        return {}
+    return {name: [int(v) for v in geometry] for name, geometry in json.loads(raw).items()}
+
+
+def is_series_agg(agg: Aggregation, series: Optional[Dict[str, Sequence[int]]]) -> bool:
+    """Whether this aggregation is a window-series, per the series carrier (membership keyed by
+    resolved_name). A series lowers to a NULL window like a lifetime aggregation, so the two are told
+    apart only by which carrier holds the resolved_name — never by the window value alone."""
+    return agg.resolved_name(agg.time_window) in (series or {})
+
+
 def _fmt_param(value: float) -> str:
     # Render a numeric aggregate parameter for SQL: an integer-valued float as an int literal
     # (5.0 -> "5"), otherwise its plain decimal form (0.95 -> "0.95"). Keeps the emitted SQL
