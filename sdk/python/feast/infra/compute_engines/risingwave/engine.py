@@ -67,9 +67,11 @@ from feast.infra.compute_engines.risingwave.nodes import (
     group_aggregations_by_window_offset,
     group_lifetime_aggregations,
     is_lifetime_agg,
+    is_series_agg,
     view_agg_lifetime,
     view_agg_offsets,
     view_agg_params,
+    view_agg_series,
     view_secondary_key,
 )
 from feast.infra.compute_engines.dag.context import ColumnInfo
@@ -390,7 +392,10 @@ def _batch_drop_ddl(project: str, view) -> List[str]:
     # The (window, offset) set comes from the SAME split the engine provisioned with.
     aggs = view_aggregations(view)
     lifetimes = view_agg_lifetime(view)
-    windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes)]
+    series = view_agg_series(view)
+    # a series aggregation has no own rollup MV (it reuses the tiles MV), so exclude it from the per-window
+    # drop set, same as a lifetime aggregation.
+    windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes) and not is_series_agg(a, series)]
     ddl = [
         f'DROP MATERIALIZED VIEW IF EXISTS "{online_window_mv_name(project, view.name, w, off)}"'
         for (w, off), _ in group_aggregations_by_window_offset(windowed_aggs, view_agg_offsets(view))
@@ -886,7 +891,11 @@ class RisingWaveComputeEngine(ComputeEngine):
         ]
         offsets = view_agg_offsets(view)
         lifetimes = view_agg_lifetime(view)
-        windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes)]
+        series = view_agg_series(view)
+        # A window-series aggregation reuses the tiles MV (assembled at read time) — it has no own rollup
+        # MV, so it is excluded from the per-(window, offset) rollup like a lifetime aggregation is. Its
+        # partials still ride the tiles MV (it stays in `aggs`).
+        windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes) and not is_series_agg(a, series)]
         for (window_secs, offset_secs), window_aggs in group_aggregations_by_window_offset(
             windowed_aggs, offsets
         ):
@@ -970,7 +979,11 @@ class RisingWaveComputeEngine(ComputeEngine):
         ]
         offsets = view_agg_offsets(view)
         lifetimes = view_agg_lifetime(view)
-        windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes)]
+        series = view_agg_series(view)
+        # A window-series aggregation reuses the tiles MV (assembled at read time) — it has no own rollup
+        # MV, so it is excluded from the per-(window, offset) rollup like a lifetime aggregation is. Its
+        # partials still ride the tiles MV (it stays in `aggs`).
+        windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes) and not is_series_agg(a, series)]
         for (window_secs, offset_secs), window_aggs in group_aggregations_by_window_offset(
             windowed_aggs, offsets
         ):
@@ -1019,7 +1032,11 @@ class RisingWaveComputeEngine(ComputeEngine):
         )
         offsets = view_agg_offsets(view)
         lifetimes = view_agg_lifetime(view)
-        windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes)]
+        series = view_agg_series(view)
+        # A window-series aggregation reuses the tiles MV (assembled at read time) — it has no own rollup
+        # MV, so it is excluded from the per-(window, offset) rollup like a lifetime aggregation is. Its
+        # partials still ride the tiles MV (it stays in `aggs`).
+        windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes) and not is_series_agg(a, series)]
         desired_online = {
             online_window_mv_name(project, view.name, w, off): build_online_rollup_select(
                 column_info, wa, tiles, aggregation_interval=interval,
@@ -1097,7 +1114,11 @@ class RisingWaveComputeEngine(ComputeEngine):
         )
         offsets = view_agg_offsets(view)
         lifetimes = view_agg_lifetime(view)
-        windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes)]
+        series = view_agg_series(view)
+        # A window-series aggregation reuses the tiles MV (assembled at read time) — it has no own rollup
+        # MV, so it is excluded from the per-(window, offset) rollup like a lifetime aggregation is. Its
+        # partials still ride the tiles MV (it stays in `aggs`).
+        windowed_aggs = [a for a in aggs if not is_lifetime_agg(a, lifetimes) and not is_series_agg(a, series)]
         desired_online = {
             online_window_mv_name(project, view.name, w, off): build_online_rollup_select(
                 column_info, wa, tiles, aggregation_interval=interval,
