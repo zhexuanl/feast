@@ -23,14 +23,21 @@ def online_mv_name(project: str, view_name: str) -> str:
     return f"{base_name(project, view_name)}_online"
 
 
-def online_window_mv_name(project: str, view_name: str, window_secs: int) -> str:
-    # Per-window online rollup MV for a tile BATCH feature view. A tile FV reuses ONE tile set across
-    # many time-windows, but RisingWave rejects now() inside a CASE in a two-sided
-    # temporal-filter MV, so each distinct window gets its OWN now()-anchored rollup MV. The point-lookup
-    # reads the per-window MV holding the requested feature's window. The engine (provisioning) and apply
-    # (serving spec) derive this name from the SAME group_aggregations_by_window split, so they cannot
-    # drift.
-    return f"{base_name(project, view_name)}_online_{window_secs}s"
+def online_window_mv_name(
+    project: str, view_name: str, window_secs: int, offset_secs: int = 0
+) -> str:
+    # Per-(window, offset) online rollup MV for a tile feature view. A tile FV reuses ONE tile set across
+    # many time-windows, but RisingWave rejects now() inside a CASE in a two-sided temporal-filter MV, so
+    # each distinct window gets its OWN now()-anchored rollup MV. A window SHIFTED into the past (a
+    # non-zero offset) cannot share the trailing window's MV either (its now()-anchored WHERE differs),
+    # so the offset is part of the name. The engine (provisioning) and apply (serving spec) derive this
+    # name from the SAME (window, offset) split, so they cannot drift. offset=0 (the trailing window, the
+    # common case) keeps the bare ``_online_{secs}s`` name — back-compatible with existing deployments.
+    name = f"{base_name(project, view_name)}_online_{window_secs}s"
+    off = abs(int(offset_secs))
+    if off:
+        name += f"_off{off}s"
+    return name
 
 
 def tiles_name(project: str, view_name: str) -> str:

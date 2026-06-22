@@ -62,7 +62,8 @@ from feast.infra.compute_engines.risingwave.nodes import (
     build_online_rollup_select,
     build_streaming_tile_select,
     build_windowed_agg_select,
-    group_aggregations_by_window,
+    group_aggregations_by_window_offset,
+    view_agg_offsets,
     view_agg_params,
 )
 from feast.infra.compute_engines.dag.context import ColumnInfo
@@ -373,32 +374,34 @@ def _passthrough_drop_ddl(project: str, view) -> List[str]:
 def _batch_drop_ddl(project: str, view) -> List[str]:
     # Mirror of _drop_ddl for a tile BatchFeatureView: drop the per-window online rollup MVs, then the
     # tiles MV they read, then the source. No Iceberg sink is provisioned (the MVs are read directly).
-    # The window set comes from the SAME group_aggregations_by_window split the engine provisioned with.
+    # The (window, offset) set comes from the SAME split the engine provisioned with.
     ddl = [
-        f'DROP MATERIALIZED VIEW IF EXISTS "{online_window_mv_name(project, view.name, window_secs)}"'
-        for window_secs, _ in group_aggregations_by_window(view_aggregations(view))
+        f'DROP MATERIALIZED VIEW IF EXISTS "{online_window_mv_name(project, view.name, w, off)}"'
+        for (w, off), _ in group_aggregations_by_window_offset(
+            view_aggregations(view), view_agg_offsets(view)
+        )
     ]
     ddl.append(f'DROP MATERIALIZED VIEW IF EXISTS "{tiles_name(project, view.name)}"')
     ddl.append(f'DROP SOURCE IF EXISTS "{source_name(project, view.name)}"')
     return ddl
 
 
-def _existing_online_window_secs(cur, project: str, view_name: str) -> set:
-    """The window-seconds of the per-window online MVs that physically EXIST for a tile view, read from
-    RisingWave's pg-compatible catalog. The reconcile diffs this against the DESIRED window set so a
-    re-apply that shrinks/changes a view's windows drops the now-removed windows' MVs: Feast routes a
+def _existing_online_mv_names(cur, project: str, view_name: str) -> set:
+    """The NAMES of the per-(window, offset) online rollup MVs that physically EXIST for a tile view, read
+    from RisingWave's pg-compatible catalog. The reconcile diffs these names against the DESIRED set so a
+    re-apply that shrinks/changes a view's (window, offset) set drops the now-removed MVs: Feast routes a
     same-name edited view to ``views_to_keep`` (not ``views_to_delete``) and ``CREATE ... IF NOT EXISTS``
-    never removes a no-longer-provisioned window's MV, so it would otherwise run forever, unreachable by
-    any future provision/teardown (which only name the current window set)."""
-    prefix = f"{base_name(project, view_name)}_online_"
+    never removes a no-longer-provisioned MV, so it would otherwise run forever, unreachable by any future
+    provision/teardown (which only name the current set).
+
+    Matches both the trailing-window form ``{base}_online_{secs}s`` and the shifted form
+    ``{base}_online_{secs}s_off{secs}s`` (``online_window_mv_name``); the anchored regex avoids matching a
+    differently-named view that merely shares this view's name as a prefix."""
+    pattern = re.compile(
+        rf"^{re.escape(base_name(project, view_name))}_online_\d+s(?:_off\d+s)?$"
+    )
     cur.execute("SELECT matviewname FROM pg_matviews")
-    found = set()
-    for (name,) in cur.fetchall():
-        if name.startswith(prefix) and name.endswith("s"):
-            secs = name[len(prefix) : -1]
-            if secs.isdigit():
-                found.add(int(secs))
-    return found
+    return {name for (name,) in cur.fetchall() if pattern.match(name)}
 
 
 def _deployed_mv_select(cur, name: str) -> Optional[str]:
@@ -859,11 +862,15 @@ class RisingWaveComputeEngine(ComputeEngine):
                 ),
             ),
         ]
-        for window_secs, window_aggs in group_aggregations_by_window(aggs):
+        offsets = view_agg_offsets(view)
+        for (window_secs, offset_secs), window_aggs in group_aggregations_by_window_offset(
+            aggs, offsets
+        ):
             rollup_select = build_online_rollup_select(
-                column_info, window_aggs, tiles, aggregation_interval=interval, agg_params=params
+                column_info, window_aggs, tiles, aggregation_interval=interval,
+                agg_params=params, offset_secs=offset_secs,
             )
-            mv = online_window_mv_name(project, view.name, window_secs)
+            mv = online_window_mv_name(project, view.name, window_secs, offset_secs)
             ddl.append(_materialized_view_ddl(mv, rollup_select))
         return ddl
 
@@ -924,11 +931,15 @@ class RisingWaveComputeEngine(ComputeEngine):
                 ),
             ),
         ]
-        for window_secs, window_aggs in group_aggregations_by_window(aggs):
+        offsets = view_agg_offsets(view)
+        for (window_secs, offset_secs), window_aggs in group_aggregations_by_window_offset(
+            aggs, offsets
+        ):
             rollup_select = build_online_rollup_select(
-                column_info, window_aggs, tiles, aggregation_interval=interval, agg_params=params
+                column_info, window_aggs, tiles, aggregation_interval=interval,
+                agg_params=params, offset_secs=offset_secs,
             )
-            mv = online_window_mv_name(project, view.name, window_secs)
+            mv = online_window_mv_name(project, view.name, window_secs, offset_secs)
             ddl.append(_materialized_view_ddl(mv, rollup_select))
         return ddl
 
@@ -954,17 +965,17 @@ class RisingWaveComputeEngine(ComputeEngine):
         desired_tiles = build_batch_tile_select(
             column_info, aggs, src, aggregation_interval=interval, agg_params=params
         )
+        offsets = view_agg_offsets(view)
         desired_online = {
-            online_window_mv_name(project, view.name, w): build_online_rollup_select(
-                column_info, wa, tiles, aggregation_interval=interval, agg_params=params
+            online_window_mv_name(project, view.name, w, off): build_online_rollup_select(
+                column_info, wa, tiles, aggregation_interval=interval,
+                agg_params=params, offset_secs=off,
             )
-            for w, wa in group_aggregations_by_window(aggs)
+            for (w, off), wa in group_aggregations_by_window_offset(aggs, offsets)
         }
         deployed_online = {
-            online_window_mv_name(project, view.name, secs): _deployed_mv_select(
-                cur, online_window_mv_name(project, view.name, secs)
-            )
-            for secs in _existing_online_window_secs(cur, project, view.name)
+            name: _deployed_mv_select(cur, name)
+            for name in _existing_online_mv_names(cur, project, view.name)
         }
         full_rebuild, drops, creates = _plan_batch_reconcile(
             desired_tiles=desired_tiles,
@@ -1019,17 +1030,17 @@ class RisingWaveComputeEngine(ComputeEngine):
         desired_tiles = build_streaming_tile_select(
             column_info, aggs, src, aggregation_interval=interval, agg_params=params
         )
+        offsets = view_agg_offsets(view)
         desired_online = {
-            online_window_mv_name(project, view.name, w): build_online_rollup_select(
-                column_info, wa, tiles, aggregation_interval=interval, agg_params=params
+            online_window_mv_name(project, view.name, w, off): build_online_rollup_select(
+                column_info, wa, tiles, aggregation_interval=interval,
+                agg_params=params, offset_secs=off,
             )
-            for w, wa in group_aggregations_by_window(aggs)
+            for (w, off), wa in group_aggregations_by_window_offset(aggs, offsets)
         }
         deployed_online = {
-            online_window_mv_name(project, view.name, secs): _deployed_mv_select(
-                cur, online_window_mv_name(project, view.name, secs)
-            )
-            for secs in _existing_online_window_secs(cur, project, view.name)
+            name: _deployed_mv_select(cur, name)
+            for name in _existing_online_mv_names(cur, project, view.name)
         }
         full_rebuild, drops, creates = _plan_batch_reconcile(
             desired_tiles=desired_tiles,

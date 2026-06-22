@@ -30,7 +30,7 @@ from feast.infra.compute_engines.risingwave.engine import (
     _deployed_mv_select,
     _deployed_source_table,
     _desired_kafka_source_opts,
-    _existing_online_window_secs,
+    _existing_online_mv_names,
     _iceberg_sink_ddl,
     _iceberg_source_ddl,
     _iceberg_storage_opts,
@@ -61,8 +61,11 @@ from feast.infra.compute_engines.risingwave.nodes import (
     build_streaming_tile_select,
     build_tile_rollup_select,
     build_windowed_agg_select,
+    encode_agg_offsets,
     encode_agg_params,
     group_aggregations_by_window,
+    group_aggregations_by_window_offset,
+    view_agg_offsets,
 )
 from feast.infra.compute_engines.dag.context import ColumnInfo, ExecutionContext
 from feast.infra.compute_engines.dag.model import DAGFormat
@@ -459,6 +462,17 @@ def test_stream_mv_select_threads_approx_percentile_quantile_from_view_tags():
     assert f"approx_percentile(0.9, 0.01) WITHIN GROUP (ORDER BY amount) AS {out}" in sql
 
 
+def test_agg_offset_carrier_round_trips_and_drops_zero():
+    # The per-aggregation window offset rides the engine-owned offset tag (parallel to the param tag),
+    # keyed by resolved_name. A zero offset (the trailing window) is omitted so a non-shifted view's
+    # tags are left untouched; the inverse decodes the shifted entries back to whole seconds.
+    assert encode_agg_offsets({"sum_amount_604800s": 0}) == {}
+    view = _stream_view(_kafka_source(watermark=True), [_agg("sum")])
+    view.tags = encode_agg_offsets({"prev_week_sum": -604800, "trailing_sum": 0})
+    assert view_agg_offsets(view) == {"prev_week_sum": -604800}
+    assert view_agg_offsets(_stream_view(_kafka_source(watermark=True), [_agg("sum")])) == {}
+
+
 # --- Batch tile aggregation (tile model: partial aggregates + retrieval rollup) ---
 # The tile model (window-independent partial aggregates materialized once, then recombined per
 # window at retrieval) is validated end-to-end on RisingWave v3.0.0.
@@ -696,7 +710,115 @@ def test_online_rollup_is_single_window_one_mv_per_window():
         )
 
 
-# --- offline tile PIT: floor-anchored range-agg join, per entity-row label ---
+# --- window offset: a window shifted into the past (week-over-week / lag) -------------------------
+
+
+def test_online_rollup_offset_zero_is_byte_identical():
+    # offset=0 (the default) must emit EXACTLY today's two-sided now() window — the reconcile compares
+    # the stored MV SELECT verbatim, so any drift would needlessly re-materialize every existing MV.
+    base = build_online_rollup_select(
+        _column_info(), [_agg("sum", 2592000)], "tiles", aggregation_interval=timedelta(days=1)
+    )
+    with_zero = build_online_rollup_select(
+        _column_info(), [_agg("sum", 2592000)], "tiles",
+        aggregation_interval=timedelta(days=1), offset_secs=0,
+    )
+    assert base == with_zero
+    assert "tile_end > now() - INTERVAL '2592000' SECOND AND tile_end <= now()" in base
+
+
+def test_online_rollup_offset_shifts_both_bounds_into_the_past():
+    # A 7d window at offset -7d is the PREVIOUS week (now-14d, now-7d]: the lower bound deepens by
+    # |offset| and the upper bound retreats from now() to now()-|offset|.
+    sql = build_online_rollup_select(
+        _column_info(), [_agg("sum", 604800)], "tiles",
+        aggregation_interval=timedelta(days=1), offset_secs=-604800,
+    )
+    assert (
+        "tile_end > now() - INTERVAL '1209600' SECOND AND tile_end <= now() - INTERVAL '604800' SECOND"
+        in sql
+    )
+    assert "tile_end <= now()," not in sql and "tile_end <= now() GROUP" not in sql  # upper is shifted
+
+
+def test_group_aggregations_by_window_offset_splits_same_window_by_offset():
+    # Two aggregates share a 7d window but differ in offset (trailing vs previous week). They cannot
+    # share one now()-anchored MV (the WHERE bounds differ), so the (window, offset) grouping splits them.
+    trailing = _agg("sum", 604800)
+    prev = Aggregation(column="amount", function="sum", time_window=timedelta(days=7), name="prev_week_sum")
+    offsets = {prev.resolved_name(prev.time_window): -604800}
+    groups = group_aggregations_by_window_offset([trailing, prev], offsets)
+    assert [key for key, _ in groups] == [(604800, -604800), (604800, 0)]  # ascending; offset sorts first
+    by_key = {key: aggs for key, aggs in groups}
+    assert by_key[(604800, 0)] == [trailing]
+    assert by_key[(604800, -604800)] == [prev]
+
+
+def test_offline_tile_pit_offset_adds_upper_bound_and_extends_join():
+    prev = Aggregation(column="amount", function="sum", time_window=timedelta(days=7), name="prev_week_sum")
+    sql = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, TIMESTAMP '2026-06-04' AS event_timestamp",
+        ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(),
+        aggregations=[_agg("sum", 604800), prev],
+        aggregation_interval=timedelta(days=1),
+        offsets={prev.resolved_name(prev.time_window): -604800},
+    )
+    end = "date_trunc('day', e.\"event_timestamp\")"
+    # the trailing 7d agg keeps its lower-only CASE (offset 0 = byte-identical)
+    assert (
+        f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '604800' SECOND THEN t.sum_amount END) "
+        "AS sum_amount_604800s" in sql
+    )
+    # the previous-week agg gets BOTH bounds: (end-14d, end-7d]
+    assert (
+        f"sum(CASE WHEN t.tile_end > {end} - INTERVAL '1209600' SECOND "
+        f"AND t.tile_end <= {end} - INTERVAL '604800' SECOND THEN t.sum_amount END) AS prev_week_sum"
+        in sql
+    )
+    # the join now reads back to the deepest tile any agg needs: 7d + |offset 7d| = 14d
+    assert f"t.tile_end > {end} - INTERVAL '1209600' SECOND AND t.tile_end <= {end}" in sql
+
+
+def test_online_rollup_rejects_offset_not_multiple_of_interval():
+    # The offset shifts the window by a count of tiles, so a non-multiple |offset| (1h on a 1-day tile)
+    # would make the online now()-anchored bound and the offline floor-anchored bound select different
+    # tiles -> online != offline. Guard it at the builder, not only at the authoring factory.
+    with pytest.raises(ValueError, match="offset"):
+        build_online_rollup_select(
+            _column_info(), [_agg("sum", 604800)], "tiles",
+            aggregation_interval=timedelta(days=1), offset_secs=-3600,
+        )
+
+
+def test_offline_tile_pit_rejects_offset_not_multiple_of_interval():
+    prev = Aggregation(column="amount", function="sum", time_window=timedelta(days=7), name="prev")
+    with pytest.raises(ValueError, match="offset"):
+        build_offline_tile_pit_query(
+            "SELECT 1", ["user_id", "event_timestamp"], "event_timestamp",
+            tiles_relation="t", column_info=_column_info(), aggregations=[prev],
+            aggregation_interval=timedelta(days=1),
+            offsets={prev.resolved_name(prev.time_window): -3600},  # 1h not a multiple of 1-day
+        )
+
+
+def test_offline_tile_pit_offset_zero_is_byte_identical():
+    # offsets=None / all-zero must reproduce today's multi-window CASE exactly (back-compat).
+    aggs = [_agg("sum", 259200), _agg("sum", 2592000)]
+    base = build_offline_tile_pit_query(
+        "SELECT 1", ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(), aggregations=aggs,
+        aggregation_interval=timedelta(days=1),
+    )
+    with_empty = build_offline_tile_pit_query(
+        "SELECT 1", ["user_id", "event_timestamp"], "event_timestamp",
+        tiles_relation="t", column_info=_column_info(), aggregations=aggs,
+        aggregation_interval=timedelta(days=1), offsets={},
+    )
+    assert base == with_empty
+
+
+# --- offline tile PIT: floor-anchored range-agg join, per entity-row label -------------------------
 
 
 def test_offline_tile_pit_anchors_window_at_floor_of_each_label():
@@ -846,8 +968,7 @@ def test_offline_tile_pit_multi_window_mean_uses_filtered_sum_and_count():
 
 
 def test_group_aggregations_by_window_groups_distinct_windows_ascending():
-    # the engine provisions one online MV per group and apply derives one serving shard per group, so
-    # the grouping is the single source of truth for the window set. Distinct windows, ascending.
+    # the window-only grouping (offline precondition + no-offset harnesses): distinct windows, ascending.
     a3d = _agg("sum", 259200)
     a30d = _agg("sum", 2592000)
     mean7d = _agg("mean", 604800)
@@ -1209,23 +1330,29 @@ def test_batch_drop_ddl_drops_both_mvs_and_source_with_no_sink():
     assert not any("SINK" in s for s in stmts)  # none provisioned, none to drop
 
 
-def test_existing_online_window_secs_parses_only_this_views_per_window_mvs():
-    # Catalog-driven reconcile: identify this tile view's per-window online MVs (to drop orphans when a
-    # re-apply shrinks the window set) WITHOUT matching the tiles MV, another view, or a non-numeric tail.
+def test_existing_online_mv_names_matches_only_this_views_window_and_offset_mvs():
+    # Catalog-driven reconcile: identify this tile view's per-(window, offset) online MVs (to drop orphans
+    # when a re-apply shrinks the set) WITHOUT matching the tiles MV, another view, or a non-numeric tail.
+    # Both the trailing-window form and the shifted ``_off{secs}s`` form must match.
     class _Cur:
         def execute(self, _sql):
             self._rows = [
-                ("proj_v_online_259200s",),   # match
-                ("proj_v_online_2592000s",),  # match
-                ("proj_v_tiles",),            # not an online MV
-                ("proj_v_online_xs",),        # non-numeric window -> ignore
-                ("proj_other_online_5s",),    # different view -> ignore
+                ("proj_v_online_259200s",),            # trailing-window match
+                ("proj_v_online_2592000s",),           # trailing-window match
+                ("proj_v_online_604800s_off604800s",), # shifted (offset) match
+                ("proj_v_tiles",),                     # not an online MV
+                ("proj_v_online_xs",),                 # non-numeric window -> ignore
+                ("proj_other_online_5s",),             # different view -> ignore
             ]
 
         def fetchall(self):
             return self._rows
 
-    assert _existing_online_window_secs(_Cur(), "proj", "v") == {259200, 2592000}
+    assert _existing_online_mv_names(_Cur(), "proj", "v") == {
+        "proj_v_online_259200s",
+        "proj_v_online_2592000s",
+        "proj_v_online_604800s_off604800s",
+    }
 
 
 def test_deployed_mv_select_strips_create_prefix_and_handles_absent():

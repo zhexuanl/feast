@@ -153,6 +153,34 @@ def view_agg_params(view) -> Dict[str, List[float]]:
     return {name: list(params) for name, params in json.loads(raw).items()}
 
 
+# The per-aggregation window OFFSET (a shift of the rollup window into the past, in whole negative
+# seconds), keyed by each aggregation's resolved_name. Like the parameters above, feast.Aggregation
+# has no field for it, so it rides this engine-owned tag — a carrier parallel to AGG_PARAMS_TAG. The
+# SAME tag mechanism serves BOTH tile flavors: a batch tile view's aggregations live on its
+# IcebergSource and a streaming tile view's on the StreamFeatureView proto, but both carry their tags
+# through the registry, so one offset carrier covers both (no per-flavor split, no proto fork). A zero
+# offset (the trailing window, the default) is omitted, so a non-shifted view's tags are untouched.
+AGG_OFFSET_TAG = "feast_rw_agg_offset"
+
+
+def encode_agg_offsets(offsets_by_resolved_name: Dict[str, int]) -> Dict[str, str]:
+    """The view-tags fragment carrying per-aggregation window offsets (whole seconds), keyed by
+    resolved_name. Drops zero/empty entries and returns ``{}`` when nothing is shifted, so a
+    trailing-window-only view's tags are left untouched. The inverse of ``view_agg_offsets``."""
+    cleaned = {name: int(secs) for name, secs in offsets_by_resolved_name.items() if secs}
+    return {AGG_OFFSET_TAG: json.dumps(cleaned)} if cleaned else {}
+
+
+def view_agg_offsets(view) -> Dict[str, int]:
+    """The per-aggregation window offsets (whole seconds, negative = shifted into the past) a view
+    carries in its tags, keyed by resolved_name. Absent => {} (the common case: every aggregation is a
+    trailing window). The inverse of ``encode_agg_offsets``."""
+    raw = (getattr(view, "tags", None) or {}).get(AGG_OFFSET_TAG)
+    if not raw:
+        return {}
+    return {name: int(secs) for name, secs in json.loads(raw).items()}
+
+
 def _fmt_param(value: float) -> str:
     # Render a numeric aggregate parameter for SQL: an integer-valued float as an int literal
     # (5.0 -> "5"), otherwise its plain decimal form (0.95 -> "0.95"). Keeps the emitted SQL
@@ -649,6 +677,21 @@ def _assert_window_multiple_of_interval(window_secs: int, aggregation_interval) 
         )
 
 
+def _assert_offset_multiple_of_interval(offset_secs: int, aggregation_interval) -> None:
+    # |offset| shifts the window by a COUNT of tiles, so it must be a whole number of
+    # aggregation_intervals — the same invariant (for the same reason) the window obeys: only when
+    # |offset| is a multiple of the interval does the online now()-anchored upper bound (now() - |offset|)
+    # select the SAME tiles as the offline floor-anchored bound (end - |offset|), so online == offline.
+    # A non-multiple offset would silently diverge online from training, so guard it at the builder too
+    # (not only at the authoring factory), where every writer of the offset carrier is forced through.
+    interval_secs = int(aggregation_interval.total_seconds())
+    if abs(int(offset_secs)) % interval_secs != 0:
+        raise ValueError(
+            f"offset ({int(offset_secs)}s) must be a whole multiple of aggregation_interval "
+            f"({interval_secs}s) for the tile model (the offset shifts the window by a count of tiles)."
+        )
+
+
 def _validate_window_rollup(aggregations: List[Aggregation], aggregation_interval) -> int:
     """Single-window precondition for the per-window rollup builders (offline floored, online now()):
     tile-supported aggs only, a single window, and window a whole multiple of the interval. Returns
@@ -687,8 +730,8 @@ def _validate_windows(aggregations: List[Aggregation], aggregation_interval) -> 
     _assert_tile_supported(aggregations)
     _assert_distinct_output_names(aggregations)
     # group_aggregations_by_window owns the non-null-window check + the distinct-ascending window set
-    # (one source of truth shared with the engine/apply provisioning path); here we only layer on the
-    # multiple-of-interval precondition the rollup needs.
+    # (the multiple-of-interval precondition is offset-independent, so the window-only grouping is what
+    # this needs); here we only layer on the multiple-of-interval check the rollup requires.
     windows = [secs for secs, _ in group_aggregations_by_window(aggregations)]
     for secs in windows:
         _assert_window_multiple_of_interval(secs, aggregation_interval)
@@ -698,12 +741,10 @@ def _validate_windows(aggregations: List[Aggregation], aggregation_interval) -> 
 def group_aggregations_by_window(
     aggregations: List[Aggregation],
 ) -> List[Tuple[int, List[Aggregation]]]:
-    """Group aggregations by their (distinct, non-null) window seconds, ascending. Each group becomes
-    ONE online rollup MV (the engine provisions one now()-anchored MV per window — RisingWave can't put
-    now() inside a CASE, so windows can't share an MV) AND one OnlineView serving shard (apply). The
-    engine and apply MUST group identically so the per-window MV names match — hence this single shared
-    helper. Pure (no interval): callers that need the multiple-of-interval precondition run
-    ``_validate_windows`` first."""
+    """Group aggregations by their (distinct, non-null) window seconds, ascending. The window-only
+    grouping, used where the offset does not matter (the offline multiple-of-interval precondition, and
+    the no-offset spike harnesses). The offset-aware ``group_aggregations_by_window_offset`` is what the
+    online MV provisioning + serving-shard derivation use, since a shifted window needs its own MV."""
     groups: dict = {}
     for a in aggregations:
         if a.time_window is None:
@@ -713,6 +754,35 @@ def group_aggregations_by_window(
             )
         groups.setdefault(int(a.time_window.total_seconds()), []).append(a)
     return [(secs, groups[secs]) for secs in sorted(groups)]
+
+
+def _agg_offset_secs(agg: Aggregation, offsets: Optional[Dict[str, int]]) -> int:
+    """This aggregation's window offset (whole seconds, <= 0 = shifted into the past) from the
+    out-of-band offsets map keyed by resolved_name. Absent => 0 (the trailing window)."""
+    return int((offsets or {}).get(agg.resolved_name(agg.time_window), 0))
+
+
+def group_aggregations_by_window_offset(
+    aggregations: List[Aggregation],
+    offsets: Optional[Dict[str, int]] = None,
+) -> List[Tuple[Tuple[int, int], List[Aggregation]]]:
+    """Group aggregations by their ``(window_secs, offset_secs)`` pair, ascending. Two aggregations
+    sharing a window but differing in offset (a trailing 7d and the previous week) cannot share one
+    now()-anchored online MV — the rollup WHERE bounds differ — so each (window, offset) pair becomes its
+    OWN online rollup MV and OnlineView shard. The offset rides the out-of-band carrier keyed by
+    resolved_name (``offsets``); absent => 0, so an all-trailing view groups one shard per window. The
+    engine (provisioning) and apply (serving spec) MUST group identically from THIS helper, so the
+    per-(window, offset) MV names cannot drift."""
+    groups: dict = {}
+    for a in aggregations:
+        if a.time_window is None:
+            raise ValueError(
+                "tile rollup needs a non-null time_window on every aggregation; "
+                f"got None on {a.function}({a.column})."
+            )
+        key = (int(a.time_window.total_seconds()), _agg_offset_secs(a, offsets))
+        groups.setdefault(key, []).append(a)
+    return [(key, groups[key]) for key in sorted(groups)]
 
 
 def _tile_rollup_exprs(
@@ -832,6 +902,7 @@ def build_tile_rollup_select(
     aggregation_interval,
     as_of_sql: str,
     agg_params: Optional[Dict[str, List[float]]] = None,
+    offset_secs: int = 0,
 ) -> str:
     """Roll up tiles to the requested window, ANCHORED TO THE REQUEST/LABEL time (a request-anchored
     sliding window over a fixed tile set). Recombine each aggregation's per-tile
@@ -839,17 +910,23 @@ def build_tile_rollup_select(
     ``end = date_trunc(aggregation_interval, as_of)`` = the most-recent aggregation_interval boundary
     at or before the request/label time. ``as_of_sql`` is a SQL expression: a bind placeholder for
     online serving, or the entity-row timestamp column for offline PIT. ``tile_end`` carries the
-    event-time PIT boundary, so there is no future leakage."""
+    event-time PIT boundary, so there is no future leakage.
+
+    ``offset_secs`` (<= 0) shifts the window into the past off the SAME ``end`` anchor — the window
+    becomes ``(end - W - |offset|, end - |offset|]``. offset=0 emits the exact un-shifted SQL."""
     if not aggregations:
         raise ValueError("build_tile_rollup_select requires at least one aggregation")
     window_secs = _validate_window_rollup(aggregations, aggregation_interval)
+    _assert_offset_multiple_of_interval(offset_secs, aggregation_interval)
     unit = _tile_unit(aggregation_interval)
     keys = ", ".join(column_info.join_keys_columns)
     rollups = _tile_rollup_exprs(aggregations, agg_params=agg_params)
     end = f"date_trunc('{unit}', {as_of_sql})"
+    off = abs(int(offset_secs))
+    upper = end if off == 0 else f"{end} - INTERVAL '{off}' SECOND"
     return (
         f"SELECT {keys}, {rollups} FROM {tile_relation} "
-        f"WHERE tile_end > {end} - INTERVAL '{window_secs}' SECOND AND tile_end <= {end} "
+        f"WHERE tile_end > {end} - INTERVAL '{window_secs + off}' SECOND AND tile_end <= {upper} "
         f"GROUP BY {keys}"
     )
 
@@ -861,6 +938,7 @@ def build_online_rollup_select(
     *,
     aggregation_interval,
     agg_params: Optional[Dict[str, List[float]]] = None,
+    offset_secs: int = 0,
 ) -> str:
     """Online rollup MV over the tiles: a CONTINUOUS RisingWave materialized view that maintains the
     request-anchored window rollup for ``as_of = now()`` (wall-clock), so the ONLINE READ stays an
@@ -875,15 +953,26 @@ def build_online_rollup_select(
     window is a whole number of intervals (``_assert_window_multiple_of_interval``): no tile ever falls
     in the intra-interval gap between ``now()`` and ``floor(now(), interval)``. So online (now-anchored)
     == offline (floor-anchored) for the same as_of. ``max(tile_end) AS window_end`` is the PIT stamp the
-    point-lookup orders by (one row per entity, so LIMIT 1 is that row)."""
+    point-lookup orders by (one row per entity, so LIMIT 1 is that row).
+
+    ``offset_secs`` (<= 0) shifts the whole window into the past — a 7d window at offset -7d is the
+    PREVIOUS week ``(now-14d, now-7d]``. The lower bound deepens by ``|offset|`` and the upper bound
+    retreats from ``now()`` to ``now() - |offset|`` — both still plain ``now() - const`` expressions, the
+    same accepted-and-maintained class as the un-shifted window (the upper bound is simply a constant
+    below now(), so aging tiles are evicted from the TOP of the window too). offset=0 emits the exact
+    un-shifted SQL (byte-identical) so an existing MV is never needlessly re-materialized. The caller
+    groups aggregations by (window, offset) so every aggregation in one MV shares this offset."""
     if not aggregations:
         raise ValueError("build_online_rollup_select requires at least one aggregation")
     window_secs = _validate_window_rollup(aggregations, aggregation_interval)
+    _assert_offset_multiple_of_interval(offset_secs, aggregation_interval)
     keys = ", ".join(column_info.join_keys_columns)
     rollups = _tile_rollup_exprs(aggregations, agg_params=agg_params)
+    off = abs(int(offset_secs))
+    upper = "now()" if off == 0 else f"now() - INTERVAL '{off}' SECOND"
     return (
         f"SELECT {keys}, {rollups}, max(tile_end) AS window_end FROM {tile_relation} "
-        f"WHERE tile_end > now() - INTERVAL '{window_secs}' SECOND AND tile_end <= now() "
+        f"WHERE tile_end > now() - INTERVAL '{window_secs + off}' SECOND AND tile_end <= {upper} "
         f"GROUP BY {keys}"
     )
 
@@ -900,10 +989,18 @@ def build_offline_tile_pit_query(
     full_feature_names: bool = False,
     view_name: Optional[str] = None,
     agg_params: Optional[Dict[str, List[float]]] = None,
+    offsets: Optional[Dict[str, int]] = None,
 ) -> str:
     """Offline point-in-time training rollup for a tile BatchFeatureView. For EACH entity row, rolls
     the tiles up in the request-anchored window ``(end - W, end]`` where ``end = floor(label_ts,
     aggregation_interval)`` — anchored to THAT ROW's label timestamp (NOT a global now()).
+
+    ``offsets`` (keyed by resolved_name, <= 0) shifts an aggregation's window into the past off the
+    same ``end`` anchor: a shifted aggregation's window is ``(end - W - |offset|, end - |offset|]``, so
+    its per-agg ``CASE`` gains an UPPER bound ``t.tile_end <= end - |offset|`` (an un-shifted aggregation
+    keeps the lower-only CASE the join's ``<= end`` already caps). The join reads back to the deepest
+    tile ANY aggregation needs — ``max(W + |offset|)`` — so every shifted/un-shifted window is covered in
+    one pass. An absent/zero offset reproduces today's SQL byte-for-byte.
 
     ``aggregations`` is already the requested feature subset (the caller filters it to the features in
     feature_refs), so each rolled-up column maps to a requested feature. ``full_feature_names`` aliases
@@ -927,20 +1024,34 @@ def build_offline_tile_pit_query(
     a longer ttl is a no-op. So the window is the single, authoritative bound."""
     if not aggregations:
         raise ValueError("build_offline_tile_pit_query requires at least one aggregation")
-    max_window = max(_validate_windows(aggregations, aggregation_interval))
+    _validate_windows(aggregations, aggregation_interval)
+    for a in aggregations:
+        _assert_offset_multiple_of_interval(_agg_offset_secs(a, offsets), aggregation_interval)
     unit = _tile_unit(aggregation_interval)
     keys = column_info.join_keys_columns
     e_cols = ", ".join(f'e."{c}"' for c in entity_columns)
     join_on = " AND ".join(f't."{k}" = e."{k}"' for k in keys)
     end = f'date_trunc(\'{unit}\', e."{label_ts_column}")'
     output_prefix = (view_name or "") if full_feature_names else ""
+
+    def _partial_filter(a: Aggregation) -> str:
+        w = int(a.time_window.total_seconds())
+        off = abs(_agg_offset_secs(a, offsets))
+        lower = f"t.tile_end > {end} - INTERVAL '{w + off}' SECOND"
+        # An un-shifted window keeps the lower-only CASE (the join's `<= end` already caps it). A shifted
+        # window's upper edge sits below `end`, so it needs its own explicit upper bound.
+        return lower if off == 0 else f"{lower} AND t.tile_end <= {end} - INTERVAL '{off}' SECOND"
+
+    # The join reads back to the deepest tile any aggregation needs: max(window + |offset|).
+    max_lower = max(
+        int(a.time_window.total_seconds()) + abs(_agg_offset_secs(a, offsets))
+        for a in aggregations
+    )
     rollups = ", ".join(
         _tile_recombine(
             a,
             prefix="t.",
-            partial_filter=(
-                f"t.tile_end > {end} - INTERVAL '{int(a.time_window.total_seconds())}' SECOND"
-            ),
+            partial_filter=_partial_filter(a),
             output_prefix=output_prefix,
             agg_params=agg_params,
         )
@@ -949,7 +1060,7 @@ def build_offline_tile_pit_query(
     return (
         f"SELECT {e_cols}, {rollups} FROM ({entity_df_sql}) e "
         f"LEFT JOIN {tiles_relation} t ON {join_on} "
-        f"AND t.tile_end > {end} - INTERVAL '{max_window}' SECOND AND t.tile_end <= {end} "
+        f"AND t.tile_end > {end} - INTERVAL '{max_lower}' SECOND AND t.tile_end <= {end} "
         f"GROUP BY {e_cols}"
     )
 
