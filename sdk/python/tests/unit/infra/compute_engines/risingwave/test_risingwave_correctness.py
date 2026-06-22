@@ -60,6 +60,8 @@ from feast.infra.compute_engines.risingwave.nodes import (
     RWJoinNode,
     _assert_tile_supported,
     _partials_for,
+    _recombine_expr,
+    _tile_value_expr,
     build_batch_tile_select,
     build_cumulative_read_query,
     build_cumulative_tile_select,
@@ -3310,6 +3312,35 @@ def test_existing_online_mv_names_sweep_matches_series_snapshot():
     names = _existing_online_mv_names(_Cur(), "proj", "v")
     assert "proj_v_online_series" in names
     assert "proj_other_online_series" not in names  # anchored to THIS view's base name
+
+
+def test_desired_online_mvs_excludes_series_snapshot_for_secondary_key_view():
+    # A secondary-key view's series is a per-key Map of arrays offline; the snapshot collapses to the join
+    # keys, so it must NOT be materialized — the series stays on the read-time single-scan (same guard the
+    # cumulative path uses). No online_series MV is emitted.
+    ci = _cum_ci()
+    mvs = _desired_online_mvs(
+        "proj", "v", ci, [_ser("max", "daily_max_5")], "proj_v_tiles",
+        aggregation_interval=timedelta(days=1), agg_params={}, secondary_key="ad_id",
+        offsets={}, lifetimes={}, series={"daily_max_5": [86400, 86400, 5]},
+    )
+    assert online_series_mv_name("proj", "v") not in mvs
+
+
+@pytest.mark.parametrize("fn", ["sum", "count", "min", "max", "mean",
+                                "var_pop", "var_samp", "stddev_pop", "stddev_samp"])
+def test_tile_value_expr_equals_recombine_over_one_tile(fn):
+    # PARITY PIN (online == offline): the snapshot's per-tile value MUST equal the offline single-scan
+    # recombine evaluated over exactly ONE tile. Over one tile the cross-tile merge is identity
+    # (sum(p)==p, min(p)==p, max(p)==p), so stripping those wrappers from _recombine_expr must reproduce
+    # _tile_value_expr verbatim — for EVERY snapshotted function (sum/count/min/max/mean/var/stddev). If a
+    # finalize formula ever changes in only one place, this fails.
+    import re
+
+    agg = _ser(fn, "feat")
+    recombine = _recombine_expr(agg)                      # e.g. sum(sum_amount) / NULLIF(sum(count_amount), 0)
+    one_tile = re.sub(r"\b(?:sum|min|max)\((\w+)\)", r"\1", recombine)  # collapse the single-tile merge
+    assert one_tile == _tile_value_expr(agg)
 
 
 # --- transient-DDL retry: a RisingWave cluster-state error on CREATE/DROP is retried, a real error is not ---

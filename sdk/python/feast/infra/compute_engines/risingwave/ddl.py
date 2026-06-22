@@ -354,10 +354,14 @@ def _desired_online_mvs(
     # A window-series whose step == the tile interval gets ONE per-entity last-L snapshot MV (carrying every
     # such series of this view) so its online read is a point lookup instead of the read-time single-scan;
     # coarser-step / overlapping / array-valued series stay on the single-scan and add no MV here.
-    snapshot = build_series_snapshot_select(
-        column_info, aggs, tiles, aggregation_interval=aggregation_interval,
-        agg_params=agg_params, series=series,
-    )
-    if snapshot is not None:
-        out[online_series_mv_name(project, view_name)] = snapshot
+    # Excluded for a SECONDARY-KEY view (same guard as the cumulative path above): the snapshot collapses to
+    # the join keys, but a secondary-key series is a per-key Map of arrays offline — so a secondary-key
+    # series stays on the read-time single-scan, which emits that Map.
+    if cumulative_ok:  # cumulative_ok == (secondary_key is None)
+        snapshot = build_series_snapshot_select(
+            column_info, aggs, tiles, aggregation_interval=aggregation_interval,
+            agg_params=agg_params, series=series,
+        )
+        if snapshot is not None:
+            out[online_series_mv_name(project, view_name)] = snapshot
     return out

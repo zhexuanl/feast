@@ -166,6 +166,29 @@ def _tile_recombine(
     return f"{expr} AS {out}"
 
 
+def _composite_finalize(fn: str, *, sm: str, cnt: str, sumsq: str) -> str:
+    """The mean / variance / stddev finalize over already-built sum, count, and sum-of-squares operand
+    expressions — the ONE home of the composite recombine algebra. The three call sites differ ONLY in how
+    they build the operands: ``_recombine_expr`` wraps each tile partial in an aggregate, ``_cumulative_
+    recombine_expr`` passes a hi-lo 2-point delta, and ``_tile_value_expr`` passes the bare single-tile
+    partial. Keeping the formula here is what guarantees online == offline — the interval recombine, the
+    cumulative subtraction, and the materialized series snapshot cannot drift apart. ``sumsq`` is unused for
+    mean (pass "").
+
+    variance/stddev: (Σx² − (Σx)²/n) / n (population) or / (n−1) (sample); stddev = sqrt(var).
+    GREATEST(..., 0) clamps the centered sum-of-squared-deviations to non-negative: the single-pass
+    computational form is catastrophic-cancellation-prone, so over large-magnitude values summed in
+    RisingWave's nondeterministic parallel order the residual can round slightly NEGATIVE — an impossible
+    variance, and (since RW's sqrt ERRORS on negative input) a hard query failure for stddev. RisingWave's
+    OWN native var/stddev plan wraps the identical expression in Greatest(_, 0), so we match it."""
+    if fn == "mean":
+        return f"{sm} / NULLIF({cnt}, 0)"
+    centered = f"GREATEST({sumsq} - {sm} * {sm} / NULLIF({cnt}, 0), 0)"
+    denom = f"NULLIF({cnt} - 1, 0)" if fn.endswith("_samp") else f"NULLIF({cnt}, 0)"
+    var = f"{centered} / {denom}"
+    return f"sqrt({var})" if fn.startswith("stddev") else var
+
+
 def _recombine_expr(
     agg: Aggregation,
     *,
@@ -210,20 +233,11 @@ def _recombine_expr(
         if fn.endswith("_distinct"):
             flat = f"array_distinct({flat})"
         return f"({flat})[1:{n}]"
-    sm, cnt = merged("sum"), merged("count")
-    if fn == "mean":
-        return f"{sm} / NULLIF({cnt}, 0)"
-    # variance/stddev: (Σx² − (Σx)²/n) / n  (population) or / (n−1) (sample); stddev = sqrt(var).
-    # GREATEST(..., 0) clamps the centered sum-of-squared-deviations to non-negative: the single-pass
-    # computational form is catastrophic-cancellation-prone, so over large-magnitude values summed in
-    # RisingWave's nondeterministic parallel order the residual can round slightly NEGATIVE — an
-    # impossible variance, and (since RW's sqrt ERRORS on negative input) a hard query failure for
-    # stddev. RisingWave's OWN native var/stddev plan wraps the identical expression in Greatest(_, 0)
-    # (over_window_function plan output), so we match it.
-    centered = f"GREATEST({merged('sumsq')} - {sm} * {sm} / NULLIF({cnt}, 0), 0)"
-    denom = f"NULLIF({cnt} - 1, 0)" if fn.endswith("_samp") else f"NULLIF({cnt}, 0)"
-    var = f"{centered} / {denom}"
-    return f"sqrt({var})" if fn.startswith("stddev") else var
+    # mean/var/stddev: one finalize home (_composite_finalize) so this interval recombine, the cumulative
+    # 2-point subtraction, and the materialized series snapshot cannot drift apart. mean needs sum/count
+    # only; var/stddev also need sumsq (a mean-only view has no sumsq partial, so do not build one).
+    sumsq = "" if fn == "mean" else merged("sumsq")
+    return _composite_finalize(fn, sm=merged("sum"), cnt=merged("count"), sumsq=sumsq)
 
 
 def _cumulative_recombine_expr(
@@ -261,14 +275,9 @@ def _cumulative_recombine_expr(
         value = delta("sum")
     elif fn == "count":
         value = delta("count")
-    elif fn == "mean":
-        value = f"{delta('sum')} / NULLIF({delta('count')}, 0)"
-    else:  # var_pop / var_samp / stddev_pop / stddev_samp — identical algebra to _recombine_expr
-        dsum, dcnt = delta("sum"), delta("count")
-        centered = f"GREATEST({delta('sumsq')} - {dsum} * {dsum} / NULLIF({dcnt}, 0), 0)"
-        denom = f"NULLIF({dcnt} - 1, 0)" if fn.endswith("_samp") else f"NULLIF({dcnt}, 0)"
-        var = f"{centered} / {denom}"
-        value = f"sqrt({var})" if fn.startswith("stddev") else var
+    else:  # mean / var_pop / var_samp / stddev_pop / stddev_samp — the shared finalize home, over deltas
+        sumsq = "" if fn == "mean" else delta("sumsq")
+        value = _composite_finalize(fn, sm=delta("sum"), cnt=delta("count"), sumsq=sumsq)
     # Empty window (no tiles in range) -> NULL, matching the offline PIT — the common case (an entity with
     # no recent events). One narrow divergence remains for SUM: a window that HAS tiles but whose every
     # aggregation-input value is NULL gives Δsum == 0 here, while the offline sum over only-NULL partials is
@@ -349,15 +358,10 @@ def _tile_value_expr(
     col, fn = agg.column, agg.function
     if fn in {"sum", "count", "min", "max"}:
         return f"{prefix}{fn}_{col}"
-    sm, cnt = f"{prefix}sum_{col}", f"{prefix}count_{col}"
-    if fn == "mean":
-        return f"{sm} / NULLIF({cnt}, 0)"
-    # variance/stddev from this tile's {sum, sumsq, count} — identical algebra (and the GREATEST clamp) to
-    # _recombine_expr, here over a single tile so there is no cross-tile aggregate.
-    centered = f"GREATEST({prefix}sumsq_{col} - {sm} * {sm} / NULLIF({cnt}, 0), 0)"
-    denom = f"NULLIF({cnt} - 1, 0)" if fn.endswith("_samp") else f"NULLIF({cnt}, 0)"
-    var = f"{centered} / {denom}"
-    return f"sqrt({var})" if fn.startswith("stddev") else var
+    # mean/var/stddev from this ONE tile's partials, via the shared finalize home — the merge collapsed to
+    # identity (no cross-tile aggregate), so it equals _recombine_expr over a single tile by construction.
+    sumsq = "" if fn == "mean" else f"{prefix}sumsq_{col}"
+    return _composite_finalize(fn, sm=f"{prefix}sum_{col}", cnt=f"{prefix}count_{col}", sumsq=sumsq)
 
 
 def snapshot_series_aggs(
@@ -376,7 +380,7 @@ def snapshot_series_aggs(
         if not geom:
             continue
         w, s, length = int(geom[0]), int(geom[1]), int(geom[2])
-        if w == s == int(interval_secs) and a.function in _SNAPSHOT_SERIES_FN:
+        if w == s == interval_secs and a.function in _SNAPSHOT_SERIES_FN:
             out.append((a, length))
     return out
 

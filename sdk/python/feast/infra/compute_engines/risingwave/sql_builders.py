@@ -755,6 +755,9 @@ def build_series_snapshot_select(
         f"FROM {tile_relation}"
     )
     arrs = ", ".join(f"array_agg({name} ORDER BY tile_end DESC) AS {name}" for name in names)
+    # GROUP BY the join keys makes them the MV's primary/distribution key, so the serving read's
+    # WHERE keys = ? is an index-only scan_ranges point lookup with no separate index — provided the reader
+    # filters on the FULL join-key set (a partial-key read would degrade to a scan).
     return (
         f"SELECT {keys}, array_agg(tile_end ORDER BY tile_end DESC) AS {SERIES_SNAPSHOT_ENDS_COL}, {arrs} "
         f"FROM ({inner}) z WHERE __rn <= {depth} GROUP BY {keys}"
