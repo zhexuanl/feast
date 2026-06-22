@@ -754,7 +754,14 @@ def build_series_snapshot_select(
         f"row_number() OVER (PARTITION BY {keys} ORDER BY tile_end DESC) AS __rn "
         f"FROM {tile_relation}"
     )
-    arrs = ", ".join(f"array_agg({name} ORDER BY tile_end DESC) AS {name}" for name in names)
+    # Each value array is trimmed to ITS OWN series length via a FILTER on the shared TopN, so a short
+    # series in a view that also carries a longer one stores only its L values (not the view-wide max depth).
+    # The shared tile_end array stays at the max depth — the reader zip-truncates it to each value's length,
+    # so the (tile_end, value) pairing still aligns per tile. No reader change.
+    arrs = ", ".join(
+        f"array_agg({name} ORDER BY tile_end DESC) FILTER (WHERE __rn <= {length}) AS {name}"
+        for (_a, length), name in zip(eligible, names)
+    )
     # GROUP BY the join keys makes them the MV's primary/distribution key, so the serving read's
     # WHERE keys = ? is an index-only scan_ranges point lookup with no separate index — provided the reader
     # filters on the FULL join-key set (a partial-key read would degrade to a scan).

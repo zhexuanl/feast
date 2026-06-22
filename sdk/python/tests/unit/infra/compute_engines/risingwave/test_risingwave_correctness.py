@@ -3224,8 +3224,10 @@ def test_series_snapshot_select_step_equals_interval_emits_last_l_pairs():
     assert f"array_agg(tile_end ORDER BY tile_end DESC) AS {SERIES_SNAPSHOT_ENDS_COL}" in sql
     assert "sum_amount AS daily_sum_3" in sql  # per-tile finalize (identity for sum) in the inner TopN
     assert "max_amount AS daily_max_4" in sql
-    assert "array_agg(daily_sum_3 ORDER BY tile_end DESC) AS daily_sum_3" in sql
-    assert "array_agg(daily_max_4 ORDER BY tile_end DESC) AS daily_max_4" in sql
+    # each value array is trimmed to its OWN series length via a FILTER on the shared TopN
+    assert "array_agg(daily_sum_3 ORDER BY tile_end DESC) FILTER (WHERE __rn <= 3) AS daily_sum_3" in sql
+    assert "array_agg(daily_max_4 ORDER BY tile_end DESC) FILTER (WHERE __rn <= 4) AS daily_max_4" in sql
+    assert "array_agg(tile_end ORDER BY tile_end DESC) AS __series_tile_ends" in sql  # ends stays at max depth
     assert "row_number() OVER (PARTITION BY user_id ORDER BY tile_end DESC) AS __rn" in sql
     assert "WHERE __rn <= 4" in sql  # depth = max(3, 4)
     assert sql.rstrip().endswith("GROUP BY user_id")
@@ -3278,7 +3280,7 @@ def test_desired_online_mvs_emits_series_snapshot_for_step_interval_series():
         offsets={}, lifetimes={}, series={"daily_max_5": [86400, 86400, 5]},
     )
     assert online_series_mv_name("proj", "v") in mvs  # == "proj_v_online_series"
-    assert "array_agg(daily_max_5 ORDER BY tile_end DESC) AS daily_max_5" in mvs[online_series_mv_name("proj", "v")]
+    assert "array_agg(daily_max_5 ORDER BY tile_end DESC) FILTER (WHERE __rn <= 5) AS daily_max_5" in mvs[online_series_mv_name("proj", "v")]
 
     coarse = _desired_online_mvs(
         "proj", "v", ci, [_ser("max", "biday_max_5")], "proj_v_tiles",
