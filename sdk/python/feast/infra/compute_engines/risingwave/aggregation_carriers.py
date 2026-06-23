@@ -190,6 +190,40 @@ def is_series_agg(agg: Aggregation, series: Optional[Dict[str, Sequence[int]]]) 
     return agg.resolved_name(agg.time_window) in (series or {})
 
 
+# The per-aggregation FILTER predicate: a filtered aggregation (e.g. a count of only DEBIT transactions, or
+# only 11PM-3AM events) is the SAME aggregation as its unfiltered sibling but with a boolean predicate over
+# STATIC source columns, applied as a SQL ``FILTER (WHERE ...)`` on the tile partial — so total / DEBIT / QR
+# / EOD counts share ONE tile scan (one GROUP BY, filtered partial columns side by side). feast.Aggregation
+# carries no predicate, so it rides this engine-owned tag as a JSON map keyed by resolved_name -> the
+# canonical predicate SQL (validated + canonicalized by the authoring layer through DataFusion). The
+# predicate is on static source columns (evaluated at tile build, free at read), so online == offline holds.
+AGG_FILTER_TAG = "feast_rw_agg_filter"
+
+
+def encode_agg_filters(filter_by_resolved_name: Dict[str, str]) -> Dict[str, str]:
+    """The view-tags fragment carrying per-aggregation FILTER predicates, keyed by resolved_name -> the
+    canonical predicate SQL. Drops empty entries and returns ``{}`` when there is no filtered aggregation,
+    so an unfiltered view's tags are left untouched. The inverse of ``view_agg_filters``."""
+    cleaned = {name: pred for name, pred in filter_by_resolved_name.items() if pred}
+    return {AGG_FILTER_TAG: json.dumps(cleaned)} if cleaned else {}
+
+
+def view_agg_filters(view) -> Dict[str, str]:
+    """The FILTER predicate a view carries in its tags, keyed by resolved_name -> canonical predicate SQL.
+    A resolved_name present here is a filtered aggregation. Absent => {} (the common case). The inverse of
+    ``encode_agg_filters``."""
+    raw = (getattr(view, "tags", None) or {}).get(AGG_FILTER_TAG)
+    if not raw:
+        return {}
+    return dict(json.loads(raw))
+
+
+def is_filtered_agg(agg: Aggregation, filters: Optional[Dict[str, str]]) -> bool:
+    """Whether this aggregation carries a FILTER predicate, per the filter carrier (membership keyed by
+    resolved_name)."""
+    return agg.resolved_name(agg.time_window) in (filters or {})
+
+
 def group_aggregations_by_window(
     aggregations: List[Aggregation],
 ) -> List[Tuple[int, List[Aggregation]]]:
