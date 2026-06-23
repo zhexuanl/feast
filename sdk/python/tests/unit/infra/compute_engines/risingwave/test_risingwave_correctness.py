@@ -76,6 +76,8 @@ from feast.infra.compute_engines.risingwave.nodes import (
     build_windowed_agg_select,
     group_lifetime_aggregations,
     snapshot_series_aggs,
+    encode_agg_filter_cols,
+    encode_agg_filters,
     encode_agg_lifetime,
     encode_agg_offsets,
     encode_agg_params,
@@ -1889,6 +1891,27 @@ def test_provision_streaming_tile_secondary_key_declares_the_column_on_the_sourc
     source_sql, tiles_sql, *_ = _engine()._provision_streaming_tile_ddl("proj", view)
     assert '"ad_id" VARCHAR' in source_sql  # declared on the source so the tiles MV can bind it
     assert 'GROUP BY window_start, window_end, user_id, "ad_id"' in tiles_sql
+
+
+def test_provision_streaming_tile_declares_filter_column_and_shares_one_tile_scan():
+    # total + DEBIT counts on the same column: the DEBIT one carries a FILTER predicate over a raw column
+    # (transaction_code) that is neither a join key, an aggregation input, nor the timestamp. The CREATE
+    # SOURCE must DECLARE it (typed from the carried source schema) so the tiles MV can bind the FILTER, and
+    # both counts must materialize side by side in ONE tiles scan.
+    total = _agg("count", window_seconds=259200)
+    debit = Aggregation(column="amount", function="count",
+                        time_window=timedelta(seconds=259200), name="debit_count")
+    debit_rn = debit.resolved_name(debit.time_window)
+    view = _stream_tile_view(_kafka_source(watermark=True), [total, debit], interval_secs=86400)
+    view.tags = {
+        **encode_agg_filters({debit_rn: "transaction_code = 'DEBIT'"}),
+        **encode_agg_filter_cols({"transaction_code": "varchar"}),
+    }
+    source_sql, tiles_sql, *_ = _engine()._provision_streaming_tile_ddl("proj", view)
+    assert '"transaction_code" varchar' in source_sql  # declared so the tiles MV FILTER can bind it
+    # window-INDEPENDENT partials: total is the bare partial, DEBIT a FILTER partial — side by side, ONE scan
+    assert "count(amount) AS count_amount" in tiles_sql
+    assert "count(amount) FILTER (WHERE transaction_code = 'DEBIT') AS count_amount_f" in tiles_sql
 
 
 def test_provision_streaming_tile_emits_watermarked_source_eowc_tiles_and_online_rollup():

@@ -224,6 +224,34 @@ def is_filtered_agg(agg: Aggregation, filters: Optional[Dict[str, str]]) -> bool
     return agg.resolved_name(agg.time_window) in (filters or {})
 
 
+# The raw SOURCE columns a view's FILTER predicates reference, keyed by column name -> its declared SQL
+# type. A filtered aggregation's ``FILTER (WHERE <col> ...)`` over a column that is neither a join key, an
+# aggregation input, nor the event timestamp would otherwise be undeclared on a streaming view's Kafka
+# CREATE SOURCE (whose column list is explicit) — so the tiles MV could not bind it. The authoring layer
+# slices these (name + type) from the stream's declared schema and rides them on this engine-owned tag; the
+# Kafka source builder declares them. A batch (Iceberg) source infers its full schema from table metadata,
+# so it ignores this carrier. Empty => no filtered aggregation references an out-of-band column.
+AGG_FILTER_COLS_TAG = "feast_rw_agg_filter_cols"
+
+
+def encode_agg_filter_cols(types_by_column: Dict[str, str]) -> Dict[str, str]:
+    """The view-tags fragment carrying the FILTER-referenced source columns, keyed by column name -> its
+    declared SQL type. Drops empty entries and returns ``{}`` when no filtered aggregation references an
+    out-of-band column, so an unfiltered view's tags are left untouched. The inverse of
+    ``view_agg_filter_cols``."""
+    cleaned = {col: typ for col, typ in types_by_column.items() if typ}
+    return {AGG_FILTER_COLS_TAG: json.dumps(cleaned)} if cleaned else {}
+
+
+def view_agg_filter_cols(view) -> Dict[str, str]:
+    """The FILTER-referenced source columns a view carries in its tags, keyed by column name -> declared SQL
+    type. Absent => {} (the common case). The inverse of ``encode_agg_filter_cols``."""
+    raw = (getattr(view, "tags", None) or {}).get(AGG_FILTER_COLS_TAG)
+    if not raw:
+        return {}
+    return dict(json.loads(raw))
+
+
 def group_aggregations_by_window(
     aggregations: List[Aggregation],
 ) -> List[Tuple[int, List[Aggregation]]]:

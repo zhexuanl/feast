@@ -17,6 +17,7 @@ from feast.infra.compute_engines.risingwave.aggregation_carriers import (
     group_lifetime_aggregations,
     is_lifetime_agg,
     is_series_agg,
+    view_agg_filter_cols,
     view_agg_lifetime,
     view_agg_offsets,
     view_agg_series,
@@ -170,6 +171,15 @@ def _source_ddl(name: str, source: KafkaSource, view) -> str:
         seen.add(sk)
     ts = source.timestamp_field
     cols.append(f'"{ts}" TIMESTAMP')
+    seen.add(ts)
+    # A filtered aggregation's FILTER(WHERE ...) may reference a raw column that is neither a join key, an
+    # aggregation input, nor the timestamp (e.g. a transaction_code). It is undeclared above, so the tiles
+    # MV could not bind it — declare each such column with its carried source type. Empty for an unfiltered
+    # view (the carrier is absent), so this leaves the unfiltered CREATE SOURCE byte-identical.
+    for col, rw_type in view_agg_filter_cols(view).items():
+        if col not in seen:
+            cols.append(f'"{col}" {rw_type or "VARCHAR"}')
+            seen.add(col)
 
     watermark = ""
     if source.kafka_options.watermark_delay_threshold is not None:
