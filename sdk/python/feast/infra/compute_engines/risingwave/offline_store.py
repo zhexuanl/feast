@@ -36,6 +36,7 @@ from feast.infra.compute_engines.risingwave.nodes import (
     build_offline_tile_pit_query,
     build_passthrough_pit_query,
     compose_multi_view_pit_query,
+    view_agg_filters,
     view_agg_lifetime,
     view_agg_offsets,
     view_agg_params,
@@ -279,6 +280,7 @@ def _tile_pit_query(
         lifetimes=view_agg_lifetime(fv),
         series=view_agg_series(fv),
         secondary_key=view_secondary_key(fv),
+        filters=view_agg_filters(fv),
     )
     # The output column for each aggregation is its per-window resolved_name, prefixed with the view name
     # under full_feature_names (the alias build_offline_tile_pit_query emits) — the names the composed join

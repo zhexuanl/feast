@@ -59,6 +59,7 @@ from feast.infra.compute_engines.risingwave.nodes import (
     build_latest_row_select,
     build_streaming_tile_select,
     build_windowed_agg_select,
+    view_agg_filters,
     view_agg_lifetime,
     view_agg_offsets,
     view_agg_params,
@@ -490,6 +491,7 @@ class RisingWaveComputeEngine(ComputeEngine):
         aggs = view_aggregations(view)
         params = view_agg_params(view)
         secondary_key = view_secondary_key(view)
+        filters = view_agg_filters(view)
         src = source_name(project, view.name)
         tiles = tiles_name(project, view.name)
         ddl = [
@@ -498,7 +500,7 @@ class RisingWaveComputeEngine(ComputeEngine):
                 tiles,
                 build_batch_tile_select(
                     column_info, aggs, src, aggregation_interval=interval, agg_params=params,
-                    secondary_key=secondary_key,
+                    secondary_key=secondary_key, filters=filters,
                 ),
             ),
         ]
@@ -510,7 +512,7 @@ class RisingWaveComputeEngine(ComputeEngine):
             project, view.name, column_info, aggs, tiles,
             aggregation_interval=interval, agg_params=params, secondary_key=secondary_key,
             offsets=view_agg_offsets(view), lifetimes=view_agg_lifetime(view),
-            series=view_agg_series(view),
+            series=view_agg_series(view), filters=filters,
         ).items():
             ddl.append(_materialized_view_ddl(name, select))
         return ddl
@@ -562,6 +564,7 @@ class RisingWaveComputeEngine(ComputeEngine):
         aggs = view_aggregations(view)
         params = view_agg_params(view)
         secondary_key = view_secondary_key(view)
+        filters = view_agg_filters(view)
         src = source_name(project, view.name)
         tiles = tiles_name(project, view.name)
         ddl = [
@@ -570,7 +573,7 @@ class RisingWaveComputeEngine(ComputeEngine):
                 tiles,
                 build_streaming_tile_select(
                     column_info, aggs, src, aggregation_interval=interval, agg_params=params,
-                    secondary_key=secondary_key,
+                    secondary_key=secondary_key, filters=filters,
                 ),
             ),
         ]
@@ -581,7 +584,7 @@ class RisingWaveComputeEngine(ComputeEngine):
             project, view.name, column_info, aggs, tiles,
             aggregation_interval=interval, agg_params=params, secondary_key=secondary_key,
             offsets=view_agg_offsets(view), lifetimes=view_agg_lifetime(view),
-            series=view_agg_series(view),
+            series=view_agg_series(view), filters=filters,
         ).items():
             ddl.append(_materialized_view_ddl(name, select))
         return ddl
@@ -604,17 +607,18 @@ class RisingWaveComputeEngine(ComputeEngine):
         aggs = view_aggregations(view)
         params = view_agg_params(view)
         secondary_key = view_secondary_key(view)
+        filters = view_agg_filters(view)
         src = source_name(project, view.name)
         tiles = tiles_name(project, view.name)
         desired_tiles = build_batch_tile_select(
             column_info, aggs, src, aggregation_interval=interval, agg_params=params,
-            secondary_key=secondary_key,
+            secondary_key=secondary_key, filters=filters,
         )
         desired_online = _desired_online_mvs(
             project, view.name, column_info, aggs, tiles,
             aggregation_interval=interval, agg_params=params, secondary_key=secondary_key,
             offsets=view_agg_offsets(view), lifetimes=view_agg_lifetime(view),
-            series=view_agg_series(view),
+            series=view_agg_series(view), filters=filters,
         )
         deployed_online = {
             name: _deployed_mv_select(cur, name)
@@ -669,17 +673,18 @@ class RisingWaveComputeEngine(ComputeEngine):
         aggs = view_aggregations(view)
         params = view_agg_params(view)
         secondary_key = view_secondary_key(view)
+        filters = view_agg_filters(view)
         src = source_name(project, view.name)
         tiles = tiles_name(project, view.name)
         desired_tiles = build_streaming_tile_select(
             column_info, aggs, src, aggregation_interval=interval, agg_params=params,
-            secondary_key=secondary_key,
+            secondary_key=secondary_key, filters=filters,
         )
         desired_online = _desired_online_mvs(
             project, view.name, column_info, aggs, tiles,
             aggregation_interval=interval, agg_params=params, secondary_key=secondary_key,
             offsets=view_agg_offsets(view), lifetimes=view_agg_lifetime(view),
-            series=view_agg_series(view),
+            series=view_agg_series(view), filters=filters,
         )
         deployed_online = {
             name: _deployed_mv_select(cur, name)

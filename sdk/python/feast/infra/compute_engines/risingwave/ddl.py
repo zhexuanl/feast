@@ -306,6 +306,7 @@ def _desired_online_mvs(
     offsets,
     lifetimes,
     series,
+    filters=None,
 ) -> dict:
     """The desired ``{mv_name: SELECT}`` for a tile view's online rollup MVs. The v2 serving split now lives
     in ``TilePlan`` (``tile_plan.py``) — the single structured home shared by provisioning, reconcile, the
