@@ -554,7 +554,7 @@ class RisingWaveComputeEngine(ComputeEngine):
         if view.tiling_hop_size is None:
             raise ValueError(
                 f"streaming-tile view '{view.name}' has enable_tiling=True but no tiling_hop_size (the "
-                "tile interval). Set tiling_hop_size to 1 hour or 1 day (the streaming tile grid)."
+                "tile interval). Set tiling_hop_size to 1 minute, 1 hour, or 1 day (the streaming tile grid)."
             )
 
         interval = tile_interval(view)

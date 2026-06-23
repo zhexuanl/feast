@@ -380,8 +380,8 @@ def build_passthrough_pit_query(
 
 
 # aggregation_interval (the tile size) -> RisingWave date_trunc unit. Standard units only for now
-# (date_trunc only supports these units); arbitrary intervals (e.g. 15min) need epoch-bucketing.
-_TILE_INTERVAL_UNIT = {3600: "hour", 86400: "day", 604800: "week"}
+# (date_trunc only supports these units); arbitrary intervals (e.g. 15min, 5min) need epoch-bucketing.
+_TILE_INTERVAL_UNIT = {60: "minute", 3600: "hour", 86400: "day", 604800: "week"}
 
 
 def _tile_unit(aggregation_interval) -> str:
@@ -626,12 +626,13 @@ def build_batch_tile_select(
     )
 
 
-# Streaming tile intervals are restricted to HOUR/DAY: the streaming tiles MV buckets with RisingWave's
-# epoch-anchored TUMBLE, but the offline PIT rollup floors with date_trunc — epoch-tumble lands on the
-# SAME boundary as date_trunc only for hour/day (a 1-week TUMBLE anchors to epoch-Thursday, date_trunc
-# 'week' to ISO-Monday, so weekly tiles would mis-grid online vs offline). Week/arbitrary intervals need
-# an epoch-aligned offline floor first, which is not yet supported.
-_STREAMING_TILE_INTERVAL_SECS = frozenset({3600, 86400})
+# Streaming tile intervals are restricted to MINUTE/HOUR/DAY: the streaming tiles MV buckets with
+# RisingWave's epoch-anchored TUMBLE, but the offline PIT rollup floors with date_trunc — epoch-tumble
+# lands on the SAME boundary as date_trunc only when the unit is epoch-anchored (minute/hour/day all are:
+# floor to epoch + k*interval). A 1-week TUMBLE anchors to epoch-Thursday but date_trunc 'week' to
+# ISO-Monday, so weekly tiles would mis-grid online vs offline; week/arbitrary intervals need an
+# epoch-aligned offline floor first, which is not yet supported.
+_STREAMING_TILE_INTERVAL_SECS = frozenset({60, 3600, 86400})
 
 
 def build_streaming_tile_select(
@@ -661,9 +662,9 @@ def build_streaming_tile_select(
     secs = int(aggregation_interval.total_seconds())
     if secs not in _STREAMING_TILE_INTERVAL_SECS:
         raise ValueError(
-            f"streaming tile aggregation_interval must be 1 hour (3600s) or 1 day (86400s); got {secs}s. "
-            f"The TUMBLE grid is epoch-anchored and must match the offline date_trunc floor — week/arbitrary "
-            f"intervals need an epoch-aligned offline floor, which is not yet supported."
+            f"streaming tile aggregation_interval must be 1 minute (60s), 1 hour (3600s) or 1 day (86400s); "
+            f"got {secs}s. The TUMBLE grid is epoch-anchored and must match the offline date_trunc floor — "
+            f"week/arbitrary intervals need an epoch-aligned offline floor, which is not yet supported."
         )
     keys = ", ".join(column_info.join_keys_columns)
     ts = column_info.timestamp_column

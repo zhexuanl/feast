@@ -1103,12 +1103,33 @@ def test_streaming_tile_select_mirrors_batch_partials_via_eowc_tumble():
 
 
 @pytest.mark.parametrize("secs", [604800, 900, 2592000])  # week, 15min, 30d
-def test_streaming_tile_select_rejects_non_hour_day_interval(secs):
-    # epoch-anchored TUMBLE must match the offline date_trunc floor -> only hour/day are grid-aligned.
+def test_streaming_tile_select_rejects_non_grid_aligned_interval(secs):
+    # epoch-anchored TUMBLE must match the offline date_trunc floor -> only minute/hour/day are grid-aligned
+    # (week mis-grids: TUMBLE epoch-Thursday vs date_trunc ISO-Monday; 15min/30d are not date_trunc units).
     with pytest.raises(ValueError, match="1 hour .* or 1 day"):
         build_streaming_tile_select(
             _column_info(), [_agg("sum", 259200)], "src", aggregation_interval=timedelta(seconds=secs)
         )
+
+
+def test_batch_tile_select_supports_minute_interval():
+    # 'minute' is a native, epoch-aligned date_trunc unit, so a 1-minute batch tile is valid — the
+    # sub-hour grain fraud velocity features need (e.g. txn count over 1m/5m/30m windows).
+    sql = build_batch_tile_select(
+        _column_info(), [_agg("count", 300)], "src", aggregation_interval=timedelta(minutes=1)
+    )
+    assert "date_trunc('minute', event_ts) + INTERVAL '1 minute' AS tile_end" in sql
+    assert "GROUP BY user_id, date_trunc('minute', event_ts)" in sql
+
+
+def test_streaming_tile_select_supports_minute_interval():
+    # a 60s EOWC TUMBLE is epoch-anchored to the SAME grid as date_trunc('minute'), so minute streaming
+    # tiles keep online == offline — the high-freshness fraud-velocity grain.
+    sql = build_streaming_tile_select(
+        _column_info(), [_agg("count", 300)], "src", aggregation_interval=timedelta(minutes=1)
+    )
+    assert "tumble(src, event_ts, INTERVAL '60' SECOND)" in sql
+    assert sql.rstrip().endswith("EMIT ON WINDOW CLOSE")
 
 
 def test_streaming_tile_select_rejects_unsupported_and_empty():
