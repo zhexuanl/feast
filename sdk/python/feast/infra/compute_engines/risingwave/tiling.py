@@ -179,17 +179,23 @@ def _partials_for(
     agg: Aggregation,
     ts_col: Optional[str] = None,
     agg_params: Optional[Dict[str, List[float]]] = None,
+    agg_filter: Optional[str] = None,
 ) -> List[Tuple[str, str]]:
     """The WINDOW-INDEPENDENT per-tile partial columns (name, SQL aggregate) one aggregation needs — a thin
     shim over ``Partial.from_aggregation`` (the single namer/renderer). Named by (function-family, column)
-    so multiple windows / functions on the same column share a partial."""
-    return [(p.column_name(), p.materialize_sql(ts_col)) for p in Partial.from_aggregation(agg, ts_col, agg_params)]
+    so multiple windows / functions on the same column share a partial; a filtered aggregation's partials
+    carry ``agg_filter`` (a canonical FILTER predicate), which hashes into the name so they stay distinct."""
+    return [
+        (p.column_name(), p.materialize_sql(ts_col))
+        for p in Partial.from_aggregation(agg, ts_col, agg_params, filter=agg_filter)
+    ]
 
 
 def _view_partials(
     aggregations: List[Aggregation],
     ts_col: Optional[str] = None,
     agg_params: Optional[Dict[str, List[float]]] = None,
+    filters: Optional[Dict[str, str]] = None,
 ) -> List[Tuple[str, str]]:
     """The deduped union of every aggregation's window-independent partials = the tiles MV's partial
     columns. Dedup is by partial NAME, and is ASSERT-EQUAL: two aggregations may share a partial only if
@@ -198,7 +204,8 @@ def _view_partials(
     predicate hash (``Partial.column_name``). Insertion order is preserved (the tiles MV column order)."""
     out: dict = {}
     for a in aggregations:
-        for name, sql in _partials_for(a, ts_col, agg_params):
+        agg_filter = (filters or {}).get(a.resolved_name(a.time_window))
+        for name, sql in _partials_for(a, ts_col, agg_params, agg_filter=agg_filter):
             if name in out and out[name] != sql:
                 raise ValueError(
                     f"tile partial name collision: {name!r} maps to two different aggregates "
@@ -215,6 +222,7 @@ def _tile_recombine(
     partial_filter: Optional[str] = None,
     output_prefix: str = "",
     agg_params: Optional[Dict[str, List[float]]] = None,
+    agg_filter: Optional[str] = None,
 ) -> str:
     """The retrieval-time recombine for one aggregation: an expression over the window-independent
     tile partials aliased to the FINAL per-window ``resolved_name``. ``prefix`` qualifies the partial
@@ -227,7 +235,9 @@ def _tile_recombine(
     out = agg.resolved_name(agg.time_window)
     if output_prefix:
         out = f'"{output_prefix}__{out}"'
-    expr = _recombine_expr(agg, prefix=prefix, partial_filter=partial_filter, agg_params=agg_params)
+    expr = _recombine_expr(
+        agg, prefix=prefix, partial_filter=partial_filter, agg_params=agg_params, agg_filter=agg_filter
+    )
     return f"{expr} AS {out}"
 
 
@@ -260,6 +270,7 @@ def _recombine_expr(
     prefix: str = "",
     partial_filter: Optional[str] = None,
     agg_params: Optional[Dict[str, List[float]]] = None,
+    agg_filter: Optional[str] = None,
 ) -> str:
     """The bare retrieval-time recombine EXPRESSION for one aggregation over the window-independent tile
     partials — WITHOUT the output alias. The single home of the per-function recombine: ``_tile_recombine``
@@ -269,7 +280,7 @@ def _recombine_expr(
     col, fn = agg.column, agg.function
 
     def merged(kind: str, op: str = "sum") -> str:
-        p = f"{prefix}{Partial(kind, col).column_name()}"
+        p = f"{prefix}{Partial(kind, col, filter=agg_filter).column_name()}"
         inner = f"CASE WHEN {partial_filter} THEN {p} END" if partial_filter else p
         return f"{op}({inner})"
 
@@ -292,7 +303,7 @@ def _recombine_expr(
         # ordered within the tile, so the flattened order is the global event-time order; the _distinct
         # variants dedup again across tiles (a value may repeat in two tiles).
         n = _sequence_n(agg, agg_params)
-        p = f"{prefix}{Partial(fn, col, n=n).column_name()}"
+        p = f"{prefix}{Partial(fn, col, n=n, filter=agg_filter).column_name()}"
         inner = f"CASE WHEN {partial_filter} THEN {p} END" if partial_filter else p
         flat = f"array_flatten(array_agg({inner} ORDER BY {prefix}tile_end {_SEQUENCE_ORDER[fn]}))"
         if fn.endswith("_distinct"):
@@ -310,6 +321,7 @@ def _cumulative_recombine_expr(
     *,
     hi: str = "hi",
     lo: Optional[str] = "lo",
+    agg_filter: Optional[str] = None,
 ) -> str:
     """The windowed recombine for an INVERTIBLE aggregation by 2-POINT SUBTRACTION over the cumulative-tile
     MV, from two cumulative rows: ``hi`` = cumulative at the latest tile_end <= window END, ``lo`` =
@@ -332,7 +344,7 @@ def _cumulative_recombine_expr(
         # inside the window, or there are no tiles at all) yields a NULL cumulative = 0 contribution. The
         # cumulative column is ``cum_`` + the partial's column_name(), so a filtered partial's hashed name
         # flows through here too (the single-namer invariant).
-        name = Partial(kind, col).column_name()
+        name = Partial(kind, col, filter=agg_filter).column_name()
         hi_c = f"COALESCE({hi}.cum_{name}, 0)"
         return hi_c if lo is None else f"({hi_c} - COALESCE({lo}.cum_{name}, 0))"
 
@@ -361,6 +373,7 @@ def cumulative_tile_recombine(
     hi: str = "hi",
     lo: Optional[str] = "lo",
     output_prefix: str = "",
+    agg_filter: Optional[str] = None,
 ) -> str:
     """``_cumulative_recombine_expr`` aliased to the aggregation's per-window ``resolved_name`` (or
     ``{output_prefix}__{resolved_name}`` for a full-feature-names offline read) — the cumulative twin of
@@ -368,7 +381,7 @@ def cumulative_tile_recombine(
     out = agg.resolved_name(agg.time_window)
     if output_prefix:
         out = f'"{output_prefix}__{out}"'
-    return f"{_cumulative_recombine_expr(agg, hi=hi, lo=lo)} AS {out}"
+    return f"{_cumulative_recombine_expr(agg, hi=hi, lo=lo, agg_filter=agg_filter)} AS {out}"
 
 
 def _series_recombine(
@@ -381,6 +394,7 @@ def _series_recombine(
     prefix: str = "",
     output_prefix: str = "",
     agg_params: Optional[Dict[str, List[float]]] = None,
+    agg_filter: Optional[str] = None,
 ) -> str:
     """The retrieval-time recombine for a window-SERIES: an ``ARRAY`` of ``length`` per-window recombines
     over the ONE shared tile set, one element per step, ordered OLDEST window FIRST (the earliest->latest
@@ -401,7 +415,9 @@ def _series_recombine(
         # older step's upper edge sits below `end`, so it gets its own explicit upper bound.
         if hi:
             pf += f" AND {prefix}tile_end <= {end_expr} - INTERVAL '{hi}' SECOND"
-        elements.append(_recombine_expr(agg, prefix=prefix, partial_filter=pf, agg_params=agg_params))
+        elements.append(_recombine_expr(
+            agg, prefix=prefix, partial_filter=pf, agg_params=agg_params, agg_filter=agg_filter
+        ))
     return f"ARRAY[{', '.join(elements)}] AS {out}"
 
 
@@ -416,6 +432,7 @@ def _tile_value_expr(
     *,
     prefix: str = "",
     agg_params: Optional[Dict[str, List[float]]] = None,
+    agg_filter: Optional[str] = None,
 ) -> str:
     """The FINALIZED feature value of ONE tile, computed from that tile's stored partials WITHOUT an
     aggregate wrapper — for a window-series whose step equals the tile interval, where each step is exactly
@@ -425,14 +442,14 @@ def _tile_value_expr(
     count_distinct/sequence are array-valued and not snapshotted."""
     col, fn = agg.column, agg.function
     if fn in {"sum", "count", "min", "max"}:
-        return f"{prefix}{Partial(fn, col).column_name()}"
+        return f"{prefix}{Partial(fn, col, filter=agg_filter).column_name()}"
     # mean/var/stddev from this ONE tile's partials, via the shared finalize home — the merge collapsed to
     # identity (no cross-tile aggregate), so it equals _recombine_expr over a single tile by construction.
-    sumsq = "" if fn == "mean" else f"{prefix}{Partial('sumsq', col).column_name()}"
+    sumsq = "" if fn == "mean" else f"{prefix}{Partial('sumsq', col, filter=agg_filter).column_name()}"
     return _composite_finalize(
         fn,
-        sm=f"{prefix}{Partial('sum', col).column_name()}",
-        cnt=f"{prefix}{Partial('count', col).column_name()}",
+        sm=f"{prefix}{Partial('sum', col, filter=agg_filter).column_name()}",
+        cnt=f"{prefix}{Partial('count', col, filter=agg_filter).column_name()}",
         sumsq=sumsq,
     )
 
@@ -476,6 +493,7 @@ def _cumulative_partials(
     aggregations: List[Aggregation],
     ts_col: Optional[str] = None,
     agg_params: Optional[Dict[str, List[float]]] = None,
+    filters: Optional[Dict[str, str]] = None,
 ) -> List[Tuple[str, str]]:
     """The running-total columns of the cumulative-tile MV: for each INVERTIBLE aggregation's
     window-independent partial (``sum_``/``count_``/``sumsq_``), a ``cum_{partial}`` whose value is a
@@ -493,6 +511,6 @@ def _cumulative_partials(
     cols: List[Tuple[str, str]] = [("cum_ntiles", "count(*)")]
     cols += [
         (f"cum_{name}", f"sum({name})")
-        for (name, _materialize_sql) in _view_partials(invertible, ts_col, agg_params)
+        for (name, _materialize_sql) in _view_partials(invertible, ts_col, agg_params, filters)
     ]
     return cols

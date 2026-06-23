@@ -523,13 +523,19 @@ def _tile_rollup_exprs(
     aggregations: List[Aggregation],
     prefix: str = "",
     agg_params: Optional[Dict[str, List[float]]] = None,
+    filters: Optional[Dict[str, str]] = None,
 ) -> str:
     """The per-aggregation recombine projection for the SINGLE-window rollup builders (the surrounding
     WHERE bounds the window, so no per-agg ``partial_filter``). Shared by online + floored rollups so
     they recombine per-tile partials IDENTICALLY (no-drift — one source of truth, via
-    ``_tile_recombine``). ``prefix`` qualifies the partial columns for a joined relation."""
+    ``_tile_recombine``). ``prefix`` qualifies the partial columns for a joined relation; ``filters`` maps
+    a filtered aggregation's resolved_name to its canonical FILTER predicate."""
     return ", ".join(
-        _tile_recombine(a, prefix=prefix, agg_params=agg_params) for a in aggregations
+        _tile_recombine(
+            a, prefix=prefix, agg_params=agg_params,
+            agg_filter=(filters or {}).get(a.resolved_name(a.time_window)),
+        )
+        for a in aggregations
     )
 
 
@@ -576,13 +582,14 @@ def _tile_partials_projection(
     column_info: ColumnInfo,
     aggregations: List[Aggregation],
     agg_params: Optional[Dict[str, List[float]]] = None,
+    filters: Optional[Dict[str, str]] = None,
 ) -> str:
     """The deduped window-independent partial columns as a ``{expr} AS {name}`` projection — the ONE
     source of the tile partial set, shared by the batch and streaming tile builders so they cannot drift.
     Includes the partial-name vs join-key clash guard (a bare ``{family}_{col}`` partial that equals an
     entity column would make the tiles MV have two identically-named columns, which RisingWave rejects)."""
     view_partials = _view_partials(
-        aggregations, column_info.timestamp_column, agg_params
+        aggregations, column_info.timestamp_column, agg_params, filters
     )
     key_clash = sorted(set(column_info.join_keys_columns) & {name for (name, _) in view_partials})
     if key_clash:
@@ -601,6 +608,7 @@ def build_batch_tile_select(
     aggregation_interval,
     agg_params: Optional[Dict[str, List[float]]] = None,
     secondary_key: Optional[str] = None,
+    filters: Optional[Dict[str, str]] = None,
 ) -> str:
     """Tile materialization for a BATCH feature view: one PARTIAL aggregate per (entity, tile),
     where a tile spans ``[tile_start, tile_start + aggregation_interval)`` and is stamped by
@@ -615,7 +623,7 @@ def build_batch_tile_select(
     unit = _tile_unit(aggregation_interval)
     keys = ", ".join(column_info.join_keys_columns)
     bucket = f"date_trunc('{unit}', {column_info.timestamp_column})"
-    partials = _tile_partials_projection(column_info, aggregations, agg_params)
+    partials = _tile_partials_projection(column_info, aggregations, agg_params, filters)
     # A secondary key adds a second GROUP BY dimension to the tiles: tiles become per-(entity,
     # secondary_key, tile_end), collapsed into a per-key Map at rollup.
     sk_sel = f'"{secondary_key}", ' if secondary_key else ""
@@ -643,6 +651,7 @@ def build_streaming_tile_select(
     aggregation_interval,
     agg_params: Optional[Dict[str, List[float]]] = None,
     secondary_key: Optional[str] = None,
+    filters: Optional[Dict[str, str]] = None,
 ) -> str:
     """Tile materialization for a STREAMING feature view — the streaming twin of ``build_batch_tile_select``.
     Emits the SAME per-(entity, tile_end) window-independent partials, but materialized by an EOWC TUMBLE at
@@ -668,7 +677,7 @@ def build_streaming_tile_select(
         )
     keys = ", ".join(column_info.join_keys_columns)
     ts = column_info.timestamp_column
-    partials = _tile_partials_projection(column_info, aggregations, agg_params)
+    partials = _tile_partials_projection(column_info, aggregations, agg_params, filters)
     sk_sel = f'"{secondary_key}", ' if secondary_key else ""
     sk_grp = f', "{secondary_key}"' if secondary_key else ""
     return (
@@ -684,6 +693,7 @@ def build_cumulative_tile_select(
     tile_relation: str,
     *,
     agg_params: Optional[Dict[str, List[float]]] = None,
+    filters: Optional[Dict[str, str]] = None,
 ) -> str:
     """The CUMULATIVE-tile MV: per ``(entity, tile_end)``, the RUNNING TOTAL of each invertible partial
     over all tiles up to and including ``tile_end`` — ``sum(partial) OVER (PARTITION BY keys ORDER BY
@@ -708,7 +718,7 @@ def build_cumulative_tile_select(
             "(sum/count/mean/var/stddev); min/max/count_distinct/sequence keep the interval read."
         )
     keys = ", ".join(column_info.join_keys_columns)
-    cum_cols = _cumulative_partials(aggregations, column_info.timestamp_column, agg_params)
+    cum_cols = _cumulative_partials(aggregations, column_info.timestamp_column, agg_params, filters)
     win = f"(PARTITION BY {keys} ORDER BY tile_end)"
     proj = ", ".join(f"{sql} OVER {win} AS {name}" for (name, sql) in cum_cols)
     return f"SELECT {keys}, tile_end, {proj} FROM {tile_relation}"
@@ -722,6 +732,7 @@ def build_series_snapshot_select(
     aggregation_interval,
     agg_params: Optional[Dict[str, List[float]]] = None,
     series: Optional[Dict[str, Sequence[int]]] = None,
+    filters: Optional[Dict[str, str]] = None,
 ) -> Optional[str]:
     """A per-entity LAST-L tile SNAPSHOT MV for the window-series whose step == the tile interval. Per
     entity it stores the last ``depth`` tiles' end timestamps (``SERIES_SNAPSHOT_ENDS_COL``) and, for each
@@ -747,7 +758,7 @@ def build_series_snapshot_select(
     depth = max(length for _a, length in eligible)
     names = [a.resolved_name(a.time_window) for a, _ in eligible]
     vals = ", ".join(
-        f"{_tile_value_expr(a, agg_params=agg_params)} AS {name}"
+        f"{_tile_value_expr(a, agg_params=agg_params, agg_filter=(filters or {}).get(name))} AS {name}"
         for (a, _), name in zip(eligible, names)
     )
     inner = (
@@ -787,6 +798,7 @@ def build_cumulative_read_query(
     offsets: Optional[Dict[str, int]] = None,
     lifetimes: Optional[Dict[str, Optional[int]]] = None,
     series: Optional[Dict[str, Sequence[int]]] = None,
+    filters: Optional[Dict[str, str]] = None,
 ) -> str:
     """Read INVERTIBLE windowed features from the CUMULATIVE-tile MV by 2-point asof subtraction. For each
     entity-spine row it anchors ``end = date_trunc(aggregation_interval, label_ts)`` and derives every
@@ -822,7 +834,7 @@ def build_cumulative_read_query(
     match = " AND ".join(f'c."{k}" = e."{k}"' for k in keys)
     end = f'date_trunc(\'{unit}\', e."{label_ts_column}")'
     cum_cols = ", ".join(
-        name for (name, _sql) in _cumulative_partials(aggregations, column_info.timestamp_column, agg_params)
+        name for (name, _sql) in _cumulative_partials(aggregations, column_info.timestamp_column, agg_params, filters)
     )
     output_prefix = (view_name or "") if full_feature_names else ""
 
@@ -846,12 +858,14 @@ def build_cumulative_read_query(
         if lifetimes and name in lifetimes:
             floor = lifetimes[name]
             lo = None if floor is None else asof(floor_bound(floor))
-            projs.append(f"{_cumulative_recombine_expr(a, hi=asof(back(0)), lo=lo)} AS {out}")
+            af = (filters or {}).get(name)
+            projs.append(f"{_cumulative_recombine_expr(a, hi=asof(back(0)), lo=lo, agg_filter=af)} AS {out}")
         else:
             w = int(a.time_window.total_seconds())
             off = abs(_agg_offset_secs(a, offsets))
+            af = (filters or {}).get(name)
             projs.append(
-                f"{_cumulative_recombine_expr(a, hi=asof(back(off)), lo=asof(back(off + w)))} AS {out}"
+                f"{_cumulative_recombine_expr(a, hi=asof(back(off)), lo=asof(back(off + w)), agg_filter=af)} AS {out}"
             )
 
     laterals = " ".join(
@@ -871,6 +885,7 @@ def build_tile_rollup_select(
     as_of_sql: str,
     agg_params: Optional[Dict[str, List[float]]] = None,
     offset_secs: int = 0,
+    filters: Optional[Dict[str, str]] = None,
 ) -> str:
     """Roll up tiles to the requested window, ANCHORED TO THE REQUEST/LABEL time (a request-anchored
     sliding window over a fixed tile set). Recombine each aggregation's per-tile
@@ -888,7 +903,7 @@ def build_tile_rollup_select(
     _assert_offset_multiple_of_interval(offset_secs, aggregation_interval)
     unit = _tile_unit(aggregation_interval)
     keys = ", ".join(column_info.join_keys_columns)
-    rollups = _tile_rollup_exprs(aggregations, agg_params=agg_params)
+    rollups = _tile_rollup_exprs(aggregations, agg_params=agg_params, filters=filters)
     end = f"date_trunc('{unit}', {as_of_sql})"
     off = abs(int(offset_secs))
     upper = end if off == 0 else f"{end} - INTERVAL '{off}' SECOND"
@@ -908,6 +923,7 @@ def build_online_rollup_select(
     agg_params: Optional[Dict[str, List[float]]] = None,
     offset_secs: int = 0,
     secondary_key: Optional[str] = None,
+    filters: Optional[Dict[str, str]] = None,
 ) -> str:
     """Online rollup MV over the tiles: a CONTINUOUS RisingWave materialized view that maintains the
     request-anchored window rollup for ``as_of = now()`` (wall-clock), so the ONLINE READ stays an
@@ -936,7 +952,7 @@ def build_online_rollup_select(
     window_secs = _validate_window_rollup(aggregations, aggregation_interval)
     _assert_offset_multiple_of_interval(offset_secs, aggregation_interval)
     keys = ", ".join(column_info.join_keys_columns)
-    rollups = _tile_rollup_exprs(aggregations, agg_params=agg_params)
+    rollups = _tile_rollup_exprs(aggregations, agg_params=agg_params, filters=filters)
     off = abs(int(offset_secs))
     upper = "now()" if off == 0 else f"now() - INTERVAL '{off}' SECOND"
     where = f"tile_end > now() - INTERVAL '{window_secs + off}' SECOND AND tile_end <= {upper}"
@@ -973,6 +989,7 @@ def build_lifetime_rollup_select(
     agg_params: Optional[Dict[str, List[float]]] = None,
     lifetime_start_secs: Optional[int] = None,
     secondary_key: Optional[str] = None,
+    filters: Optional[Dict[str, str]] = None,
 ) -> str:
     """Online rollup MV for LIFETIME aggregations over the tiles: a continuous RisingWave materialized
     view maintaining the ALL-HISTORY rollup for ``as_of = now()``, with the lower window bound DROPPED.
@@ -992,7 +1009,7 @@ def build_lifetime_rollup_select(
     _assert_tile_supported(aggregations)
     _assert_distinct_output_names(aggregations)
     keys = ", ".join(column_info.join_keys_columns)
-    rollups = _tile_rollup_exprs(aggregations, agg_params=agg_params)
+    rollups = _tile_rollup_exprs(aggregations, agg_params=agg_params, filters=filters)
     where = "tile_end <= now()"
     if lifetime_start_secs is not None:
         # The floor is an absolute instant (epoch seconds). ``AT TIME ZONE 'UTC'`` renders it as the UTC
@@ -1024,6 +1041,7 @@ def build_offline_tile_pit_query(
     lifetimes: Optional[Dict[str, Optional[int]]] = None,
     series: Optional[Dict[str, Sequence[int]]] = None,
     secondary_key: Optional[str] = None,
+    filters: Optional[Dict[str, str]] = None,
 ) -> str:
     """Offline point-in-time training rollup for a tile BatchFeatureView. For EACH entity row, rolls
     the tiles up in the request-anchored window ``(end - W, end]`` where ``end = floor(label_ts,
@@ -1099,15 +1117,16 @@ def build_offline_tile_pit_query(
         return int(a.time_window.total_seconds()) + abs(_agg_offset_secs(a, offsets))
 
     def _recombine(a: Aggregation) -> str:
+        af = (filters or {}).get(a.resolved_name(a.time_window))
         if is_series_agg(a, series):
             w, s, length = series[a.resolved_name(a.time_window)]
             return _series_recombine(
                 a, end_expr=end, window_secs=int(w), step_secs=int(s), length=int(length),
-                prefix="t.", output_prefix=output_prefix, agg_params=agg_params,
+                prefix="t.", output_prefix=output_prefix, agg_params=agg_params, agg_filter=af,
             )
         return _tile_recombine(
             a, prefix="t.", partial_filter=_partial_filter(a),
-            output_prefix=output_prefix, agg_params=agg_params,
+            output_prefix=output_prefix, agg_params=agg_params, agg_filter=af,
         )
 
     has_lifetime = any(is_lifetime_agg(a, lifetimes) for a in aggregations)

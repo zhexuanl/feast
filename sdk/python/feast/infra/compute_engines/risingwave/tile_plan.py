@@ -63,13 +63,14 @@ class TilesNode:
     aggregation_interval: object
     agg_params: Optional[Dict[str, List[float]]] = None
     secondary_key: Optional[str] = None
+    filters: Optional[Dict[str, str]] = None
 
     def select(self) -> str:
         builder = build_batch_tile_select if self.flavor == "batch" else build_streaming_tile_select
         return builder(
             self.column_info, self.aggregations, self.source_relation,
             aggregation_interval=self.aggregation_interval, agg_params=self.agg_params,
-            secondary_key=self.secondary_key,
+            secondary_key=self.secondary_key, filters=self.filters,
         )
 
 
@@ -83,10 +84,12 @@ class CumulativeNode:
     invertible_aggregations: List[Aggregation]
     tiles_relation: str
     agg_params: Optional[Dict[str, List[float]]] = None
+    filters: Optional[Dict[str, str]] = None
 
     def select(self) -> str:
         return build_cumulative_tile_select(
-            self.column_info, self.invertible_aggregations, self.tiles_relation, agg_params=self.agg_params
+            self.column_info, self.invertible_aggregations, self.tiles_relation,
+            agg_params=self.agg_params, filters=self.filters,
         )
 
 
@@ -104,12 +107,13 @@ class WindowNode:
     offset_secs: int
     agg_params: Optional[Dict[str, List[float]]] = None
     secondary_key: Optional[str] = None
+    filters: Optional[Dict[str, str]] = None
 
     def select(self) -> str:
         return build_online_rollup_select(
             self.column_info, self.aggregations, self.tiles_relation,
             aggregation_interval=self.aggregation_interval, agg_params=self.agg_params,
-            offset_secs=self.offset_secs, secondary_key=self.secondary_key,
+            offset_secs=self.offset_secs, secondary_key=self.secondary_key, filters=self.filters,
         )
 
 
@@ -125,11 +129,12 @@ class LifetimeNode:
     floor: Optional[int]
     agg_params: Optional[Dict[str, List[float]]] = None
     secondary_key: Optional[str] = None
+    filters: Optional[Dict[str, str]] = None
 
     def select(self) -> str:
         return build_lifetime_rollup_select(
             self.column_info, self.aggregations, self.tiles_relation, agg_params=self.agg_params,
-            lifetime_start_secs=self.floor, secondary_key=self.secondary_key,
+            lifetime_start_secs=self.floor, secondary_key=self.secondary_key, filters=self.filters,
         )
 
 
@@ -146,11 +151,13 @@ class SeriesSnapshotNode:
     aggregation_interval: object
     agg_params: Optional[Dict[str, List[float]]] = None
     series: Optional[Dict[str, List[int]]] = None
+    filters: Optional[Dict[str, str]] = None
 
     def select(self) -> Optional[str]:
         return build_series_snapshot_select(
             self.column_info, self.aggregations, self.tiles_relation,
-            aggregation_interval=self.aggregation_interval, agg_params=self.agg_params, series=self.series,
+            aggregation_interval=self.aggregation_interval, agg_params=self.agg_params,
+            series=self.series, filters=self.filters,
         )
 
 
@@ -181,17 +188,20 @@ class TilePlan:
         offsets: Optional[Dict[str, int]] = None,
         lifetimes: Optional[Dict[str, Optional[int]]] = None,
         series: Optional[Dict[str, List[int]]] = None,
+        filters: Optional[Dict[str, str]] = None,
         flavor: str = "batch",
         source_relation: str = "",
     ) -> "TilePlan":
         """Build the plan from the same inputs ``_desired_online_mvs`` takes (plus the tiles flavor + source
         for the tiles node). The node construction lifts the v2 serving split VERBATIM from
-        ``_desired_online_mvs`` — the single home of that classification."""
+        ``_desired_online_mvs`` — the single home of that classification. ``filters`` (resolved_name ->
+        canonical predicate) rides every node so a filtered aggregation's FILTER reaches both the tiles MV
+        partials and every recombine identically (the offline read is built from the same filters)."""
         cumulative_ok = secondary_key is None
         invertible = [a for a in aggregations if cumulative_ok and is_invertible_agg(a)]
         cumulative = (
             CumulativeNode(online_cumulative_mv_name(project, view_name), column_info, invertible,
-                           tiles_relation, agg_params)
+                           tiles_relation, agg_params, filters)
             if invertible else None
         )
 
@@ -202,22 +212,22 @@ class TilePlan:
         windowed = [a for a in aggregations if _interval_served(a) and not is_lifetime_agg(a, lifetimes)]
         windows = [
             WindowNode(online_window_mv_name(project, view_name, w, off), column_info, wa, tiles_relation,
-                       aggregation_interval, w, off, agg_params, secondary_key)
+                       aggregation_interval, w, off, agg_params, secondary_key, filters)
             for (w, off), wa in group_aggregations_by_window_offset(windowed, offsets)
         ]
         lifetime = [a for a in aggregations if _interval_served(a) and is_lifetime_agg(a, lifetimes)]
         lifes = [
             LifetimeNode(online_lifetime_mv_name(project, view_name, floor), column_info, la, tiles_relation,
-                         floor, agg_params, secondary_key)
+                         floor, agg_params, secondary_key, filters)
             for floor, la in group_lifetime_aggregations(lifetime, lifetimes)
         ]
         snapshot = (
             SeriesSnapshotNode(online_series_mv_name(project, view_name), column_info, aggregations,
-                               tiles_relation, aggregation_interval, agg_params, series)
+                               tiles_relation, aggregation_interval, agg_params, series, filters)
             if cumulative_ok else None
         )
         tiles = TilesNode(tiles_relation, column_info, aggregations, source_relation, flavor,
-                          aggregation_interval, agg_params, secondary_key)
+                          aggregation_interval, agg_params, secondary_key, filters)
         return TilePlan(project, view_name, tiles, cumulative, windows, lifes, snapshot)
 
     def online_mvs(self) -> Dict[str, str]:
@@ -247,6 +257,7 @@ def tile_plan_from_view(project: str, view) -> TilePlan:
     plan. (Used by the provisioning / reconcile / offline / serving consumers; kept thin so the carrier
     decode lives in ONE place.)"""
     from feast.infra.compute_engines.risingwave.aggregation_carriers import (
+        view_agg_filters,
         view_agg_lifetime,
         view_agg_offsets,
         view_agg_params,
@@ -262,7 +273,7 @@ def tile_plan_from_view(project: str, view) -> TilePlan:
         project, view.name, column_info, view_aggregations(view), tiles_name(project, view.name),
         aggregation_interval=tile_interval(view), agg_params=view_agg_params(view),
         secondary_key=view_secondary_key(view), offsets=view_agg_offsets(view),
-        lifetimes=view_agg_lifetime(view), series=view_agg_series(view),
+        lifetimes=view_agg_lifetime(view), series=view_agg_series(view), filters=view_agg_filters(view),
         flavor="streaming" if streaming else "batch",
         source_relation=(view.stream_source.name if streaming else view.batch_source.table),
     )

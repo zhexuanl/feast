@@ -60,6 +60,33 @@ def test_online_mvs_equals_desired_online_mvs(label, aggs, carriers):
     assert list(plan.items()) == list(legacy.items()), label
 
 
+def test_filtered_aggregation_shares_one_tile_scan():
+    # total + DEBIT counts on the same column share ONE tiles MV: the total is the bare partial, the filtered
+    # count is a FILTER(WHERE ...) partial whose name carries a predicate hash (so they don't collide). The
+    # recombine references the hashed name, and the offline read references the IDENTICAL name (online==offline).
+    from feast.infra.compute_engines.risingwave.sql_builders import build_offline_tile_pit_query
+
+    total = _agg("count", 1, "total_count")
+    debit = _agg("count", 1, "debit_count")
+    pred = "transaction_code = 'DEBIT'"
+    filters = {_rn(debit): pred}
+    plan = TilePlan.from_inputs(PROJECT, VIEW, CI, [total, debit], TILES, aggregation_interval=INTERVAL,
+                                filters=filters, flavor="batch", source_relation="src")
+    _, tiles_sql = plan.tiles_ddl()
+    assert "count(amount) AS count_amount" in tiles_sql            # total: bare partial
+    assert f"count(amount) FILTER (WHERE {pred}) AS count_amount_f" in tiles_sql  # DEBIT: filtered, hashed
+    # both counts are invertible -> ONE cumulative MV carrying BOTH running totals (distinct columns)
+    cum_sql = next(s for n, s in plan.online_mvs().items() if "_cum" in n)
+    assert "AS cum_count_amount," in cum_sql and "AS cum_count_amount_f" in cum_sql
+    # the offline read references the SAME filtered partial name -> online == offline by construction
+    off = build_offline_tile_pit_query(
+        "SELECT 'u1' AS user_id, now() AS event_timestamp", ["user_id", "event_timestamp"],
+        "event_timestamp", tiles_relation=TILES, column_info=CI, aggregations=[total, debit],
+        aggregation_interval=INTERVAL, filters=filters,
+    )
+    assert "count_amount_f" in off and "AS debit_count" in off and "AS total_count" in off
+
+
 @pytest.mark.parametrize("flavor,builder", [("batch", build_batch_tile_select), ("streaming", build_streaming_tile_select)])
 def test_tiles_ddl_equals_builder(flavor, builder):
     aggs = [_agg("sum", 1), _agg("mean", 1)]
