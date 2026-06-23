@@ -38,13 +38,7 @@ from feast.infra.compute_engines.risingwave.names import (
     source_name,
     tiles_name,
 )
-from feast.infra.compute_engines.risingwave.sql_builders import (
-    build_cumulative_tile_select,
-    build_lifetime_rollup_select,
-    build_online_rollup_select,
-    build_series_snapshot_select,
-)
-from feast.infra.compute_engines.risingwave.tiling import is_invertible_agg
+from feast.infra.compute_engines.risingwave.tile_plan import TilePlan
 
 
 def _registry_free_column_info(view) -> ColumnInfo:
@@ -313,55 +307,14 @@ def _desired_online_mvs(
     lifetimes,
     series,
 ) -> dict:
-    """The desired ``{mv_name: SELECT}`` for a tile view's online rollup MVs — the ONE place the v2
-    serving split lives, shared by provisioning AND reconcile so they cannot drift.
-
-    INVERTIBLE aggregations (sum/count/mean/var/stddev) are served from ONE cumulative-tile MV
-    (``build_cumulative_tile_select``) by read-time 2-point asof subtraction; every window/offset/lifetime/
-    series shape is derived from that single MV at read time, so they get NO per-window MV. NON-INVERTIBLE
-    aggregations (min/max/count_distinct/sequence) keep a now()-anchored rollup MV per (window, offset) and
-    per lifetime floor (a series of them reads the tiles directly at request time).
-
-    SECONDARY-KEY views are excluded from the cumulative path: the cumulative MV carries no per-key Map
-    dimension, and a jsonb-map subtraction is not supported — so a secondary-key view keeps the full v1
-    now()-MV rollup for EVERY aggregation, invertible or not. A window-series aggregation never gets its
-    own MV (it is read at request time), so it is excluded from the per-window/lifetime rollup like a
-    lifetime aggregation is."""
-    out: dict = {}
-    cumulative_ok = secondary_key is None
-    invertible = [a for a in aggs if cumulative_ok and is_invertible_agg(a)]
-    if invertible:
-        out[online_cumulative_mv_name(project, view_name)] = build_cumulative_tile_select(
-            column_info, invertible, tiles, agg_params=agg_params
-        )
-
-    def _interval_served(a) -> bool:
-        # served by a per-window / lifetime now()-MV: not invertible-via-cumulative, and not a series.
-        return not (cumulative_ok and is_invertible_agg(a)) and not is_series_agg(a, series)
-
-    windowed = [a for a in aggs if _interval_served(a) and not is_lifetime_agg(a, lifetimes)]
-    for (w, off), wa in group_aggregations_by_window_offset(windowed, offsets):
-        out[online_window_mv_name(project, view_name, w, off)] = build_online_rollup_select(
-            column_info, wa, tiles, aggregation_interval=aggregation_interval,
-            agg_params=agg_params, offset_secs=off, secondary_key=secondary_key,
-        )
-    lifetime = [a for a in aggs if _interval_served(a) and is_lifetime_agg(a, lifetimes)]
-    for floor, la in group_lifetime_aggregations(lifetime, lifetimes):
-        out[online_lifetime_mv_name(project, view_name, floor)] = build_lifetime_rollup_select(
-            column_info, la, tiles, agg_params=agg_params, lifetime_start_secs=floor,
-            secondary_key=secondary_key,
-        )
-    # A window-series whose step == the tile interval gets ONE per-entity last-L snapshot MV (carrying every
-    # such series of this view) so its online read is a point lookup instead of the read-time single-scan;
-    # coarser-step / overlapping / array-valued series stay on the single-scan and add no MV here.
-    # Excluded for a SECONDARY-KEY view (same guard as the cumulative path above): the snapshot collapses to
-    # the join keys, but a secondary-key series is a per-key Map of arrays offline — so a secondary-key
-    # series stays on the read-time single-scan, which emits that Map.
-    if cumulative_ok:  # cumulative_ok == (secondary_key is None)
-        snapshot = build_series_snapshot_select(
-            column_info, aggs, tiles, aggregation_interval=aggregation_interval,
-            agg_params=agg_params, series=series,
-        )
-        if snapshot is not None:
-            out[online_series_mv_name(project, view_name)] = snapshot
-    return out
+    """The desired ``{mv_name: SELECT}`` for a tile view's online rollup MVs. The v2 serving split now lives
+    in ``TilePlan`` (``tile_plan.py``) — the single structured home shared by provisioning, reconcile, the
+    offline read, and serving-shard derivation, so they cannot drift. This stays as the stable entry point
+    that ``engine.py`` re-exports and the unit suite imports; it is a thin delegation to
+    ``TilePlan.online_mvs()`` and is byte-identical to its former hand-coded body (pinned by
+    ``test_tile_plan.test_online_mvs_equals_desired_online_mvs``)."""
+    return TilePlan.from_inputs(
+        project, view_name, column_info, aggs, tiles,
+        aggregation_interval=aggregation_interval, agg_params=agg_params, secondary_key=secondary_key,
+        offsets=offsets, lifetimes=lifetimes, series=series,
+    ).online_mvs()
