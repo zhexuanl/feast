@@ -327,5 +327,5 @@ def _desired_online_mvs(
     return TilePlan.from_inputs(
         project, view_name, column_info, aggs, tiles,
         aggregation_interval=aggregation_interval, agg_params=agg_params, secondary_key=secondary_key,
-        offsets=offsets, lifetimes=lifetimes, series=series,
+        offsets=offsets, lifetimes=lifetimes, series=series, filters=filters,
     ).online_mvs()

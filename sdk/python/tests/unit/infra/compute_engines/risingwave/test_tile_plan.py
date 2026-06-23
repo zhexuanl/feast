@@ -87,6 +87,20 @@ def test_filtered_aggregation_shares_one_tile_scan():
     assert "count_amount_f" in off and "AS debit_count" in off and "AS total_count" in off
 
 
+def test_desired_online_mvs_threads_filters_into_cumulative():
+    # regression: _desired_online_mvs is the provisioning/reconcile entry point and must thread `filters`
+    # into the plan, not just TilePlan.from_inputs. If it drops them, a filtered view provisions a
+    # cumulative MV WITHOUT the filtered partial while the read references it -> "column not found" at serve.
+    total = _agg("count", 1, "total_count")
+    debit = _agg("count", 1, "debit_count")
+    filters = {_rn(debit): "transaction_code = 'DEBIT'"}
+    mvs = _desired_online_mvs(PROJECT, VIEW, CI, [total, debit], TILES, aggregation_interval=INTERVAL,
+                              agg_params=None, secondary_key=None, offsets={}, lifetimes={}, series={},
+                              filters=filters)
+    cum_sql = next(s for n, s in mvs.items() if "_cum" in n)
+    assert "AS cum_count_amount," in cum_sql and "AS cum_count_amount_f" in cum_sql
+
+
 @pytest.mark.parametrize("flavor,builder", [("batch", build_batch_tile_select), ("streaming", build_streaming_tile_select)])
 def test_tiles_ddl_equals_builder(flavor, builder):
     aggs = [_agg("sum", 1), _agg("mean", 1)]
