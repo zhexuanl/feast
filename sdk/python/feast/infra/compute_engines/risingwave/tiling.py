@@ -9,6 +9,8 @@ a SELECT (that lives in ``sql_builders``). Depends only on ``feast.Aggregation``
 leaf carriers module; the SQL builders depend on it.
 """
 
+import hashlib
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from feast.aggregation import Aggregation
@@ -88,44 +90,100 @@ def _sequence_n(agg: Aggregation, agg_params: Optional[Dict[str, List[float]]]) 
     return int(params[0])
 
 
+def _filter_hash(canonical_predicate: str) -> str:
+    """A deterministic 8-hex digest of an ALREADY-canonicalized FILTER predicate, used as a filtered
+    partial's column-name suffix. Must be stable run-to-run: the reconcile catalog keys on the rendered
+    SELECT, so a non-deterministic name would needlessly re-materialize the MV. The predicate is
+    canonicalized upstream (by DataFusion, via the ``feast_rw_agg_filter`` carrier); we never re-parse it."""
+    return hashlib.sha1(canonical_predicate.encode("utf-8")).hexdigest()[:8]
+
+
+@dataclass(frozen=True)
+class Partial:
+    """A WINDOW-INDEPENDENT per-tile partial column — the atom of the tile model. ``function`` is the
+    PARTIAL-level family token (``sum``/``count``/``min``/``max``/``sumsq``/``distinct``, or a sequence fn),
+    ``column`` the source column, ``n`` the sequence top-n (shapes the slice + the name), ``filter`` an
+    optional canonical ``FILTER`` predicate (over static source columns).
+
+    ``column_name`` is the ONE namer every writer (the tiles MV) AND every reader (the recombines) use, so a
+    partial's stored name and every reference to it cannot drift — the invariant that makes the filtered
+    variant safe. With ``filter=None`` it returns the legacy bare name byte-identically (so existing views
+    emit unchanged SQL); a filter appends ``_f<hash>`` so total/DEBIT/QR partials on one column stay distinct.
+    """
+
+    function: str
+    column: str
+    n: Optional[int] = None
+    filter: Optional[str] = None
+
+    def column_name(self) -> str:
+        if self.function in _SEQUENCE_ORDER:
+            base = f"{self.function}_{self.column}_{self.n}"
+        elif self.function == "distinct":
+            base = f"distinct_{self.column}"
+        else:  # sum / count / min / max / sumsq
+            base = f"{self.function}_{self.column}"
+        return base if self.filter is None else f"{base}_f{_filter_hash(self.filter)}"
+
+    def _filter_clause(self, intrinsic: str = "") -> str:
+        # the user predicate (when set) is ANDed with any INTRINSIC partial filter (count_distinct's
+        # NOT NULL), so a filtered count_distinct would compose correctly; both absent => no FILTER clause.
+        preds = [p for p in (intrinsic, self.filter) if p]
+        return f" FILTER (WHERE {' AND '.join(preds)})" if preds else ""
+
+    def materialize_sql(self, ts_col: Optional[str] = None) -> str:
+        """The per-tile aggregate that builds this partial column (the value, no alias)."""
+        col, fn = self.column, self.function
+        if fn in _SEQUENCE_ORDER:
+            # the tile's OWN top-n ordered array (bounded); n is part of the partial.
+            ordered = f"array_agg({col} ORDER BY {ts_col} {_SEQUENCE_ORDER[fn]})"
+            if fn.endswith("_distinct"):
+                ordered = f"array_distinct({ordered})"
+            return f"({ordered})[1:{self.n}]{self._filter_clause()}"
+        if fn == "distinct":
+            # the tile's DISTINCT SET; NULLs filtered so the union+count matches count(distinct <col>).
+            return f"array_agg(DISTINCT {col}){self._filter_clause(f'{col} IS NOT NULL')}"
+        if fn == "sumsq":
+            return f"sum({col} * {col}){self._filter_clause()}"
+        return f"{fn}({col}){self._filter_clause()}"  # sum / count / min / max
+
+    @staticmethod
+    def from_aggregation(
+        agg: Aggregation,
+        ts_col: Optional[str] = None,
+        agg_params: Optional[Dict[str, List[float]]] = None,
+        filter: Optional[str] = None,
+    ) -> List["Partial"]:
+        """The window-independent partials one aggregation needs (the partial-aggregate IR decomposition):
+        additive functions need ONE partial; composite (mean/var/stddev) need the additive sub-partials that
+        merge across tiles; count_distinct stores the tile's distinct set; sequence stores the bounded
+        top-n. An optional ``filter`` rides every partial of a filtered aggregation."""
+        fn, col = agg.function, agg.column
+        if fn == "sum":
+            return [Partial("sum", col, filter=filter)]
+        if fn == "count":
+            return [Partial("count", col, filter=filter)]
+        if fn in {"min", "max"}:
+            return [Partial(fn, col, filter=filter)]
+        if fn in _SEQUENCE_ORDER:
+            return [Partial(fn, col, n=_sequence_n(agg, agg_params), filter=filter)]
+        if fn == "count_distinct":
+            return [Partial("distinct", col, filter=filter)]
+        partials = [Partial("sum", col, filter=filter), Partial("count", col, filter=filter)]
+        if fn in {"var_pop", "var_samp", "stddev_pop", "stddev_samp"}:
+            partials.append(Partial("sumsq", col, filter=filter))
+        return partials
+
+
 def _partials_for(
     agg: Aggregation,
     ts_col: Optional[str] = None,
     agg_params: Optional[Dict[str, List[float]]] = None,
 ) -> List[Tuple[str, str]]:
-    """The WINDOW-INDEPENDENT per-tile partial columns (name, SQL aggregate) one aggregation needs.
-    Named by (function-family, column) so multiple windows / functions on the same column share a
-    partial. Additive functions need ONE partial; composite (mean/var/stddev) need the additive
-    sub-partials that merge across tiles; count_distinct stores the tile's distinct set; sequence
-    aggregates store the tile's bounded top-n (``ts_col`` orders it, ``n`` from agg_params)."""
-    col, fn = agg.column, agg.function
-    if fn == "sum":
-        return [(f"sum_{col}", f"sum({col})")]
-    if fn == "count":
-        return [(f"count_{col}", f"count({col})")]
-    if fn in {"min", "max"}:
-        return [(f"{fn}_{col}", f"{fn}({col})")]
-    if fn in _SEQUENCE_ORDER:
-        # The tile's OWN top-n ordered array (bounded). n is part of the partial (the slice + the
-        # name), so last(3) and last(5) on one column are distinct partials.
-        n = _sequence_n(agg, agg_params)
-        ordered = f"array_agg({col} ORDER BY {ts_col} {_SEQUENCE_ORDER[fn]})"
-        if fn.endswith("_distinct"):
-            ordered = f"array_distinct({ordered})"
-        return [(f"{fn}_{col}_{n}", f"({ordered})[1:{n}]")]
-    if fn == "count_distinct":
-        # The tile's DISTINCT SET. FILTER out NULL so the union+count matches count(distinct <col>),
-        # which excludes NULL (RisingWave's array_agg(DISTINCT) would otherwise carry a NULL element).
-        return [
-            (
-                f"distinct_{col}",
-                f"array_agg(DISTINCT {col}) FILTER (WHERE {col} IS NOT NULL)",
-            )
-        ]
-    partials = [(f"sum_{col}", f"sum({col})"), (f"count_{col}", f"count({col})")]
-    if fn in {"var_pop", "var_samp", "stddev_pop", "stddev_samp"}:
-        partials.append((f"sumsq_{col}", f"sum({col} * {col})"))
-    return partials
+    """The WINDOW-INDEPENDENT per-tile partial columns (name, SQL aggregate) one aggregation needs — a thin
+    shim over ``Partial.from_aggregation`` (the single namer/renderer). Named by (function-family, column)
+    so multiple windows / functions on the same column share a partial."""
+    return [(p.column_name(), p.materialize_sql(ts_col)) for p in Partial.from_aggregation(agg, ts_col, agg_params)]
 
 
 def _view_partials(
@@ -134,12 +192,19 @@ def _view_partials(
     agg_params: Optional[Dict[str, List[float]]] = None,
 ) -> List[Tuple[str, str]]:
     """The deduped union of every aggregation's window-independent partials = the tiles MV's partial
-    columns. ``setdefault`` keeps one entry per partial name (the materialize-SQL is identical for a
-    given partial name, so dedup is safe — a sequence partial's name carries its n + column)."""
+    columns. Dedup is by partial NAME, and is ASSERT-EQUAL: two aggregations may share a partial only if
+    they render the IDENTICAL aggregate SQL for that name. A same-name/different-SQL clash raises rather
+    than silently dropping one — the collision a filtered partial would cause if its name did not carry the
+    predicate hash (``Partial.column_name``). Insertion order is preserved (the tiles MV column order)."""
     out: dict = {}
     for a in aggregations:
         for name, sql in _partials_for(a, ts_col, agg_params):
-            out.setdefault(name, sql)
+            if name in out and out[name] != sql:
+                raise ValueError(
+                    f"tile partial name collision: {name!r} maps to two different aggregates "
+                    f"({out[name]!r} vs {sql!r}) — a filtered partial must carry its predicate hash."
+                )
+            out[name] = sql
     return list(out.items())
 
 
@@ -204,7 +269,7 @@ def _recombine_expr(
     col, fn = agg.column, agg.function
 
     def merged(kind: str, op: str = "sum") -> str:
-        p = f"{prefix}{kind}_{col}"
+        p = f"{prefix}{Partial(kind, col).column_name()}"
         inner = f"CASE WHEN {partial_filter} THEN {p} END" if partial_filter else p
         return f"{op}({inner})"
 
@@ -227,7 +292,7 @@ def _recombine_expr(
         # ordered within the tile, so the flattened order is the global event-time order; the _distinct
         # variants dedup again across tiles (a value may repeat in two tiles).
         n = _sequence_n(agg, agg_params)
-        p = f"{prefix}{fn}_{col}_{n}"
+        p = f"{prefix}{Partial(fn, col, n=n).column_name()}"
         inner = f"CASE WHEN {partial_filter} THEN {p} END" if partial_filter else p
         flat = f"array_flatten(array_agg({inner} ORDER BY {prefix}tile_end {_SEQUENCE_ORDER[fn]}))"
         if fn.endswith("_distinct"):
@@ -264,9 +329,12 @@ def _cumulative_recombine_expr(
 
     def delta(kind: str) -> str:
         # COALESCE each cumulative to 0: a boundary asof that finds NO tile (the entity's history begins
-        # inside the window, or there are no tiles at all) yields a NULL cumulative = 0 contribution.
-        hi_c = f"COALESCE({hi}.cum_{kind}_{col}, 0)"
-        return hi_c if lo is None else f"({hi_c} - COALESCE({lo}.cum_{kind}_{col}, 0))"
+        # inside the window, or there are no tiles at all) yields a NULL cumulative = 0 contribution. The
+        # cumulative column is ``cum_`` + the partial's column_name(), so a filtered partial's hashed name
+        # flows through here too (the single-namer invariant).
+        name = Partial(kind, col).column_name()
+        hi_c = f"COALESCE({hi}.cum_{name}, 0)"
+        return hi_c if lo is None else f"({hi_c} - COALESCE({lo}.cum_{name}, 0))"
 
     hi_n = f"COALESCE({hi}.cum_ntiles, 0)"
     dntiles = hi_n if lo is None else f"({hi_n} - COALESCE({lo}.cum_ntiles, 0))"
@@ -357,11 +425,16 @@ def _tile_value_expr(
     count_distinct/sequence are array-valued and not snapshotted."""
     col, fn = agg.column, agg.function
     if fn in {"sum", "count", "min", "max"}:
-        return f"{prefix}{fn}_{col}"
+        return f"{prefix}{Partial(fn, col).column_name()}"
     # mean/var/stddev from this ONE tile's partials, via the shared finalize home — the merge collapsed to
     # identity (no cross-tile aggregate), so it equals _recombine_expr over a single tile by construction.
-    sumsq = "" if fn == "mean" else f"{prefix}sumsq_{col}"
-    return _composite_finalize(fn, sm=f"{prefix}sum_{col}", cnt=f"{prefix}count_{col}", sumsq=sumsq)
+    sumsq = "" if fn == "mean" else f"{prefix}{Partial('sumsq', col).column_name()}"
+    return _composite_finalize(
+        fn,
+        sm=f"{prefix}{Partial('sum', col).column_name()}",
+        cnt=f"{prefix}{Partial('count', col).column_name()}",
+        sumsq=sumsq,
+    )
 
 
 def snapshot_series_aggs(

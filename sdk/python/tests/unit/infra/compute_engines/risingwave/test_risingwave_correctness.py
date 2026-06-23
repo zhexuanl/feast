@@ -3396,3 +3396,66 @@ def test_execute_ddl_reraises_a_permanent_error_without_retrying():
     with pytest.raises(ValueError):
         _execute_ddl(cur, "SELCT 1", backoff_ms=0)
     assert cur.calls == 1  # a permanent (non-transient) error is raised on the first attempt, no retry
+
+
+def test_partial_column_name_matches_legacy_names():
+    # the Partial atom is the single namer; for filter=None it MUST reproduce the legacy bare names
+    # byte-identically (so the tile-plan refactor changes structure, not emitted SQL).
+    from feast.infra.compute_engines.risingwave.tiling import Partial
+
+    assert Partial("sum", "amount").column_name() == "sum_amount"
+    assert Partial("count", "amount").column_name() == "count_amount"
+    assert Partial("min", "amount").column_name() == "min_amount"
+    assert Partial("max", "amount").column_name() == "max_amount"
+    assert Partial("sumsq", "amount").column_name() == "sumsq_amount"
+    assert Partial("distinct", "amount").column_name() == "distinct_amount"
+    assert Partial("last", "amount", n=5).column_name() == "last_amount_5"
+    # a filtered partial appends a stable hash suffix, distinct from the unfiltered name
+    filtered = Partial("count", "amount", filter="transaction_code = 'DEBIT'")
+    assert filtered.column_name().startswith("count_amount_f")
+    assert filtered.column_name() != "count_amount"
+    assert filtered.column_name() == Partial("count", "amount", filter="transaction_code = 'DEBIT'").column_name()
+
+
+def test_partials_for_pairs_unchanged():
+    # _partials_for is now a shim over Partial; the (name, sql) pairs must be exactly the legacy ones.
+    import datetime as dt
+
+    from feast.aggregation import Aggregation
+    from feast.infra.compute_engines.risingwave.tiling import _partials_for
+
+    def a(fn):
+        return Aggregation(column="amount", function=fn, time_window=dt.timedelta(days=1))
+
+    assert _partials_for(a("sum")) == [("sum_amount", "sum(amount)")]
+    assert _partials_for(a("count")) == [("count_amount", "count(amount)")]
+    assert _partials_for(a("min")) == [("min_amount", "min(amount)")]
+    assert _partials_for(a("mean")) == [("sum_amount", "sum(amount)"), ("count_amount", "count(amount)")]
+    assert _partials_for(a("var_pop")) == [
+        ("sum_amount", "sum(amount)"),
+        ("count_amount", "count(amount)"),
+        ("sumsq_amount", "sum(amount * amount)"),
+    ]
+    assert _partials_for(a("count_distinct")) == [
+        ("distinct_amount", "array_agg(DISTINCT amount) FILTER (WHERE amount IS NOT NULL)")
+    ]
+
+
+def test_view_partials_raises_on_name_collision(monkeypatch):
+    # the assert-equal dedup: if two aggregations rendered the SAME partial name with DIFFERENT SQL
+    # (what a filtered partial would do without its predicate-hash suffix), _view_partials must raise,
+    # not silently drop one.
+    import datetime as dt
+
+    import pytest
+
+    from feast.aggregation import Aggregation
+    import feast.infra.compute_engines.risingwave.tiling as tiling
+
+    monkeypatch.setattr(tiling, "_partials_for", lambda a, *args, **kw: [("count_amount", f"count({a.function})")])
+    aggs = [
+        Aggregation(column="amount", function="count", time_window=dt.timedelta(days=1)),
+        Aggregation(column="amount", function="sum", time_window=dt.timedelta(days=1)),
+    ]
+    with pytest.raises(ValueError, match="collision"):
+        tiling._view_partials(aggs)
