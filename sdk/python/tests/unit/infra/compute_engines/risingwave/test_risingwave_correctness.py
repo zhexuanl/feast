@@ -81,6 +81,7 @@ from feast.infra.compute_engines.risingwave.nodes import (
     encode_agg_lifetime,
     encode_agg_offsets,
     encode_agg_params,
+    encode_dedup_source,
     encode_secondary_key,
     group_aggregations_by_window,
     group_aggregations_by_window_offset,
@@ -642,6 +643,84 @@ def test_sequence_tile_rollup_flattens_topn_in_tile_order_then_slices():
         _column_info(), [agg], "tiles", aggregation_interval=timedelta(days=1), agg_params={out: [3]}
     )
     assert f"(array_flatten(array_agg(last_amount_3 ORDER BY tile_end DESC)))[1:3] AS {out}" in sql
+
+
+def _column_info_created_ts(feature_cols=("amount_sum_3600s",)):
+    return ColumnInfo(
+        join_keys=["user_id"],
+        feature_cols=list(feature_cols),
+        ts_col="event_ts",
+        created_ts_col="created_ts",
+        field_mapping=None,
+    )
+
+
+@pytest.mark.parametrize("function,order", [("last", "DESC"), ("first", "ASC")])
+def test_sequence_tie_break_uses_created_ts_when_present(function, order):
+    # Equal-event-time rows must order DETERMINISTICALLY, and parallel sequence columns (e.g. event_times
+    # + event_names off the same rows) must stay positionally aligned. The array_agg tie-breaks on the
+    # created timestamp — the SAME (event_ts, created_ts) total order build_latest_row_select uses — on
+    # BOTH the tile partial and the plain-path build. Only emitted when the source defines a created column.
+    agg = _agg(function, 2592000)
+    out = agg.resolved_name(agg.time_window)
+    expected = f"array_agg(amount ORDER BY event_ts {order}, created_ts {order})"
+    tile = build_batch_tile_select(
+        _column_info_created_ts(), [agg], "src",
+        aggregation_interval=timedelta(days=1), agg_params={out: [3]},
+    )
+    assert expected in tile
+    plain = build_windowed_agg_select(
+        _column_info_created_ts(), [agg], "src",
+        source_is_retractable=False, emit_on_close=True, agg_params={out: [3]},
+    )
+    assert expected in plain
+
+
+def test_sequence_without_created_ts_orders_by_event_time_only():
+    # No created column -> the tie-break degrades to event-time only, byte-identical to the pre-tie-break
+    # SQL, so existing (created-less) sources re-materialize nothing.
+    agg = _agg("last", 2592000)
+    out = agg.resolved_name(agg.time_window)
+    tile = build_batch_tile_select(
+        _column_info(), [agg], "src", aggregation_interval=timedelta(days=1), agg_params={out: [3]}
+    )
+    assert "array_agg(amount ORDER BY event_ts DESC)" in tile
+    assert "created_ts" not in tile
+
+
+@pytest.mark.parametrize("bad_n", [0, -1, 1001])
+def test_sequence_n_out_of_range_is_rejected(bad_n):
+    # n is bounded to [1, 1000] (industry-parity + a per-tile array-width safety cap). The single _sequence_n
+    # chokepoint enforces it, so BOTH the tile partial and the plain path reject out-of-range n.
+    agg = _agg("last", 2592000)
+    out = agg.resolved_name(agg.time_window)
+    with pytest.raises(ValueError, match=r"n in \[1, 1000\]"):
+        build_batch_tile_select(
+            _column_info(), [agg], "src",
+            aggregation_interval=timedelta(days=1), agg_params={out: [bad_n]},
+        )
+    with pytest.raises(ValueError, match=r"n in \[1, 1000\]"):
+        build_windowed_agg_select(
+            _column_info(), [agg], "src",
+            source_is_retractable=False, emit_on_close=True, agg_params={out: [bad_n]},
+        )
+
+
+def test_last_distinct_tile_rollup_dedups_across_tiles_then_slices():
+    # last_distinct recombine: concat the per-tile distinct top-n arrays in tile_end order, then dedup
+    # AGAIN across tiles (a value may recur in two tiles) before slicing to n -> the n most-recent DISTINCT
+    # across the window. The per-tile partial is already distinct; the cross-tile array_distinct is the
+    # load-bearing dedup this test pins (the live counterpart is spike/verify_sequence_tiles.py).
+    agg = _agg("last_distinct", 2592000)
+    out = agg.resolved_name(agg.time_window)
+    sql = build_online_rollup_select(
+        _column_info(), [agg], "tiles", aggregation_interval=timedelta(days=1), agg_params={out: [3]}
+    )
+    expected = (
+        "(array_distinct(array_flatten(array_agg("
+        f"last_distinct_amount_3 ORDER BY tile_end DESC))))[1:3] AS {out}"
+    )
+    assert expected in sql
 
 
 def test_count_distinct_tile_partial_is_nullsafe_distinct_set():
@@ -1625,6 +1704,29 @@ def _batch_view(aggs, interval_secs=86400, name="user_txn_daily"):
         features=[SimpleNamespace(name=a.resolved_name(a.time_window)) for a in aggs],
         offline=True,
     )
+
+
+def test_build_batch_tile_dedup_source_wraps_distinct():
+    # A cumulative / duplicate-row source: dedup_source wraps the relation in SELECT DISTINCT * so identical
+    # rows collapse before tiling (no double-count of an invertible aggregate). Default off is byte-identical.
+    ci, agg, iv = _column_info(), _agg("sum", 86400), timedelta(seconds=86400)
+    plain = build_batch_tile_select(ci, [agg], "src", aggregation_interval=iv)
+    deduped = build_batch_tile_select(ci, [agg], "src", aggregation_interval=iv, dedup_source=True)
+    assert "FROM src GROUP BY" in plain and "DISTINCT" not in plain  # default: untouched
+    assert "FROM (SELECT DISTINCT * FROM src) AS _feast_dedup GROUP BY" in deduped
+
+
+def test_provision_batch_threads_dedup_source_from_carrier():
+    # The engine reads the dedup carrier off the view and threads it into the tiles MV build.
+    agg = _agg("sum", window_seconds=259200)
+    view = _batch_view([agg])
+    view.tags = encode_dedup_source(True)
+    tiles_sql = next(s for s in _engine()._provision_batch_ddl("proj", view) if "GROUP BY" in s)
+    assert "SELECT DISTINCT * FROM" in tiles_sql
+    # an unflagged view (no carrier) is byte-identical — no dedup wrapper
+    plain_view = _batch_view([agg])
+    plain_tiles = next(s for s in _engine()._provision_batch_ddl("proj", plain_view) if "GROUP BY" in s)
+    assert "DISTINCT" not in plain_tiles
 
 
 def test_provision_batch_emits_source_tiles_mv_and_online_rollup_mv():

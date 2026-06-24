@@ -146,6 +146,26 @@ def view_secondary_key(view) -> Optional[str]:
     return (getattr(view, "tags", None) or {}).get(SECONDARY_KEY_TAG) or None
 
 
+# A batch tile source flagged as possibly containing DUPLICATE rows for the same event — a history-restating
+# ("cumulative") source, an at-least-once backfill, or reprocessed partitions. When set, the batch tile build
+# dedups identical source rows before aggregating so an INVERTIBLE aggregate is not double-counted (mirrors
+# Chronon's EventSource.isCumulative guard). Absent => the source is treated as append-only (no dedup, the
+# byte-identical default). Batch-tile only — a streaming source is append-only event-by-event.
+DEDUP_SOURCE_TAG = "feast_rw_dedup_source"
+
+
+def encode_dedup_source(dedup: bool) -> Dict[str, str]:
+    """The view-tags fragment marking the batch source for identical-row dedup, or ``{}`` when off (so an
+    append-only view's tags are untouched). The inverse of ``view_dedup_source``."""
+    return {DEDUP_SOURCE_TAG: "1"} if dedup else {}
+
+
+def view_dedup_source(view) -> bool:
+    """Whether the view's batch tile source should be deduplicated before tiling. The inverse of
+    ``encode_dedup_source``."""
+    return bool((getattr(view, "tags", None) or {}).get(DEDUP_SOURCE_TAG))
+
+
 # The per-aggregation window-SERIES geometry: an aggregation fanned into a series of trailing windows,
 # emitted as one ARRAY-valued feature (e.g. 24 hourly sums). feast.Aggregation carries a single window,
 # not a series, so the geometry rides this engine-owned tag — a carrier parallel to the offset/param tags

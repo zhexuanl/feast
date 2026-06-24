@@ -64,6 +64,7 @@ from feast.infra.compute_engines.risingwave.nodes import (
     view_agg_offsets,
     view_agg_params,
     view_agg_series,
+    view_dedup_source,
     view_secondary_key,
 )
 from feast.infra.offline_stores.offline_store import OfflineStore
@@ -501,7 +502,7 @@ class RisingWaveComputeEngine(ComputeEngine):
                 tiles,
                 build_batch_tile_select(
                     column_info, aggs, src, aggregation_interval=interval, agg_params=params,
-                    secondary_key=secondary_key, filters=filters,
+                    secondary_key=secondary_key, filters=filters, dedup_source=view_dedup_source(view),
                 ),
             ),
         ]
@@ -613,7 +614,7 @@ class RisingWaveComputeEngine(ComputeEngine):
         tiles = tiles_name(project, view.name)
         desired_tiles = build_batch_tile_select(
             column_info, aggs, src, aggregation_interval=interval, agg_params=params,
-            secondary_key=secondary_key, filters=filters,
+            secondary_key=secondary_key, filters=filters, dedup_source=view_dedup_source(view),
         )
         desired_online = _desired_online_mvs(
             project, view.name, column_info, aggs, tiles,

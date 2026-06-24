@@ -44,6 +44,7 @@ from feast.infra.compute_engines.risingwave.aggregation_carriers import (
     encode_agg_offsets,
     encode_agg_params,
     encode_agg_series,
+    encode_dedup_source,
     encode_secondary_key,
     group_aggregations_by_window,
     group_aggregations_by_window_offset,
@@ -57,6 +58,7 @@ from feast.infra.compute_engines.risingwave.aggregation_carriers import (
     view_agg_offsets,
     view_agg_params,
     view_agg_series,
+    view_dedup_source,
     view_secondary_key,
 )
 from feast.infra.compute_engines.risingwave.names import (
@@ -121,6 +123,7 @@ __all__ = [
     "encode_agg_offsets",
     "encode_agg_params",
     "encode_agg_series",
+    "encode_dedup_source",
     "encode_secondary_key",
     "group_aggregations_by_window",
     "group_aggregations_by_window_offset",
@@ -134,6 +137,7 @@ __all__ = [
     "view_agg_offsets",
     "view_agg_params",
     "view_agg_series",
+    "view_dedup_source",
     "view_secondary_key",
     # tiling
     "_assert_tile_supported",

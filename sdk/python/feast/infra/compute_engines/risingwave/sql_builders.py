@@ -29,6 +29,7 @@ from feast.infra.compute_engines.risingwave.tiling import (
     _assert_tile_supported,
     _cumulative_partials,
     _cumulative_recombine_expr,
+    _sequence_n,
     _series_recombine,
     _tile_recombine,
     _tile_value_expr,
@@ -120,6 +121,7 @@ def _agg_expr(
     agg: Aggregation,
     agg_params: Optional[Dict[str, List[float]]] = None,
     ts_col: Optional[str] = None,
+    created_ts_col: Optional[str] = None,
 ) -> str:
     # Output column == resolved_name(time_window) so the online MV and the offline
     # sink emit byte-identical column names — no online/offline column-name skew
@@ -128,21 +130,18 @@ def _agg_expr(
     if agg.function == "count_distinct":
         return f"count(distinct {agg.column}) AS {out}"
     if agg.function in _SEQUENCE_ORDER:
-        # Array-valued: the n earliest/most-recent values, ordered by event time. n rides in
-        # agg_params keyed by resolved_name. CAVEAT: array_agg materializes the WHOLE window's
-        # values per key before the [1:n] slice, so MV state grows with the window's event count
-        # (unbounded for high-cardinality windows) — the bounded tile recombine is a later delivery.
-        params = (agg_params or {}).get(out)
-        if not params:
-            raise ValueError(
-                f"{agg.function} on {agg.column!r} needs an n parameter (the number of values to "
-                f"keep); none was provided. n rides in agg_params keyed by the aggregation's "
-                f"resolved name ({out!r})."
-            )
-        n = int(params[0])
-        ordered = (
-            f"array_agg({agg.column} ORDER BY {ts_col} {_SEQUENCE_ORDER[agg.function]})"
+        # Array-valued: the n earliest/most-recent values, ordered by event time (n via the shared
+        # _sequence_n chokepoint, so the [1, MAX] bound is enforced here too). Tie-break on the created
+        # timestamp when present — same (event_ts, created_ts) order as the tile partial and
+        # build_latest_row_select — so equal-ts rows are deterministic and parallel arrays stay aligned.
+        # CAVEAT: this plain path materializes the WHOLE window's values per key before the [1:n] slice,
+        # so MV state grows with the window's event count (unbounded for high-cardinality windows) — the
+        # BOUNDED tile recombine (build_*_tile_select + the per-tile [1:n] partial) is the served path.
+        n = _sequence_n(agg, agg_params)
+        order = ", ".join(
+            f"{c} {_SEQUENCE_ORDER[agg.function]}" for c in (ts_col, created_ts_col) if c
         )
+        ordered = f"array_agg({agg.column} ORDER BY {order})"
         if agg.function.endswith("_distinct"):
             ordered = f"array_distinct({ordered})"
         return f"({ordered})[1:{n}] AS {out}"
@@ -246,7 +245,13 @@ def build_windowed_agg_select(
 
     keys = ", ".join(column_info.join_keys_columns)
     exprs = ", ".join(
-        _agg_expr(a, agg_params, column_info.timestamp_column) for a in aggregations
+        _agg_expr(
+            a,
+            agg_params,
+            column_info.timestamp_column,
+            column_info.created_timestamp_column,
+        )
+        for a in aggregations
     )
     windowed = aggregations[0].time_window is not None
     src = _window_relation(aggregations, column_info.timestamp_column, relation)
@@ -589,7 +594,11 @@ def _tile_partials_projection(
     Includes the partial-name vs join-key clash guard (a bare ``{family}_{col}`` partial that equals an
     entity column would make the tiles MV have two identically-named columns, which RisingWave rejects)."""
     view_partials = _view_partials(
-        aggregations, column_info.timestamp_column, agg_params, filters
+        aggregations,
+        column_info.timestamp_column,
+        agg_params,
+        filters,
+        created_ts_col=column_info.created_timestamp_column,
     )
     key_clash = sorted(set(column_info.join_keys_columns) & {name for (name, _) in view_partials})
     if key_clash:
@@ -609,13 +618,22 @@ def build_batch_tile_select(
     agg_params: Optional[Dict[str, List[float]]] = None,
     secondary_key: Optional[str] = None,
     filters: Optional[Dict[str, str]] = None,
+    dedup_source: bool = False,
 ) -> str:
     """Tile materialization for a BATCH feature view: one PARTIAL aggregate per (entity, tile),
     where a tile spans ``[tile_start, tile_start + aggregation_interval)`` and is stamped by
     ``tile_end`` (its event-time upper boundary). A plain batch ``GROUP BY date_trunc`` over a batch
     relation (e.g. a RisingWave Iceberg source) — NOT the streaming TUMBLE path. The additive
     partial is the aggregate itself, named by the final feature's ``resolved_name`` so tile ->
-    rollup -> serve carry one column name. Rolled up at retrieval by ``build_tile_rollup_select``."""
+    rollup -> serve carry one column name. Rolled up at retrieval by ``build_tile_rollup_select``.
+
+    ``dedup_source`` guards an INVERTIBLE aggregate (sum/count/...) against double-counting when the source
+    can contain DUPLICATE rows for the same event — a history-restating ("cumulative") source, an
+    at-least-once backfill, or reprocessed partitions. When set, the source is wrapped in ``SELECT DISTINCT *``
+    so identical rows collapse to one before tiling. Opt-in (default off keeps the SELECT byte-identical)
+    because it is only correct when duplicates are EXACT copies — a value-restatement (same key, changed value)
+    is a retractable/upsert source, handled separately. A RisingWave Iceberg source already reads the current
+    snapshot, so this is needed only for genuinely duplicated input rows, not for snapshot-style restatement."""
     if not aggregations:
         raise ValueError("build_batch_tile_select requires at least one aggregation")
     _assert_tile_supported(aggregations)
@@ -628,9 +646,10 @@ def build_batch_tile_select(
     # secondary_key, tile_end), collapsed into a per-key Map at rollup.
     sk_sel = f'"{secondary_key}", ' if secondary_key else ""
     sk_grp = f', "{secondary_key}"' if secondary_key else ""
+    source = f"(SELECT DISTINCT * FROM {relation}) AS _feast_dedup" if dedup_source else relation
     return (
         f"SELECT {keys}, {sk_sel}{bucket} + INTERVAL '1 {unit}' AS tile_end, {partials} "
-        f"FROM {relation} GROUP BY {keys}{sk_grp}, {bucket}"
+        f"FROM {source} GROUP BY {keys}{sk_grp}, {bucket}"
     )
 
 
