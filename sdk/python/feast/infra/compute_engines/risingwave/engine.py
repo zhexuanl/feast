@@ -105,6 +105,7 @@ from feast.infra.compute_engines.risingwave.reconcile import (
     _deployed_mv_select,
     _deployed_source_columns,
     _deployed_source_table,
+    _desired_filter_source_columns,
     _desired_kafka_source_opts,
     _desired_passthrough_columns,
     _existing_online_mv_names,
@@ -701,20 +702,22 @@ class RisingWaveComputeEngine(ComputeEngine):
         # full re-materialize — which already drops+recreates the source below — else the tiles keep reading
         # the stale topic, or admit late events under the old watermark, diverging online from offline.
         deployed_opts = _deployed_kafka_source_opts(cur, src)
-        source_changed = (
+        opts_changed = (
             deployed_opts is not None
             and deployed_opts != _desired_kafka_source_opts(view.stream_source)
         )
-        # KNOWN LIMITATION: a change to ONLY the declared TYPE of a FILTER-referenced source column
-        # (view_agg_filter_cols) — with no change to the predicate, window, topic, or watermark — is not
-        # detected here, so the live CREATE SOURCE keeps the stale type until an unrelated change forces a
-        # rebuild. The predicate text and tiles SELECT depend on the column NAME, not its type, so a type-only
-        # edit leaves the desired SELECT byte-identical and this reconcile a no-op. It is NOT diffed against
-        # the catalog (unlike the passthrough path's _deployed_source_columns check) because the source mixes
-        # carrier-typed filter columns with PLACEHOLDER-typed entity/agg-input/timestamp columns (ddl.py
-        # _source_ddl), so a catalog comparison would need to replicate that split to avoid spurious full
-        # rebuilds. Most type edits are benign (varchar<->char(n) compare identically); a decode-altering edit
-        # (e.g. double->int) is the rare harmful case. Deferred over the rebuild-on-false-positive risk.
+        # A type change to a FILTER-referenced source column shows in NO MV SELECT (the predicate references
+        # the column by name, not type), so the tiles SELECT stays byte-identical and the plan diff is a no-op
+        # — diff the deployed filter-column types against the desired and force a rebuild on a difference.
+        # Scoped to the carrier-declared filter columns (_desired_filter_source_columns), so the
+        # placeholder-typed entity/agg-input/timestamp columns never trigger a spurious rebuild; an
+        # unrecognized carried type is skipped. An unfiltered view carries none, so this is a no-op for it.
+        deployed_cols = _deployed_source_columns(cur, src)
+        filter_cols_changed = deployed_cols is not None and any(
+            deployed_cols.get(col) != canon
+            for col, canon in _desired_filter_source_columns(view).items()
+        )
+        source_changed = opts_changed or filter_cols_changed
         if source_changed:
             full_rebuild, drops, creates = True, list(deployed_online), []
         for name in drops:  # online MVs (dependents) first

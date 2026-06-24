@@ -11,7 +11,14 @@ import re
 from typing import Optional
 
 from feast.data_source import KafkaSource
-from feast.infra.compute_engines.risingwave.engine_config import _canonical_type
+from feast.infra.compute_engines.risingwave.aggregation_carriers import (
+    view_agg_filter_cols,
+    view_secondary_key,
+)
+from feast.infra.compute_engines.risingwave.engine_config import (
+    _RW_CANONICAL_TYPE,
+    _canonical_type,
+)
 from feast.infra.compute_engines.risingwave.names import base_name
 
 
@@ -150,6 +157,47 @@ def _desired_passthrough_columns(view) -> dict:
         cols.setdefault(feature.name, _canonical_type(getattr(feature, "dtype", "")))
     cols.setdefault(source.timestamp_field, "timestamp without time zone")
     return cols
+
+
+# A FILTER column's carried type is a schema_json spelling declared verbatim on the source (ddl.py
+# _source_ddl). Map it to the _RW_CANONICAL_TYPE CREATE-clause key so it canonicalizes to the form
+# information_schema reports. An unrecognized spelling maps to None and is SKIPPED by the reconcile diff
+# below — a conservative no-op, never a spurious rebuild.
+_SCHEMA_JSON_TO_CREATE_TYPE = {
+    "varchar": "VARCHAR", "string": "VARCHAR",
+    "double": "DOUBLE PRECISION", "double precision": "DOUBLE PRECISION", "float8": "DOUBLE PRECISION",
+    "real": "REAL", "float4": "REAL",
+    "bigint": "BIGINT", "int8": "BIGINT",
+    "int": "INT", "integer": "INT", "int4": "INT",
+    "boolean": "BOOLEAN", "bool": "BOOLEAN",
+    "timestamp": "TIMESTAMP",
+    "bytea": "BYTEA",
+}
+
+
+def _desired_filter_source_columns(view) -> dict:
+    """The desired ``{column: canonical SQL type}`` for the FILTER-referenced columns a streaming Kafka source
+    declares FROM THE FILTER CARRIER — ``view_agg_filter_cols`` MINUS the columns the source already declares
+    as a join key / aggregation input / secondary key / timestamp (those carry their own or placeholder types
+    and are out of scope here). MIRRORS the filter-column set ``_source_ddl`` declares (ddl.py) — kept in sync
+    with it. A column whose carried type spelling is unrecognized is omitted, so the reconcile skips it rather
+    than forcing a spurious rebuild. Empty for an unfiltered view, so the reconcile diff is a no-op there."""
+    source = view.stream_source
+    declared = {f.name for f in view.entity_columns}
+    declared.update(a.column for a in view.aggregations if a.column)
+    sk = view_secondary_key(view)
+    if sk:
+        declared.add(sk)
+    declared.add(source.timestamp_field)
+    out: dict = {}
+    for col, schema_json_type in view_agg_filter_cols(view).items():
+        if col in declared:
+            continue
+        key = _SCHEMA_JSON_TO_CREATE_TYPE.get(str(schema_json_type).strip().lower())
+        canon = _RW_CANONICAL_TYPE.get(key) if key is not None else None
+        if canon is not None:
+            out[col] = canon
+    return out
 
 
 def _norm_sql(sql):

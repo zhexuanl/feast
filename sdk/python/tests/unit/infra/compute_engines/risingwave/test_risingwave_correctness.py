@@ -2015,20 +2015,25 @@ class _TileReconcileCur:
     => the MV does not exist. Also answers the rw_sources source-definition lookup (for
     ``_deployed_kafka_source_opts``) with ``source_def``; source_def=None => the source row is absent."""
 
-    def __init__(self, deployed, source_def=None):
+    def __init__(self, deployed, source_def=None, source_cols=None):
         self.executed = []
         self._deployed = deployed
         self._source_def = source_def
+        self._source_cols = source_cols  # information_schema.columns rows for the source (filter-col diff)
         self._name = None
         self._is_source = False
+        self._cols_query = False
 
     def execute(self, sql, params=None):
         self.executed.append(sql)
+        self._cols_query = "information_schema.columns" in sql
         if sql.startswith("SELECT definition"):
             self._is_source = "rw_sources" in sql
             self._name = params[0]
 
     def fetchall(self):
+        if self._cols_query:  # _deployed_source_columns: the source's (column, canonical type) rows
+            return list(self._source_cols) if self._source_cols else []
         return [(name,) for name in self._deployed]  # all deployed MV names (tiles + per-window online)
 
     def fetchone(self):
@@ -2140,6 +2145,49 @@ def test_reconcile_streaming_tile_full_rebuild_when_source_changed():
     creates = [s for s in cur.executed if s.startswith("CREATE MATERIALIZED VIEW")]
     assert len(creates) == 3  # tiles + both per-window online MVs re-created
     assert any(s.startswith("CREATE SOURCE") for s in cur.executed)  # the source is re-created
+
+
+def _filtered_streaming_tile_view():
+    # total + DEBIT counts (both invertible -> cumulative MV); the DEBIT filter references transaction_code,
+    # a raw column declared on the CREATE SOURCE from the filter-cols carrier (typed varchar).
+    debit = Aggregation(
+        column="amount", function="count", time_window=timedelta(seconds=259200), name="debit_count"
+    )
+    view = _stream_tile_view(_kafka_source(watermark=True), [_agg("count", 259200), debit], interval_secs=86400)
+    debit_rn = debit.resolved_name(debit.time_window)
+    view.tags = {
+        **encode_agg_filters({debit_rn: "transaction_code = 'DEBIT'"}),
+        **encode_agg_filter_cols({"transaction_code": "varchar"}),
+    }
+    return view
+
+
+def test_reconcile_streaming_tile_rebuilds_on_filter_column_type_change():
+    # A type-only change to a FILTER-referenced source column shows in NO MV SELECT (the predicate references
+    # the column by name, not type), so the tiles/online MVs are unchanged; it is caught from the source
+    # catalog (information_schema) and forces a full rebuild so the live CREATE SOURCE picks up the new type.
+    eng = _engine()
+    view = _filtered_streaming_tile_view()
+    deployed = _deployed_from_provision_ddl(eng._provision_streaming_tile_ddl("proj", view))
+    # the deployed source declares transaction_code as a STALE type (bigint) vs the desired varchar
+    stale_cols = [("transaction_code", "bigint")]
+    cur = _TileReconcileCur(deployed, source_def=_rendered_kafka_source_def(), source_cols=stale_cols)
+    eng._reconcile_streaming_tile_view(cur, "proj", view)
+    assert 'DROP SOURCE IF EXISTS "proj_user_txn_src"' in cur.executed  # rebuilt to pick up the new type
+    assert any(s.startswith("CREATE SOURCE") for s in cur.executed)
+
+
+def test_reconcile_streaming_tile_noop_when_filter_column_type_matches():
+    # Same filtered view; the deployed source reports transaction_code in its canonical form (varchar ->
+    # "character varying"), matching the desired -> NO spurious rebuild (the placeholder-vs-carrier mismatch
+    # trap is avoided by scoping the diff to the carrier-declared filter columns only).
+    eng = _engine()
+    view = _filtered_streaming_tile_view()
+    deployed = _deployed_from_provision_ddl(eng._provision_streaming_tile_ddl("proj", view))
+    matching_cols = [("transaction_code", "character varying")]
+    cur = _TileReconcileCur(deployed, source_def=_rendered_kafka_source_def(), source_cols=matching_cols)
+    eng._reconcile_streaming_tile_view(cur, "proj", view)
+    assert not any(s.startswith(("DROP", "CREATE")) for s in cur.executed)  # only catalog SELECTs ran
 
 
 def test_multi_window_streaming_tile_would_fail_the_plain_stream_path():
