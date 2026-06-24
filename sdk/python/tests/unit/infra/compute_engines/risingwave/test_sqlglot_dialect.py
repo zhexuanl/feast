@@ -17,17 +17,31 @@ from feast.aggregation import Aggregation
 from feast.infra.compute_engines.dag.context import ColumnInfo
 from feast.infra.compute_engines.risingwave.sql_builders import (
     build_batch_tile_select,
+    build_cumulative_read_query,
+    build_cumulative_tile_select,
+    build_latest_row_select,
+    build_lifetime_rollup_select,
     build_offline_tile_pit_query,
     build_online_rollup_select,
+    build_series_snapshot_select,
     build_streaming_tile_select,
+    build_tile_rollup_select,
+    build_windowed_agg_select,
 )
 from feast.infra.compute_engines.risingwave.sqlglot_dialect import RisingWaveStreaming
 
 _CI = ColumnInfo(join_keys=["user_id"], feature_cols=["amount"], ts_col="event_ts",
                  created_ts_col=None, field_mapping=None)
-_AGGS = [Aggregation(column="amount", function="sum", time_window=dt.timedelta(days=1)),
-         Aggregation(column="amount", function="count", time_window=dt.timedelta(days=1))]
 _DAY, _HOUR = dt.timedelta(days=1), dt.timedelta(seconds=3600)
+_AGGS = [Aggregation(column="amount", function="sum", time_window=_DAY),
+         Aggregation(column="amount", function="count", time_window=_DAY)]
+_MEANVAR = [Aggregation(column="amount", function="mean", time_window=_DAY),
+            Aggregation(column="amount", function="var_pop", time_window=_DAY)]
+_MAX = Aggregation(column="amount", function="max", time_window=_DAY)  # non-invertible -> rollup MVs
+_CDISTINCT = Aggregation(column="amount", function="count_distinct", time_window=_DAY)
+_SEQ = Aggregation(column="amount", function="first", time_window=_DAY, name="seq5")  # -> array_agg[1:n]
+_PCT = Aggregation(column="amount", function="approx_percentile", time_window=_DAY, name="p95")  # -> WITHIN GROUP
+_SPINE = "SELECT 1 AS user_id, now() AS event_timestamp"
 
 
 def _render(tree):
@@ -70,14 +84,36 @@ def test_stock_risingwave_dialect_lacks_both():
 
 # --- the dialect round-trips the engine's ACTUAL streaming SQL (semantic + idempotent) ---
 
+# Every f-string builder in sql_builders.py, across its aggregate variants — so the dialect's coverage of the
+# whole engine SQL surface is pinned (a SQLGlot bump that breaks any construct's round-trip is caught here).
 _ENGINE_SQL = {
-    "streaming_tile": build_streaming_tile_select(_CI, _AGGS, "src", aggregation_interval=_HOUR),
-    "online_rollup": build_online_rollup_select(_CI, [_AGGS[0]], "tiles", aggregation_interval=_DAY),
-    "batch_tile": build_batch_tile_select(_CI, _AGGS, "src", aggregation_interval=_DAY),
+    "batch_tile": build_batch_tile_select(_CI, _AGGS + _MEANVAR, "src", aggregation_interval=_DAY),
+    "batch_tile_count_distinct": build_batch_tile_select(_CI, [_CDISTINCT], "src", aggregation_interval=_DAY),
+    "streaming_tile_eowc_tumble": build_streaming_tile_select(_CI, _AGGS, "src", aggregation_interval=_HOUR),
+    "cumulative_tile": build_cumulative_tile_select(_CI, _AGGS + _MEANVAR, "tiles"),
+    "online_rollup_now": build_online_rollup_select(_CI, [_MAX], "tiles", aggregation_interval=_DAY),
+    "tile_rollup_asof": build_tile_rollup_select(_CI, [_MAX], "tiles", aggregation_interval=_DAY, as_of_sql="now()"),
+    "lifetime_rollup": build_lifetime_rollup_select(_CI, [_MAX], "tiles", lifetime_start_secs=None),
+    "cumulative_read": build_cumulative_read_query(
+        _SPINE, ["user_id", "event_timestamp"], "event_timestamp", cumulative_relation="cum",
+        column_info=_CI, aggregations=_AGGS, aggregation_interval=_DAY, lifetimes={}),
+    "offline_pit_trailing": build_offline_tile_pit_query(
+        _SPINE, ["user_id", "event_timestamp"], "event_timestamp", tiles_relation="tiles",
+        column_info=_CI, aggregations=[_AGGS[0], _MAX], aggregation_interval=_DAY),
     "offline_series_pit": build_offline_tile_pit_query(
-        "SELECT 1 AS user_id, now() AS event_timestamp", ["user_id", "event_timestamp"], "event_timestamp",
-        tiles_relation="tiles", column_info=_CI, aggregations=[_AGGS[0]], aggregation_interval=_DAY,
+        _SPINE, ["user_id", "event_timestamp"], "event_timestamp", tiles_relation="tiles",
+        column_info=_CI, aggregations=[_AGGS[0]], aggregation_interval=_DAY,
         series={_AGGS[0].resolved_name(_AGGS[0].time_window): [86400, 86400, 5]}),
+    "series_snapshot": build_series_snapshot_select(
+        _CI, [_AGGS[0]], "tiles", aggregation_interval=_DAY,
+        series={_AGGS[0].resolved_name(_AGGS[0].time_window): [86400, 86400, 5]}),
+    "windowed_agg_v1": build_windowed_agg_select(
+        _CI, _AGGS, "src", source_is_retractable=False, emit_on_close=True),
+    "windowed_agg_sequence_slice": build_windowed_agg_select(
+        _CI, [_SEQ], "src", source_is_retractable=False, emit_on_close=False, agg_params={"seq5": [5.0]}),
+    "windowed_agg_approx_percentile": build_windowed_agg_select(
+        _CI, [_PCT], "src", source_is_retractable=False, emit_on_close=False, agg_params={"p95": [0.95]}),
+    "latest_row": build_latest_row_select(_CI, "src"),
 }
 
 
