@@ -705,6 +705,16 @@ class RisingWaveComputeEngine(ComputeEngine):
             deployed_opts is not None
             and deployed_opts != _desired_kafka_source_opts(view.stream_source)
         )
+        # KNOWN LIMITATION: a change to ONLY the declared TYPE of a FILTER-referenced source column
+        # (view_agg_filter_cols) — with no change to the predicate, window, topic, or watermark — is not
+        # detected here, so the live CREATE SOURCE keeps the stale type until an unrelated change forces a
+        # rebuild. The predicate text and tiles SELECT depend on the column NAME, not its type, so a type-only
+        # edit leaves the desired SELECT byte-identical and this reconcile a no-op. It is NOT diffed against
+        # the catalog (unlike the passthrough path's _deployed_source_columns check) because the source mixes
+        # carrier-typed filter columns with PLACEHOLDER-typed entity/agg-input/timestamp columns (ddl.py
+        # _source_ddl), so a catalog comparison would need to replicate that split to avoid spurious full
+        # rebuilds. Most type edits are benign (varchar<->char(n) compare identically); a decode-altering edit
+        # (e.g. double->int) is the rare harmful case. Deferred over the rebuild-on-false-positive risk.
         if source_changed:
             full_rebuild, drops, creates = True, list(deployed_online), []
         for name in drops:  # online MVs (dependents) first
